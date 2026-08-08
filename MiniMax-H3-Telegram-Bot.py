@@ -73,11 +73,7 @@ COMFYUI_STATE_DIR = Path(
 )
 COMFYUI_USER_DIR = COMFYUI_STATE_DIR / "user"
 COMFYUI_DATABASE = COMFYUI_STATE_DIR / "comfyui.db"
-COMFYUI_VRAM_MODE_NAMES = {"lowvram", "novram"}
-_configured_vram_mode = os.environ.get("MINIMAX_COMFY_VRAM_MODE", "lowvram").strip().lower()
-DEFAULT_COMFYUI_VRAM_MODE = (
-    _configured_vram_mode if _configured_vram_mode in COMFYUI_VRAM_MODE_NAMES else "lowvram"
-)
+DEFAULT_COMFYUI_VRAM_MODE = "lowvram"
 FFMPEG_PATH = os.environ.get("MINIMAX_FFMPEG", shutil.which("ffmpeg") or "ffmpeg")
 MAX_TELEGRAM_IMAGE_BYTES = 20 * 1024 * 1024
 
@@ -587,18 +583,12 @@ def normalize_comfyui_vram_mode(mode: Optional[str]) -> str:
         "lowvram": "lowvram",
         "quick": "lowvram",
         "turbo": "lowvram",
-        "novram": "novram",
-        "extreme": "novram",
     }
     return aliases.get(str(mode or "").strip().lower(), DEFAULT_COMFYUI_VRAM_MODE)
 
 
 def comfyui_vram_mode_label(mode: Optional[str]) -> str:
-    return (
-        "快速 Turbo（--lowvram）"
-        if normalize_comfyui_vram_mode(mode) == "lowvram"
-        else "极限显存（--novram + RAM 卸载）"
-    )
+    return "Turbo（--lowvram）"
 
 
 def comfyui_is_online() -> bool:
@@ -631,11 +621,7 @@ def start_comfyui_process(vram_mode: Optional[str] = None) -> str:
         COMFYUI_LOG.parent.mkdir(parents=True, exist_ok=True)
         COMFYUI_USER_DIR.mkdir(parents=True, exist_ok=True)
         database_url = f"sqlite:///{COMFYUI_DATABASE.as_posix()}"
-        memory_flags = (
-            ["--novram", "--disable-smart-memory"]
-            if vram_mode == "novram"
-            else ["--lowvram"]
-        )
+        memory_flags = ["--lowvram"]
         command = [
             str(COMFYUI_PYTHON),
             "main.py",
@@ -1565,22 +1551,6 @@ class TelegramMenuBot(TelegramTurboBot):
                 "callback_data": "mode:image",
             },
         ]
-        vram_row = [
-            {
-                "text": self.selected(
-                    "⚡ 快速 Turbo",
-                    self.comfyui_vram_mode() == "lowvram",
-                ),
-                "callback_data": "vram:lowvram",
-            },
-            {
-                "text": self.selected(
-                    "🧠 极限显存",
-                    self.comfyui_vram_mode() == "novram",
-                ),
-                "callback_data": "vram:novram",
-            },
-        ]
         resolution_row = [
             {
                 "text": self.selected(
@@ -1623,8 +1593,6 @@ class TelegramMenuBot(TelegramTurboBot):
             "inline_keyboard": [
                 [{"text": "🎬 生成模式（选择一种）", "callback_data": "noop"}],
                 mode_row,
-                [{"text": "ComfyUI 顯存模式（切換後會自動重啟）", "callback_data": "noop"}],
-                vram_row,
                 [{"text": "⏱ 總片長（短片）", "callback_data": "noop"}],
                 short_seconds_row,
                 [{"text": "🎞 總片長（長片，會自動分段）", "callback_data": "noop"}],

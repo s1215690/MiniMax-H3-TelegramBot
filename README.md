@@ -12,7 +12,7 @@
 - 長片自動分段生成並用 FFmpeg 合併
 - 解析度、steps 和提示詞按鈕
 - ComfyUI 啟動、停止、重啟和生成進度查詢
-- 快速 Turbo（`--lowvram`）和極限顯存（`--novram --disable-smart-memory`）模式
+- Turbo 工作流（固定使用 `--lowvram` 顯存管理）
 - Windows 登入後自動啟動 Bot
 - Token 只從 Windows 使用者環境變數讀取
 
@@ -59,7 +59,6 @@ Token 輸入框會隱藏內容，Token 會保存到 Windows 使用者環境變�
 | `MINIMAX_T8_API_TEMPLATE` | T8 API 工作流 JSON；預設使用 `workflow/dual_clock_4step_api.json` |
 | `MINIMAX_COMFY_OUTPUT` | ComfyUI output 目錄 |
 | `MINIMAX_COMFY_INPUT` | ComfyUI input 目錄 |
-| `MINIMAX_COMFY_VRAM_MODE` | `lowvram` 或 `novram` |
 | `MINIMAX_COMFY_PORT` | ComfyUI API Port，預設 `8191` |
 | `MINIMAX_FFMPEG` | FFmpeg 可執行檔路徑；不設定時使用 PATH 中的 `ffmpeg` |
 
@@ -98,12 +97,9 @@ cinematic bright daylight scene with smooth camera movement and clear synchroniz
 
 總片長超過 15 秒時，Bot 會使用上一段最後畫面作為下一段首幀，然後合併成一個 MP4。
 
-## 顯存模式
+## 顯存配置
 
-- `lowvram`：速度較快，適合一般使用。
-- `novram`：使用 `--novram --disable-smart-memory`，把更多模型資料卸載到系統 RAM；可能更慢，但適合顯存不足時測試。
-
-Telegram 面板可以切換模式。切換會重啟 ComfyUI，並取消正在執行的生成工作。
+本專案固定使用 Turbo 工作流和 `--lowvram`。這只是 ComfyUI 的顯存管理方式，不會切換成其他模型；Telegram 面板不再提供極限顯存模式。
 
 ## 安全提醒
 
