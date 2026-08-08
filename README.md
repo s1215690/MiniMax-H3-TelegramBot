@@ -29,8 +29,8 @@
 ## 安裝
 
 ```powershell
-git clone https://github.com/s1215690/MiniMax-H3-Telegram-Bot.git
-cd MiniMax-H3-Telegram-Bot
+git clone https://github.com/s1215690/MiniMax-H3-TelegramBot.git
+cd MiniMax-H3-TelegramBot
 py -3 -m pip install -r requirements.txt
 ```
 
