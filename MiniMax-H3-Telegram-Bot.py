@@ -75,6 +75,12 @@ COMFYUI_USER_DIR = COMFYUI_STATE_DIR / "user"
 COMFYUI_DATABASE = COMFYUI_STATE_DIR / "comfyui.db"
 DEFAULT_COMFYUI_VRAM_MODE = "lowvram"
 FFMPEG_PATH = os.environ.get("MINIMAX_FFMPEG", shutil.which("ffmpeg") or "ffmpeg")
+NVIDIA_SMI_PATH = os.environ.get(
+    "MINIMAX_NVIDIA_SMI",
+    shutil.which("nvidia-smi")
+    or r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+)
+SHUTDOWN_DELAY_SECONDS = 60
 MAX_TELEGRAM_IMAGE_BYTES = 20 * 1024 * 1024
 
 VIDEO_VAE = os.environ.get("MINIMAX_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors")
@@ -110,6 +116,110 @@ def http_error_detail(exc: HTTPError) -> str:
     except Exception:
         body = ""
     return f"HTTP Error {exc.code}: {body[:1200]}" if body else str(exc)
+
+
+def run_hidden_command(
+    command: list[str], timeout: float = 10
+) -> subprocess.CompletedProcess[str]:
+    """Run a local diagnostic/control command without opening a console window."""
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": timeout,
+        "check": False,
+    }
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(command, **kwargs)
+
+
+def temperature_report() -> str:
+    """Read available Windows/NVIDIA temperature and VRAM information."""
+    lines = ["🌡 電腦溫度／顯卡狀態"]
+    smi_path = Path(NVIDIA_SMI_PATH)
+    if smi_path.is_file() or shutil.which(NVIDIA_SMI_PATH):
+        try:
+            result = run_hidden_command(
+                [
+                    NVIDIA_SMI_PATH,
+                    "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                timeout=8,
+            )
+            if result.returncode == 0:
+                rows = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                for index, row in enumerate(rows, start=1):
+                    fields = [field.strip() for field in row.split(",")]
+                    if len(fields) >= 5:
+                        name, temperature, utilization, memory_used, memory_total = fields[:5]
+                        lines.append(
+                            f"GPU {index}：{name}｜{temperature}°C｜"
+                            f"GPU {utilization}%｜VRAM {memory_used}/{memory_total} MiB"
+                        )
+            else:
+                detail = (result.stderr or result.stdout).strip().splitlines()
+                lines.append(f"GPU：讀取失敗（{detail[-1][:180] if detail else 'nvidia-smi error'}）")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            lines.append(f"GPU：讀取失敗（{exc}）")
+    else:
+        lines.append("GPU：找不到 nvidia-smi")
+
+    cpu_query = (
+        "try { $values = @(Get-CimInstance -Namespace root/wmi "
+        "-ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
+        "ForEach-Object { [math]::Round(($_.CurrentTemperature / 10) - 273.15, 1) }); "
+        "if ($values.Count -gt 0) { $values -join ',' } else { exit 1 } "
+        "} catch { exit 1 }"
+    )
+    try:
+        cpu_result = run_hidden_command(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                cpu_query,
+            ],
+            timeout=8,
+        )
+        cpu_values = [value.strip() for value in cpu_result.stdout.split(",") if value.strip()]
+        if cpu_result.returncode == 0 and cpu_values:
+            lines.append(f"CPU：{'、'.join(value + '°C' for value in cpu_values[:4])}")
+        else:
+            lines.append("CPU：Windows 未提供可讀取的溫度感測器")
+    except (OSError, subprocess.TimeoutExpired):
+        lines.append("CPU：無法讀取溫度感測器")
+
+    lines.append(f"讀取時間：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(lines)
+
+
+def schedule_windows_shutdown() -> None:
+    if os.name != "nt":
+        raise BotError("自動關機只支援 Windows。")
+    result = run_hidden_command(
+        ["shutdown.exe", "/s", "/t", str(SHUTDOWN_DELAY_SECONDS)],
+        timeout=10,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise BotError(f"排程關機失敗：{detail[-500:] or 'shutdown.exe error'}")
+
+
+def cancel_windows_shutdown() -> None:
+    if os.name != "nt":
+        raise BotError("取消自動關機只支援 Windows。")
+    result = run_hidden_command(["shutdown.exe", "/a"], timeout=10)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise BotError(f"取消關機失敗：{detail[-500:] or 'shutdown.exe error'}")
 
 
 def validate_total_seconds(seconds: float) -> float:
@@ -985,6 +1095,8 @@ class TelegramTurboBot:
             "/gen 864 480 12 15\n你的提示詞\n\n"
             "/status 查看狀態\n"
             "/progress 查看即時生成進度\n"
+            "/temperature 查看 GPU／CPU 溫度\n"
+            "/cancel_shutdown 取消已排程的自動關機\n"
             "/comfy_restart 重啟 ComfyUI\n"
             "/comfy_stop 關閉 ComfyUI\n"
             "/cancel 取消目前生成\n"
@@ -1397,6 +1509,8 @@ class TelegramMenuBot(TelegramTurboBot):
         self.input_mode = self.load_saved_mode()
         self.image_path = self.load_saved_image_path()
         self.vram_mode = self.load_saved_vram_mode()
+        self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
+        self._shutdown_pending = False
         self.awaiting_prompt = False
         self.awaiting_duration = False
 
@@ -1448,6 +1562,18 @@ class TelegramMenuBot(TelegramTurboBot):
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return DEFAULT_COMFYUI_VRAM_MODE
 
+    @staticmethod
+    def load_saved_shutdown_after_generation() -> bool:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("shutdown_after_generation", False)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return value is True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+
     def comfyui_vram_mode(self) -> str:
         return normalize_comfyui_vram_mode(self.vram_mode)
 
@@ -1497,6 +1623,9 @@ class TelegramMenuBot(TelegramTurboBot):
                     "input_mode": getattr(self, "input_mode", "text"),
                     "comfy_vram_mode": normalize_comfyui_vram_mode(
                         getattr(self, "vram_mode", DEFAULT_COMFYUI_VRAM_MODE)
+                    ),
+                    "shutdown_after_generation": bool(
+                        getattr(self, "shutdown_after_generation", False)
                     ),
                     "image_path": (
                         str(getattr(self, "image_path", ""))
@@ -1589,6 +1718,26 @@ class TelegramMenuBot(TelegramTurboBot):
             }
             for steps in self.STEPS
         ]
+        if self._shutdown_pending:
+            shutdown_row = [
+                {"text": "🛑 取消即將關機", "callback_data": "shutdown_cancel"}
+            ]
+        elif self.total_seconds > MAX_SEGMENT_SECONDS:
+            shutdown_row = [
+                {
+                    "text": self.selected(
+                        "🔌 長片完成後關機", self.shutdown_after_generation
+                    ),
+                    "callback_data": "shutdown_toggle",
+                }
+            ]
+        else:
+            shutdown_row = [
+                {
+                    "text": "🔌 完成後關機（只限長片）",
+                    "callback_data": "shutdown_toggle",
+                }
+            ]
         return {
             "inline_keyboard": [
                 [{"text": "🎬 生成模式（选择一种）", "callback_data": "noop"}],
@@ -1614,6 +1763,8 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "♻️ 讀取上次設定", "callback_data": "last"},
                 ],
                 [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
+                shutdown_row,
+                [{"text": "🌡 查看電腦溫度", "callback_data": "temperature"}],
                 [
                     {"text": "▶️ 啟動 ComfyUI", "callback_data": "comfy_start"},
                     {"text": "📡 ComfyUI 狀態", "callback_data": "comfy_status"},
@@ -1750,6 +1901,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 f"{job.segment_total} 段合併"
             )
             self.telegram.send_video(job.chat_id, output_path, caption)
+            self.schedule_shutdown_if_enabled(job)
         except Exception as exc:
             if not job.cancel_event.is_set():
                 self.send_safe(job.chat_id, f"長片生成失敗：{exc}")
@@ -1780,6 +1932,12 @@ class TelegramMenuBot(TelegramTurboBot):
             duration_text = (
                 f"總片長：約 {effective.actual_seconds:.2f} 秒（{effective.length} frames）"
             )
+        if self._shutdown_pending:
+            shutdown_text = "完成後關機：倒數中（可取消）"
+        elif self.shutdown_after_generation:
+            shutdown_text = "完成後關機：已開啟（只對長片生效）"
+        else:
+            shutdown_text = "完成後關機：關閉"
         return (
             f"{prefix}MiniMax H3 Turbo 控制面板\n\n"
             f"模式：{mode_text}\n"
@@ -1788,11 +1946,54 @@ class TelegramMenuBot(TelegramTurboBot):
             f"步數：{current.steps}\n"
                 f"{duration_text}\n"
                 f"ComfyUI 顯存模式：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"
+            f"{shutdown_text}\n"
             f"提示詞：{prompt_status}\n\n"
             "圖片模式：先發圖片，再輸入提示詞；文字模式：直接輸入提示詞。\n"
             "最後按「生成影片」。\n"
             "長片會自動分段生成後合併，設定和提示詞會自動保存。"
         )
+
+    def schedule_shutdown_if_enabled(self, job: JobState) -> None:
+        with self.lock:
+            should_schedule = (
+                not job.cancel_event.is_set()
+                and job.segment_total > 1
+                and self.shutdown_after_generation
+                and not self._shutdown_pending
+            )
+            if should_schedule:
+                self._shutdown_pending = True
+        if not should_schedule:
+            return
+        try:
+            schedule_windows_shutdown()
+        except BotError as exc:
+            with self.lock:
+                self._shutdown_pending = False
+            self.send_safe(job.chat_id, f"長片已完成，但排程關機失敗：{exc}")
+            return
+        self.send_safe(
+            job.chat_id,
+            f"長片已傳送完成，電腦將在 {SHUTDOWN_DELAY_SECONDS} 秒後關機。"
+            "如需取消，請按面板的「取消即將關機」或輸入 /cancel_shutdown。",
+        )
+
+    def cancel_scheduled_shutdown(
+        self, chat_id: str, message_id: Optional[int] = None
+    ) -> None:
+        with self.lock:
+            pending = self._shutdown_pending
+        if pending:
+            try:
+                cancel_windows_shutdown()
+            except BotError as exc:
+                self.send_safe(chat_id, str(exc))
+                return
+            with self.lock:
+                self._shutdown_pending = False
+        self.shutdown_after_generation = False
+        self.save_settings()
+        self.show_menu(chat_id, message_id, "自動關機已取消")
 
     def show_progress(
         self,
@@ -2017,10 +2218,33 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.prompt = self.load_saved_prompt()
                 self.input_mode = self.load_saved_mode()
                 self.image_path = self.load_saved_image_path()
+                self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
                 self.show_menu(chat_id, message_id, "已讀取上次設定")
                 return
             if data == "prompt":
                 self.request_prompt(chat_id)
+                return
+            if data == "temperature":
+                self.send_safe(chat_id, temperature_report())
+                return
+            if data == "shutdown_toggle":
+                if self.total_seconds <= MAX_SEGMENT_SECONDS:
+                    self.send_safe(
+                        chat_id,
+                        "自動關機只對超過 15 秒的長片生效，請先選擇 30 秒或更長片長。",
+                    )
+                    return
+                self.shutdown_after_generation = not self.shutdown_after_generation
+                self.save_settings()
+                notice = (
+                    "已開啟：長片完成並傳送後會在 60 秒後關機。"
+                    if self.shutdown_after_generation
+                    else "已關閉：長片完成後不會自動關機。"
+                )
+                self.show_menu(chat_id, message_id, notice)
+                return
+            if data == "shutdown_cancel":
+                self.cancel_scheduled_shutdown(chat_id, message_id)
                 return
             if data == "clear":
                 self.prompt = ""
@@ -2137,6 +2361,12 @@ class TelegramMenuBot(TelegramTurboBot):
         if command == "/progress":
             self.send_safe(chat_id, self.progress_text())
             return
+        if command in {"/temperature", "/temp"}:
+            self.send_safe(chat_id, temperature_report())
+            return
+        if command == "/cancel_shutdown":
+            self.cancel_scheduled_shutdown(chat_id)
+            return
         if command == "/status":
             with self.lock:
                 job = self.job
@@ -2160,6 +2390,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 except BotError:
                     pass
                 self.send_safe(chat_id, "已要求取消目前生成。")
+            elif self._shutdown_pending:
+                self.cancel_scheduled_shutdown(chat_id)
             else:
                 self.show_menu(chat_id, notice="已取消輸入")
             return

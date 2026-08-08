@@ -11,6 +11,8 @@
 - 5、10、12、15 秒短片，以及自訂總片長
 - 長片自動分段生成並用 FFmpeg 合併
 - 解析度、steps 和提示詞按鈕
+- GPU 溫度、使用率和 VRAM 查詢按鈕
+- 長片完成並傳回 Telegram 後自動關機，可在倒數期間取消
 - ComfyUI 啟動、停止、重啟和生成進度查詢
 - Turbo 工作流（固定使用 `--lowvram` 顯存管理）
 - Windows 登入後自動啟動 Bot
@@ -61,6 +63,7 @@ Token 輸入框會隱藏內容，Token 會保存到 Windows 使用者環境變�
 | `MINIMAX_COMFY_INPUT` | ComfyUI input 目錄 |
 | `MINIMAX_COMFY_PORT` | ComfyUI API Port，預設 `8191` |
 | `MINIMAX_FFMPEG` | FFmpeg 可執行檔路徑；不設定時使用 PATH 中的 `ffmpeg` |
+| `MINIMAX_NVIDIA_SMI` | `nvidia-smi` 路徑；不設定時自動尋找 NVIDIA 標準安裝位置 |
 
 模型檔名也可以覆寫：
 
@@ -81,6 +84,8 @@ MINIMAX_LORA
 /text                  切換到文字生視頻
 /progress              查看生成進度
 /status                查看 Bot 狀態
+/temperature           查看 GPU／CPU 溫度
+/cancel_shutdown       取消已排程的自動關機
 /comfy_status          查看 ComfyUI 狀態
 /comfy_start           啟動 ComfyUI
 /comfy_restart         重啟 ComfyUI
@@ -96,6 +101,8 @@ cinematic bright daylight scene with smooth camera movement and clear synchroniz
 ```
 
 總片長超過 15 秒時，Bot 會使用上一段最後畫面作為下一段首幀，然後合併成一個 MP4。
+
+面板上的「🌡 查看電腦溫度」會讀取 NVIDIA GPU 溫度、GPU 使用率和 VRAM；CPU 溫度只有在 Windows/主機板提供感測器時才會顯示。選擇超過 15 秒的長片後，可以開啟「🔌 長片完成後關機」；影片合併並成功傳回 Telegram 後，系統會在 60 秒後關機。倒數期間可以按「🛑 取消即將關機」，或輸入 `/cancel_shutdown`。
 
 ## 顯存配置
 
