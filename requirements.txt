@@ -1,0 +1,2 @@
+# Optional: enables live ComfyUI WebSocket progress updates in Telegram.
+aiohttp>=3.9,<4

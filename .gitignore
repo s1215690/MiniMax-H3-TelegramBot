@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.pyc
+__pycache__/
+input_images/
+continuation_frames/
+settings.json
+*.db
+*.db-*
+outputs/
+input/
+comfyui-user/
+.venv/
+venv/

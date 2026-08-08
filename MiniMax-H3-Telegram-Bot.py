@@ -1,0 +1,2365 @@
+#!/usr/bin/env python3
+"""Telegram controller for the local MiniMax H3 Turbo ComfyUI workflow.
+
+The bot accepts generation parameters and a prompt from one authorized chat,
+submits an API-format workflow to ComfyUI, then sends the synchronized MP4
+back to Telegram. Secrets are intentionally read only from environment
+variables and are never written to this workspace.
+"""
+
+from __future__ import annotations
+
+import json
+import asyncio
+import math
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+LOCAL_APP_DATA = Path(
+    os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+)
+COMFY_ROOT = Path(
+    os.environ.get("MINIMAX_COMFY_ROOT", str(Path.home() / "ComfyUI"))
+)
+COMFYUI_BASE_DIR = Path(
+    os.environ.get("MINIMAX_COMFY_BASE_DIR", str(COMFY_ROOT / "ComfyUI"))
+)
+COMFYUI_DIR = Path(
+    os.environ.get("MINIMAX_COMFY_DIR", str(COMFY_ROOT / "ComfyUI-Turbo"))
+)
+COMFYUI_PYTHON = Path(
+    os.environ.get(
+        "MINIMAX_COMFY_PYTHON",
+        str(COMFYUI_BASE_DIR / ".venv" / "Scripts" / "python.exe"),
+    )
+)
+COMFY_URL = os.environ.get("MINIMAX_COMFY_URL", "http://127.0.0.1:8191").rstrip("/")
+OUTPUT_DIR = Path(
+    os.environ.get("MINIMAX_COMFY_OUTPUT", str(LOCAL_APP_DATA / "ComfyUI" / "output"))
+)
+INPUT_DIR = Path(os.environ.get("MINIMAX_COMFY_INPUT", str(OUTPUT_DIR.parent / "input")))
+T8_API_TEMPLATE = Path(
+    os.environ.get(
+        "MINIMAX_T8_API_TEMPLATE",
+        str(PROJECT_DIR / "workflow" / "dual_clock_4step_api.json"),
+    )
+)
+COMFYUI_PORT = int(os.environ.get("MINIMAX_COMFY_PORT", "8191"))
+COMFYUI_LOG = Path(
+    os.environ.get(
+        "MINIMAX_COMFY_LOG",
+        str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MiniMax-H3-Telegram" / "comfyui.log"),
+    )
+)
+COMFYUI_STATE_DIR = Path(
+    os.environ.get(
+        "MINIMAX_COMFY_STATE_DIR",
+        str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MiniMax-H3-Turbo-ComfyUI"),
+    )
+)
+COMFYUI_USER_DIR = COMFYUI_STATE_DIR / "user"
+COMFYUI_DATABASE = COMFYUI_STATE_DIR / "comfyui.db"
+COMFYUI_VRAM_MODE_NAMES = {"lowvram", "novram"}
+_configured_vram_mode = os.environ.get("MINIMAX_COMFY_VRAM_MODE", "lowvram").strip().lower()
+DEFAULT_COMFYUI_VRAM_MODE = (
+    _configured_vram_mode if _configured_vram_mode in COMFYUI_VRAM_MODE_NAMES else "lowvram"
+)
+FFMPEG_PATH = os.environ.get("MINIMAX_FFMPEG", shutil.which("ffmpeg") or "ffmpeg")
+MAX_TELEGRAM_IMAGE_BYTES = 20 * 1024 * 1024
+
+VIDEO_VAE = os.environ.get("MINIMAX_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors")
+AUDIO_VAE = os.environ.get("MINIMAX_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors")
+CLIP_NAME = os.environ.get(
+    "MINIMAX_CLIP", "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
+)
+UNET_NAME = os.environ.get("MINIMAX_UNET", "minimax_h3_fl2va_int8_convrot.safetensors")
+LORA_NAME = os.environ.get(
+    "MINIMAX_LORA", "minimax_h3_turbo_4step_ema_comfyui.safetensors"
+)
+OUTPUT_PREFIX = "MiniMaxH3/Telegram_Turbo"
+STATE_PATH = Path(
+    os.environ.get(
+        "MINIMAX_TELEGRAM_STATE",
+        str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MiniMax-H3-Telegram" / "settings.json"),
+    )
+)
+IMAGE_DIR = STATE_PATH.parent / "input_images"
+MAX_SEGMENT_SECONDS = 15.0
+MIN_TOTAL_SECONDS = 2.0
+MAX_TOTAL_SECONDS = 30.0 * 60.0
+CONTINUATION_DIR = STATE_PATH.parent / "continuation_frames"
+
+
+class BotError(RuntimeError):
+    pass
+
+
+def http_error_detail(exc: HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    return f"HTTP Error {exc.code}: {body[:1200]}" if body else str(exc)
+
+
+def validate_total_seconds(seconds: float) -> float:
+    """Validate a Telegram total duration and keep a stable saved value."""
+    if not math.isfinite(seconds):
+        raise BotError("總片長必須是有效數字，例如 37 或 600。")
+    if seconds < MIN_TOTAL_SECONDS or seconds > MAX_TOTAL_SECONDS:
+        raise BotError("總片長必須介乎 2 至 1800 秒（30 分鐘）。")
+    return round(float(seconds), 3)
+
+
+@dataclass(frozen=True)
+class GenerationConfig:
+    width: int
+    height: int
+    steps: int
+    requested_seconds: float
+    length: int
+
+    @property
+    def actual_seconds(self) -> float:
+        return self.length / 24.0
+
+
+@dataclass
+class JobState:
+    chat_id: str
+    config: GenerationConfig
+    prompt: str
+    started_at: float
+    prompt_id: Optional[str] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    output_prefix: str = OUTPUT_PREFIX
+    segment_index: int = 1
+    segment_total: int = 1
+    total_seconds: float = 0.0
+    input_image_path: Optional[Path] = None
+    comfy_image_name: Optional[str] = None
+    continuation_image_path: Optional[Path] = None
+    progress_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    progress_percent: float = 0.0
+    progress_node_id: Optional[str] = None
+    progress_node_state: str = "queued"
+    progress_node_value: float = 0.0
+    progress_node_max: float = 1.0
+    progress_node_index: int = 0
+    progress_node_total: int = 0
+    progress_queue_remaining: Optional[int] = None
+    progress_phase: str = "queued"
+    progress_tracker: Any = field(default=None, repr=False, compare=False)
+
+
+class ComfyProgressTracker:
+    """Listen to ComfyUI's WebSocket progress events for one prompt."""
+
+    def __init__(self, job: JobState):
+        self.job = job
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(
+            target=self._run,
+            name="minimax-comfy-progress",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._listen())
+        except Exception as exc:
+            # Progress is best-effort; the normal history poll remains authoritative.
+            print(f"Comfy progress tracker error: {exc}", flush=True)
+
+    async def _listen(self) -> None:
+        try:
+            import aiohttp
+        except ImportError as exc:
+            print(f"Comfy progress tracker unavailable: {exc}", flush=True)
+            return
+
+        ws_base = COMFY_URL.replace("https://", "wss://", 1).replace(
+            "http://", "ws://", 1
+        )
+        ws_url = f"{ws_base}/ws?clientId=telegram-turbo-bot"
+        timeout = aiohttp.ClientTimeout(total=None, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.ws_connect(
+                    ws_url,
+                    heartbeat=30,
+                    autoping=True,
+                ) as websocket:
+                    while not self.stop_event.is_set():
+                        try:
+                            message = await asyncio.wait_for(
+                                websocket.receive(), timeout=1.0
+                            )
+                        except asyncio.TimeoutError:
+                            continue
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                payload = json.loads(message.data)
+                            except (TypeError, json.JSONDecodeError):
+                                continue
+                            if isinstance(payload, dict):
+                                self._handle_message(payload)
+                        elif message.type in {
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            break
+            except Exception as exc:
+                print(f"Comfy progress WebSocket unavailable: {exc}", flush=True)
+
+    def _is_current_prompt(self, data: dict[str, Any]) -> bool:
+        prompt_id = data.get("prompt_id")
+        return prompt_id is None or str(prompt_id) == str(self.job.prompt_id)
+
+    def _handle_message(self, payload: dict[str, Any]) -> None:
+        message_type = str(payload.get("type", ""))
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            return
+
+        if message_type == "status":
+            exec_info = (data.get("status") or {}).get("exec_info") or {}
+            queue_remaining = exec_info.get("queue_remaining")
+            if queue_remaining is not None:
+                with self.job.progress_lock:
+                    self.job.progress_queue_remaining = int(queue_remaining)
+            return
+
+        if not self._is_current_prompt(data):
+            return
+
+        if message_type == "executing":
+            node_id = data.get("node")
+            with self.job.progress_lock:
+                if node_id is None:
+                    self.job.progress_phase = "finishing"
+                    self.job.progress_node_state = "finishing"
+                else:
+                    self.job.progress_phase = "running"
+                    self.job.progress_node_id = str(node_id)
+                    self.job.progress_node_state = "running"
+            return
+
+        if message_type == "progress":
+            self._update_step_progress(data)
+            return
+
+        if message_type == "progress_state":
+            self._update_node_progress(data.get("nodes") or {})
+            return
+
+        if message_type == "execution_success":
+            with self.job.progress_lock:
+                self.job.progress_percent = 100.0
+                self.job.progress_phase = "completed"
+                self.job.progress_node_state = "finished"
+            return
+
+        if message_type == "execution_error":
+            with self.job.progress_lock:
+                self.job.progress_phase = "error"
+                self.job.progress_node_state = "error"
+
+    def _update_step_progress(self, data: dict[str, Any]) -> None:
+        try:
+            value = float(data.get("value", 0))
+            maximum = max(float(data.get("max", 1)), 1.0)
+        except (TypeError, ValueError):
+            return
+        percent = max(0.0, min(100.0, value / maximum * 100.0))
+        with self.job.progress_lock:
+            self.job.progress_percent = percent
+            self.job.progress_phase = "sampling"
+            self.job.progress_node_state = "running"
+            self.job.progress_node_value = value
+            self.job.progress_node_max = maximum
+            if data.get("node") is not None:
+                self.job.progress_node_id = str(data["node"])
+
+    def _update_node_progress(self, nodes: Any) -> None:
+        if not isinstance(nodes, dict):
+            return
+        valid_nodes = [node for node in nodes.values() if isinstance(node, dict)]
+        if not valid_nodes:
+            return
+
+        finished = 0
+        running_node: Optional[tuple[str, dict[str, Any]]] = None
+        running_fraction = 0.0
+        for key, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            state = str(node.get("state", "pending"))
+            if state == "finished":
+                finished += 1
+            elif state in {"running", "executing"} and running_node is None:
+                running_node = (str(key), node)
+
+        if running_node is not None:
+            key, node = running_node
+            try:
+                value = float(node.get("value", 0))
+                maximum = max(float(node.get("max", 1)), 1.0)
+                running_fraction = max(0.0, min(1.0, value / maximum))
+            except (TypeError, ValueError):
+                value, maximum = 0.0, 1.0
+            node_id = node.get("display_node_id") or node.get("node_id") or key
+            node_state = "running"
+        else:
+            value, maximum = 0.0, 1.0
+            node_id = None
+            node_state = "finished" if finished == len(valid_nodes) else "pending"
+
+        total = len(valid_nodes)
+        percent = ((finished + running_fraction) / total) * 100.0
+        with self.job.progress_lock:
+            self.job.progress_percent = max(0.0, min(100.0, percent))
+            self.job.progress_phase = "running"
+            self.job.progress_node_id = str(node_id) if node_id is not None else None
+            self.job.progress_node_state = node_state
+            self.job.progress_node_value = value
+            self.job.progress_node_max = maximum
+            self.job.progress_node_index = min(total, finished + (1 if running_node else 0))
+            self.job.progress_node_total = total
+
+
+def valid_length(seconds: float) -> int:
+    """Return the next valid H3 frame count on the 17n+5 grid at 24fps."""
+    if seconds < 2 or seconds > 15:
+        raise BotError("秒數目前只允許 2 到 15 秒。")
+    target_frames = max(5, math.ceil(seconds * 24.0))
+    if target_frames <= 5:
+        return 5
+    n = math.ceil((target_frames - 5) / 17)
+    return 17 * n + 5
+
+
+def parse_config(parts: list[str]) -> GenerationConfig:
+    if len(parts) != 4:
+        raise BotError("格式：/gen 寬度 高度 steps 秒數\n例如：/gen 864 480 12 15")
+    try:
+        width, height, steps = (int(parts[0]), int(parts[1]), int(parts[2]))
+        seconds = float(parts[3])
+    except ValueError as exc:
+        raise BotError("寬度、高度、steps 和秒數都要是數字。") from exc
+
+    if width < 32 or height < 32 or width > 1344 or height > 768:
+        raise BotError("解析度範圍是 32 至 1344×768。")
+    if width % 32 or height % 32:
+        raise BotError("寬度和高度必須是 32 的倍數，例如 608×352、864×480。")
+    if width * height > 1344 * 768:
+        raise BotError("解析度太高，先不要超過 1344×768。")
+    if steps < 4 or steps > 20:
+        raise BotError("steps 目前允許 4 至 20，建議 8 或 12。")
+
+    length = valid_length(seconds)
+    return GenerationConfig(width, height, steps, seconds, length)
+
+
+def extract_last_frame(video_path: Path, output_path: Path) -> Path:
+    """Extract a single PNG used to anchor the next long-video segment."""
+    if not video_path.is_file():
+        raise BotError(f"找不到上一段影片：{video_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-sseof",
+        "-0.15",
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-y",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BotError(f"抽取上一段最後畫面失敗：{exc}") from exc
+    if result.returncode != 0 or not output_path.is_file():
+        details = (result.stderr or "").strip()
+        raise BotError(f"抽取上一段最後畫面失敗：{details[-800:]}")
+    return output_path
+
+
+def segment_prompt(job: JobState) -> str:
+    """Give each long-video segment a focused time window and continuity rule."""
+    if job.segment_total <= 1:
+        return job.prompt
+    start_seconds = (job.segment_index - 1) * MAX_SEGMENT_SECONDS
+    end_seconds = min(job.segment_index * MAX_SEGMENT_SECONDS, job.total_seconds)
+    if job.segment_index == 1:
+        continuity = (
+            "This is the opening segment. Establish the scene and begin the action naturally."
+        )
+    else:
+        continuity = (
+            "This is a direct continuation of the previous segment. Start from the supplied "
+            "first frame and continue the exact ongoing action. Do not restart the scene, "
+            "do not repeat the opening, and do not introduce a second version of the same fight."
+        )
+    return (
+        f"{job.prompt}\n\n"
+        f"LONG VIDEO SEGMENT {job.segment_index}/{job.segment_total}; "
+        f"story time window {start_seconds:g}-{end_seconds:g} seconds.\n"
+        f"{continuity}\n"
+        "Advance the story to this time window only. Preserve the same characters, costumes, "
+        "location, lighting, camera language and motion direction. Smoothly carry over the "
+        "last pose and momentum from the previous segment. Do not replay earlier events."
+    )
+
+
+def build_workflow(
+    config: GenerationConfig,
+    prompt: str,
+    output_prefix: str = OUTPUT_PREFIX,
+    image_name: Optional[str] = None,
+) -> dict[str, Any]:
+    if not T8_API_TEMPLATE.is_file():
+        raise BotError(f"找不到 T8 API 工作流模板：{T8_API_TEMPLATE}")
+    with T8_API_TEMPLATE.open("r", encoding="utf-8") as handle:
+        workflow = json.load(handle)
+
+    workflow["1"]["inputs"]["vae_name"] = VIDEO_VAE
+    workflow["2"]["inputs"]["vae_name"] = AUDIO_VAE
+    workflow["3"]["inputs"]["clip_name"] = CLIP_NAME
+    workflow["4"]["inputs"]["unet_name"] = UNET_NAME
+
+    # INT8 ConvRot uses the bypass model-only loader for the Turbo LoRA.
+    workflow["5"]["class_type"] = "LoraLoaderBypassModelOnly"
+    workflow["5"]["inputs"]["lora_name"] = LORA_NAME
+    workflow["5"]["inputs"]["strength_model"] = 1.0
+
+    conditioning = workflow["6"]["inputs"]
+    conditioning["prompt"] = prompt.strip()
+    conditioning["width"] = config.width
+    conditioning["height"] = config.height
+    conditioning["length"] = config.length
+    conditioning["task_type"] = "I2VA" if image_name else "T2VA"
+    conditioning["audio_mode"] = "native"
+    conditioning["add_source_as_reference"] = False
+    conditioning["prompt_primary_audio_ordinal"] = 0
+    if image_name:
+        workflow["13"] = {
+            "inputs": {"image": image_name},
+            "class_type": "LoadImage",
+            "_meta": {"title": "Telegram input image"},
+        }
+        conditioning["first_frame"] = ["13", 0]
+
+    workflow["7"]["inputs"]["steps"] = config.steps
+    workflow["7"]["inputs"]["shift_video"] = 12.0
+    workflow["7"]["inputs"]["shift_audio"] = 3.0
+    workflow["8"]["inputs"]["noise_seed"] = secrets.randbits(63)
+    workflow["12"]["inputs"]["filename_prefix"] = output_prefix
+    return workflow
+
+
+def json_request(url: str, payload: Optional[dict[str, Any]] = None, timeout: float = 45.0) -> Any:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except HTTPError as exc:
+        raise BotError(f"連線失敗：{http_error_detail(exc)}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise BotError(f"連線失敗：{exc}") from exc
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise BotError("服務回傳了無法解析的資料。") from exc
+
+
+def comfy_post(path: str, payload: Optional[dict[str, Any]] = None) -> Any:
+    return json_request(f"{COMFY_URL}{path}", payload)
+
+
+def upload_image_to_comfy(image_path: Path) -> str:
+    """Upload a Telegram image to ComfyUI input and return its LoadImage name."""
+    if not image_path.is_file():
+        raise BotError(f"找不到輸入圖片：{image_path}")
+    boundary = f"----MiniMaxH3Image{uuid.uuid4().hex}"
+    boundary_bytes = boundary.encode("ascii")
+    remote_name = f"telegram_{uuid.uuid4().hex}{image_path.suffix.lower() or '.jpg'}"
+    chunks: list[bytes] = []
+    for name, value in {
+        "type": "input",
+        "subfolder": "TelegramInputs",
+        "overwrite": "true",
+    }.items():
+        chunks.extend(
+            [
+                b"--" + boundary_bytes + b"\r\n",
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(
+                    "utf-8"
+                ),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    chunks.extend(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            (
+                f'Content-Disposition: form-data; name="image"; '
+                f'filename="{remote_name}"\r\n'
+            ).encode("utf-8"),
+            b"Content-Type: application/octet-stream\r\n\r\n",
+            image_path.read_bytes(),
+            b"\r\n--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+    request = Request(
+        f"{COMFY_URL}/upload/image",
+        data=b"".join(chunks),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise BotError(f"圖片上傳到 ComfyUI 失敗：{http_error_detail(exc)}") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise BotError(f"圖片上傳到 ComfyUI 失敗：{exc}") from exc
+    if not result.get("name"):
+        raise BotError(f"ComfyUI 沒有回傳圖片名稱：{result}")
+    subfolder = str(result.get("subfolder", "")).strip("/\\")
+    name = str(result["name"])
+    return f"{subfolder}/{name}" if subfolder else name
+
+
+_comfy_start_lock = threading.Lock()
+_comfy_process: Optional[subprocess.Popen] = None
+
+
+def normalize_comfyui_vram_mode(mode: Optional[str]) -> str:
+    aliases = {
+        "low": "lowvram",
+        "lowvram": "lowvram",
+        "quick": "lowvram",
+        "turbo": "lowvram",
+        "novram": "novram",
+        "extreme": "novram",
+    }
+    return aliases.get(str(mode or "").strip().lower(), DEFAULT_COMFYUI_VRAM_MODE)
+
+
+def comfyui_vram_mode_label(mode: Optional[str]) -> str:
+    return (
+        "快速 Turbo（--lowvram）"
+        if normalize_comfyui_vram_mode(mode) == "lowvram"
+        else "极限显存（--novram + RAM 卸载）"
+    )
+
+
+def comfyui_is_online() -> bool:
+    try:
+        json_request(f"{COMFY_URL}/system_stats", timeout=4)
+        return True
+    except BotError:
+        return False
+
+
+def start_comfyui_process(vram_mode: Optional[str] = None) -> str:
+    """Start this user's local Turbo ComfyUI only when its API is offline."""
+    global _comfy_process
+    vram_mode = normalize_comfyui_vram_mode(vram_mode)
+    if comfyui_is_online():
+        return f"ComfyUI 已經在運行（{COMFY_URL}）。"
+
+    with _comfy_start_lock:
+        if comfyui_is_online():
+            return f"ComfyUI 已經在運行（{COMFY_URL}）。"
+        if _comfy_process is not None and _comfy_process.poll() is None:
+            return f"ComfyUI 正在啟動中（PID {_comfy_process.pid}）。"
+        if not COMFYUI_DIR.is_dir():
+            raise BotError(f"找不到 ComfyUI 資料夾：{COMFYUI_DIR}")
+        if not COMFYUI_BASE_DIR.is_dir():
+            raise BotError(f"找不到 ComfyUI base-directory：{COMFYUI_BASE_DIR}")
+        if not COMFYUI_PYTHON.is_file():
+            raise BotError(f"找不到 ComfyUI Python：{COMFYUI_PYTHON}")
+
+        COMFYUI_LOG.parent.mkdir(parents=True, exist_ok=True)
+        COMFYUI_USER_DIR.mkdir(parents=True, exist_ok=True)
+        database_url = f"sqlite:///{COMFYUI_DATABASE.as_posix()}"
+        memory_flags = (
+            ["--novram", "--disable-smart-memory"]
+            if vram_mode == "novram"
+            else ["--lowvram"]
+        )
+        command = [
+            str(COMFYUI_PYTHON),
+            "main.py",
+            "--base-directory",
+            str(COMFYUI_BASE_DIR),
+            "--listen",
+            "127.0.0.1",
+            "--port",
+            str(COMFYUI_PORT),
+            *memory_flags,
+            "--user-directory",
+            str(COMFYUI_USER_DIR),
+            "--database-url",
+            database_url,
+            "--output-directory",
+            str(OUTPUT_DIR),
+            "--input-directory",
+            str(INPUT_DIR),
+            "--disable-auto-launch",
+        ]
+        try:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            startupinfo = None
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+            with COMFYUI_LOG.open("ab") as log_file:
+                _comfy_process = subprocess.Popen(
+                    command,
+                    cwd=str(COMFYUI_DIR),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    startupinfo=startupinfo,
+                    creationflags=creationflags,
+                )
+        except OSError as exc:
+            raise BotError(f"啟動 ComfyUI 失敗：{exc}") from exc
+
+    return (
+        f"已啟動 ComfyUI，正在載入中（PID {_comfy_process.pid}）。\n"
+        f"日誌：{COMFYUI_LOG}"
+    )
+
+
+def _running_comfy_process_ids() -> set[int]:
+    """Find only the configured ComfyUI server processes on Windows."""
+    pids: set[int] = set()
+    if _comfy_process is not None and _comfy_process.poll() is None:
+        pids.add(int(_comfy_process.pid))
+    if os.name != "nt":
+        return pids
+
+    query = (
+        "$items = Get-CimInstance Win32_Process | "
+        "Where-Object { $_.CommandLine -and "
+        "$_.CommandLine -match 'main\\.py' -and "
+        f"$_.CommandLine -match '--port\\s+{COMFYUI_PORT}(\\s|$)' "
+        "}; $items | Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", query],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return pids
+    for line in result.stdout.splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid > 0 and pid != os.getpid():
+            pids.add(pid)
+    return pids
+
+
+def stop_comfyui_process() -> str:
+    """Interrupt and stop the configured local ComfyUI server."""
+    global _comfy_process
+    try:
+        comfy_post("/interrupt", {})
+    except BotError:
+        pass
+
+    with _comfy_start_lock:
+        pids = _running_comfy_process_ids()
+        if not pids:
+            _comfy_process = None
+            return "ComfyUI 目前已關閉。"
+
+        failures: list[str] = []
+        for pid in sorted(pids):
+            try:
+                if os.name == "nt":
+                    result = subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=20,
+                        check=False,
+                    )
+                    if result.returncode != 0 and "not found" not in (
+                        result.stdout + result.stderr
+                    ).lower():
+                        failures.append(f"PID {pid}")
+                else:
+                    os.kill(pid, 15)
+            except (OSError, subprocess.TimeoutExpired):
+                failures.append(f"PID {pid}")
+        _comfy_process = None
+
+    deadline = time.time() + 20
+    while time.time() < deadline and comfyui_is_online():
+        time.sleep(0.25)
+    if comfyui_is_online():
+        return "已發出關閉 ComfyUI 的要求，但 8191 埠仍在回應。"
+    if failures:
+        return f"ComfyUI 關閉不完整，請檢查：{', '.join(failures)}"
+    return "ComfyUI 已關閉。"
+
+
+def restart_comfyui_process(vram_mode: Optional[str] = None) -> str:
+    """Stop and start the configured local Turbo ComfyUI server."""
+    stop_message = stop_comfyui_process()
+    start_message = start_comfyui_process(vram_mode)
+    return f"{stop_message}\n{start_message}"
+
+
+def multipart_request(url: str, fields: dict[str, str], file_field: str, file_path: Path) -> Any:
+    boundary = f"----MiniMaxH3Telegram{uuid.uuid4().hex}"
+    boundary_bytes = boundary.encode("ascii")
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                b"--" + boundary_bytes + b"\r\n",
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    chunks.extend(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; '
+                f'filename="{file_path.name}"\r\n'
+            ).encode("utf-8"),
+            b"Content-Type: video/mp4\r\n\r\n",
+            file_path.read_bytes(),
+            b"\r\n--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+    request = Request(
+        url,
+        data=b"".join(chunks),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise BotError(f"傳送影片失敗：{http_error_detail(exc)}") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise BotError(f"傳送影片失敗：{exc}") from exc
+    if not result.get("ok"):
+        raise BotError(result.get("description", "Telegram 傳送影片失敗。"))
+    return result
+
+
+def concat_videos(video_paths: list[Path], output_path: Path, total_seconds: float) -> Path:
+    """Join generated MP4 segments without re-encoding their video/audio streams."""
+    if len(video_paths) < 2:
+        raise BotError("長片至少需要兩段影片才能合併。")
+    if shutil.which(FFMPEG_PATH) is None and not Path(FFMPEG_PATH).is_file():
+        raise BotError(
+            f"找不到 FFmpeg：{FFMPEG_PATH}。請安裝 FFmpeg，或設定 MINIMAX_FFMPEG。"
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    list_path = output_path.with_suffix(".concat.txt")
+    lines = []
+    for video_path in video_paths:
+        escaped = str(video_path.resolve()).replace("\\", "/").replace("'", "'\\''")
+        lines.append(f"file '{escaped}'")
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    command = [
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_path),
+        "-t",
+        f"{total_seconds:.3f}",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BotError(f"合併長片時 FFmpeg 失敗：{exc}") from exc
+    finally:
+        try:
+            list_path.unlink()
+        except OSError:
+            pass
+
+    if result.returncode != 0 or not output_path.is_file():
+        details = (result.stderr or "").strip()
+        raise BotError(f"合併長片失敗：{details[-800:]}")
+    return output_path
+
+
+class TelegramClient:
+    def __init__(self, token: str):
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.file_base_url = f"https://api.telegram.org/file/bot{token}"
+
+    def call(self, method: str, params: Optional[dict[str, Any]] = None, timeout: float = 45.0) -> Any:
+        query = urlencode(params or {}, doseq=True)
+        url = f"{self.base_url}/{method}"
+        if query:
+            url += "?" + query
+        try:
+            with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            raise BotError(
+                f"Telegram 連線失敗：{http_error_detail(exc)}"
+            ) from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise BotError(f"Telegram 連線失敗：{exc}") from exc
+        if not result.get("ok"):
+            raise BotError(result.get("description", "Telegram API 失敗。"))
+        return result.get("result")
+
+    def get_file(self, file_id: str) -> str:
+        result = self.call("getFile", {"file_id": file_id}, timeout=30)
+        file_path = result.get("file_path") if isinstance(result, dict) else None
+        if not file_path:
+            raise BotError("Telegram 沒有回傳圖片檔案路徑。")
+        return str(file_path)
+
+    def download_file(self, file_path: str, target_path: Path) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with urlopen(
+                Request(
+                    f"{self.file_base_url}/{file_path}",
+                    headers={"Accept": "application/octet-stream"},
+                ),
+                timeout=120,
+            ) as response:
+                data = response.read(MAX_TELEGRAM_IMAGE_BYTES + 1)
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise BotError(f"下載 Telegram 圖片失敗：{exc}") from exc
+        if len(data) > MAX_TELEGRAM_IMAGE_BYTES:
+            raise BotError("圖片太大，請控制在 20 MB 以內。")
+        target_path.write_bytes(data)
+
+    def get_updates(self, offset: Optional[int]) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "timeout": 25,
+            "allowed_updates": json.dumps(["message", "callback_query"]),
+        }
+        if offset is not None:
+            params["offset"] = offset
+        result = self.call("getUpdates", params, timeout=35)
+        return result or []
+
+    def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        reply_markup: Optional[dict[str, Any]] = None,
+    ) -> None:
+        params: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        self.call("sendMessage", params, timeout=30)
+
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        params: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text
+        self.call("answerCallbackQuery", params, timeout=30)
+
+    def edit_message_text(
+        self,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        reply_markup: Optional[dict[str, Any]] = None,
+    ) -> None:
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if reply_markup is not None:
+            params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        self.call("editMessageText", params, timeout=30)
+
+    def send_video(self, chat_id: str, video_path: Path, caption: str) -> None:
+        multipart_request(
+            f"{self.base_url}/sendVideo",
+            {"chat_id": chat_id, "caption": caption, "supports_streaming": "true"},
+            "video",
+            video_path,
+        )
+
+
+class TelegramTurboBot:
+    def __init__(self, token: str, allowed_chat_id: str):
+        self.telegram = TelegramClient(token)
+        self.allowed_chat_id = str(allowed_chat_id)
+        self.offset: Optional[int] = None
+        self.pending_config: Optional[GenerationConfig] = None
+        self.job: Optional[JobState] = None
+        self.lock = threading.Lock()
+
+    def help_text(self) -> str:
+        return (
+            "MiniMax H3 Turbo 控制器\n\n"
+            "/gen 寬度 高度 steps 秒數\n"
+            "例如：/gen 864 480 12 15\n"
+            "下一則訊息貼完整提示詞即可。\n\n"
+            "也可同一則訊息輸入：\n"
+            "/gen 864 480 12 15\n你的提示詞\n\n"
+            "/status 查看狀態\n"
+            "/progress 查看即時生成進度\n"
+            "/comfy_restart 重啟 ComfyUI\n"
+            "/comfy_stop 關閉 ComfyUI\n"
+            "/cancel 取消目前生成\n"
+            "/help 查看說明"
+        )
+
+    def send_safe(self, chat_id: str, text: str) -> None:
+        try:
+            self.telegram.send_message(chat_id, text)
+        except BotError as exc:
+            print(f"Telegram sendMessage error: {exc}", flush=True)
+
+    @staticmethod
+    def progress_bar(percent: float) -> str:
+        bounded = max(0.0, min(100.0, percent))
+        filled = min(10, int(bounded / 10.0))
+        return "█" * filled + "░" * (10 - filled)
+
+    def progress_text(self) -> str:
+        with self.lock:
+            job = self.job
+            pending = self.pending_config
+        if job is None:
+            if pending is not None:
+                return "目前沒有生成中的工作，正在等待你貼上提示詞。"
+            return "目前沒有生成中的工作。"
+
+        with job.progress_lock:
+            percent = job.progress_percent
+            node_id = job.progress_node_id
+            node_state = job.progress_node_state
+            node_value = job.progress_node_value
+            node_max = job.progress_node_max
+            node_index = job.progress_node_index
+            node_total = job.progress_node_total
+            queue_remaining = job.progress_queue_remaining
+            phase = job.progress_phase
+
+        phase_labels = {
+            "queued": "等待 ComfyUI 開始",
+            "waiting": "等待 ComfyUI 回報進度",
+            "running": "執行 ComfyUI 節點",
+            "sampling": "採樣中",
+            "finishing": "正在整理影片與音訊",
+            "completed": "本段生成完成",
+            "merging": "正在合併長片分段",
+            "uploading": "正在傳回 Telegram",
+            "error": "生成錯誤",
+        }
+        phase_text = phase_labels.get(phase, phase)
+        elapsed = max(0, int(time.time() - job.started_at))
+        elapsed_text = f"{elapsed // 60}分 {elapsed % 60}秒"
+
+        if job.segment_total > 1:
+            completed_segments = max(0, job.segment_index - 1)
+            overall = min(
+                100.0,
+                ((completed_segments + percent / 100.0) / job.segment_total) * 100.0,
+            )
+            segment_line = (
+                f"長片：第 {job.segment_index}/{job.segment_total} 段\n"
+                f"總進度：{self.progress_bar(overall)} {overall:.1f}%\n"
+                f"本段進度：{self.progress_bar(percent)} {percent:.1f}%"
+            )
+        else:
+            overall = percent
+            segment_line = f"進度：{self.progress_bar(overall)} {overall:.1f}%"
+
+        node_labels = {
+            "1": "載入影片 VAE",
+            "2": "載入音訊 VAE",
+            "3": "載入文字／視覺編碼器",
+            "4": "載入 H3 模型",
+            "5": "套用 Turbo",
+            "6": "建立條件",
+            "7": "設定採樣器",
+            "8": "準備噪聲",
+            "9": "引導",
+            "10": "採樣",
+            "11": "VAE 解碼",
+            "12": "儲存影片",
+        }
+        lines = [
+            "📊 MiniMax H3 生成進度",
+            segment_line,
+            f"狀態：{phase_text}",
+            f"已用時間：{elapsed_text}",
+        ]
+        if node_id is not None:
+            node_name = node_labels.get(str(node_id), f"ComfyUI 節點 {node_id}")
+            if node_total:
+                node_name = f"{node_name}（{node_index}/{node_total}）"
+            lines.append(f"目前：{node_name}｜{node_state}")
+            if node_max > 1:
+                lines.append(f"節點進度：{node_value:.0f}/{node_max:.0f}")
+        elif phase in {"queued", "waiting", "running"}:
+            lines.append("詳細節點進度尚未回報，但 ComfyUI 任務仍在處理。")
+        if queue_remaining is not None:
+            lines.append(f"ComfyUI 佇列剩餘：{queue_remaining}")
+        if job.prompt_id:
+            lines.append(f"Prompt ID：{job.prompt_id}")
+        return "\n".join(lines)
+
+    def handle_message(self, message: dict[str, Any]) -> None:
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        if chat_id != self.allowed_chat_id:
+            return
+        text = str(message.get("text", "")).strip()
+        if not text:
+            return
+
+        if text.startswith("/"):
+            self.handle_command(chat_id, text)
+            return
+
+        with self.lock:
+            pending = self.pending_config
+            self.pending_config = None
+        if pending is None:
+            self.send_safe(chat_id, "請先使用 /gen 寬度 高度 steps 秒數，再貼提示詞。")
+            return
+        self.start_generation(chat_id, pending, text)
+
+    def handle_command(self, chat_id: str, text: str) -> None:
+        lines = text.splitlines()
+        first = lines[0].strip()
+        parts = first.split()
+        command = parts[0].split("@", 1)[0].lower()
+
+        if command in {"/start", "/help"}:
+            self.send_safe(chat_id, self.help_text())
+            return
+        if command == "/status":
+            with self.lock:
+                job = self.job
+                pending = self.pending_config
+            if pending:
+                self.send_safe(chat_id, "等待你貼上提示詞。")
+            elif job:
+                current = job.prompt_id or "正在提交到 ComfyUI"
+                self.send_safe(
+                    chat_id,
+                    f"生成中：{current}\n{job.config.width}×{job.config.height} | "
+                    f"{job.config.steps} steps | 約 {job.config.actual_seconds:.2f} 秒",
+                )
+            else:
+                self.send_safe(chat_id, "目前沒有生成工作。")
+            return
+        if command == "/cancel":
+            with self.lock:
+                job = self.job
+                self.pending_config = None
+                if job:
+                    job.cancel_event.set()
+            if job:
+                try:
+                    comfy_post("/interrupt", {})
+                except BotError:
+                    pass
+                self.send_safe(chat_id, "已要求取消目前生成。")
+            else:
+                self.send_safe(chat_id, "沒有正在生成的工作。")
+            return
+        if command != "/gen":
+            self.send_safe(chat_id, "不認識這個指令，輸入 /help 查看用法。")
+            return
+
+        if len(parts) < 5:
+            self.send_safe(chat_id, "格式：/gen 寬度 高度 steps 秒數\n例如：/gen 864 480 12 15")
+            return
+        try:
+            config = parse_config(parts[1:5])
+        except BotError as exc:
+            self.send_safe(chat_id, str(exc))
+            return
+
+        inline_prompt = " ".join(parts[5:]).strip()
+        if len(lines) > 1:
+            inline_prompt = (inline_prompt + "\n" + "\n".join(lines[1:])).strip()
+        if inline_prompt:
+            self.start_generation(chat_id, config, inline_prompt)
+            return
+
+        with self.lock:
+            if self.job:
+                self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或使用 /cancel。")
+                return
+            self.pending_config = config
+        self.send_safe(
+            chat_id,
+            f"設定已收取：{config.width}×{config.height} | {config.steps} steps | "
+            f"約 {config.actual_seconds:.2f} 秒。\n請下一則訊息貼上完整提示詞。",
+        )
+
+    def start_generation(
+        self,
+        chat_id: str,
+        config: GenerationConfig,
+        prompt: str,
+        input_image_path: Optional[Path] = None,
+    ) -> None:
+        prompt = prompt.strip()
+        if not prompt:
+            self.send_safe(chat_id, "提示詞不可為空白。")
+            return
+        with self.lock:
+            if self.job:
+                self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或使用 /cancel。")
+                return
+            job = JobState(
+                chat_id,
+                config,
+                prompt,
+                time.time(),
+                cancel_event=threading.Event(),
+                input_image_path=input_image_path,
+            )
+            self.job = job
+        thread = threading.Thread(target=self.run_job, args=(job,), daemon=True)
+        thread.start()
+
+    def ensure_comfyui_ready(self, job: JobState) -> None:
+        """Hook for a subclass to start or wait for ComfyUI before queuing."""
+        return
+
+    def comfyui_vram_mode(self) -> str:
+        return DEFAULT_COMFYUI_VRAM_MODE
+
+    def cancel_job_for_comfy_control(self) -> bool:
+        """Mark the active Telegram job cancelled before stopping ComfyUI."""
+        with self.lock:
+            job = self.job
+            if job is not None:
+                job.cancel_event.set()
+        return job is not None
+
+    def run_segment(self, job: JobState, announce: bool = True) -> Path:
+        segment_started_at = time.time()
+        image_name: Optional[str] = None
+        if job.input_image_path is not None and job.segment_index == 1:
+            if job.comfy_image_name is None:
+                job.comfy_image_name = upload_image_to_comfy(job.input_image_path)
+            image_name = job.comfy_image_name
+        elif job.segment_index > 1 and job.continuation_image_path is not None:
+            image_name = upload_image_to_comfy(job.continuation_image_path)
+        workflow = build_workflow(
+            job.config,
+            segment_prompt(job),
+            job.output_prefix,
+            image_name=image_name,
+        )
+        response = comfy_post(
+            "/prompt",
+            {"prompt": workflow, "client_id": "telegram-turbo-bot"},
+        )
+        prompt_id = response.get("prompt_id")
+        if not prompt_id:
+            raise BotError(f"ComfyUI 沒有回傳 prompt_id：{response}")
+        job.prompt_id = str(prompt_id)
+        with job.progress_lock:
+            job.progress_percent = 0.0
+            job.progress_node_id = None
+            job.progress_node_state = "queued"
+            job.progress_node_value = 0.0
+            job.progress_node_max = 1.0
+            job.progress_node_index = 0
+            job.progress_node_total = 0
+            job.progress_queue_remaining = None
+            job.progress_phase = "waiting"
+        progress_tracker = ComfyProgressTracker(job)
+        job.progress_tracker = progress_tracker
+        progress_tracker.start()
+        if announce:
+            self.send_safe(
+                job.chat_id,
+                f"已開始生成：{job.config.width}×{job.config.height} | "
+                f"{job.config.steps} steps | 約 {job.config.actual_seconds:.2f} 秒\n"
+                f"Prompt ID: {prompt_id}",
+            )
+
+        try:
+            history: Optional[dict[str, Any]] = None
+            while True:
+                if job.cancel_event.is_set():
+                    raise BotError("生成已取消。")
+                try:
+                    history_all = comfy_post(f"/history/{prompt_id}")
+                    history = (
+                        history_all.get(str(prompt_id))
+                        if isinstance(history_all, dict)
+                        else None
+                    )
+                except BotError:
+                    history = None
+                if history:
+                    status = history.get("status", {})
+                    status_name = status.get("status_str")
+                    if status_name == "error":
+                        raise BotError(self.execution_error(history))
+                    if status.get("completed") or status_name == "success":
+                        break
+                time.sleep(3)
+
+            video_path = self.find_video(history or {}, segment_started_at)
+            if video_path is None:
+                raise BotError("生成完成，但找不到输出 MP4。请在 ComfyUI output 資料夾查看。")
+            with job.progress_lock:
+                job.progress_percent = 100.0
+                job.progress_phase = "completed"
+                job.progress_node_state = "finished"
+            return video_path
+        finally:
+            progress_tracker.stop()
+            if job.progress_tracker is progress_tracker:
+                job.progress_tracker = None
+
+    def run_job(self, job: JobState) -> None:
+        try:
+            self.ensure_comfyui_ready(job)
+            video_path = self.run_segment(job, announce=True)
+            with job.progress_lock:
+                job.progress_phase = "uploading"
+            caption = (
+                f"MiniMax H3 Turbo 完成\n{job.config.width}×{job.config.height} | "
+                f"{job.config.steps} steps | {job.config.actual_seconds:.2f} 秒"
+            )
+            self.telegram.send_video(job.chat_id, video_path, caption)
+        except Exception as exc:  # keep the long-polling bot alive after one job fails
+            if not job.cancel_event.is_set():
+                self.send_safe(job.chat_id, f"生成失败：{exc}")
+            print(f"generation error: {exc}", flush=True)
+        finally:
+            with self.lock:
+                if self.job is job:
+                    self.job = None
+
+    @staticmethod
+    def execution_error(history: dict[str, Any]) -> str:
+        for message in history.get("status", {}).get("messages", []):
+            if isinstance(message, list) and message and message[0] == "execution_error":
+                details = message[1] if len(message) > 1 else {}
+                return str(details.get("exception_message", "ComfyUI execution error"))
+        return "ComfyUI execution error"
+
+    @staticmethod
+    def find_video(history: dict[str, Any], started_at: float) -> Optional[Path]:
+        candidates: list[Path] = []
+        for node_output in history.get("outputs", {}).values():
+            if not isinstance(node_output, dict):
+                continue
+            for key in ("gifs", "videos", "files"):
+                for item in node_output.get(key, []) or []:
+                    if not isinstance(item, dict) or not item.get("filename"):
+                        continue
+                    path = OUTPUT_DIR / str(item.get("subfolder", "")) / str(item["filename"])
+                    if path.is_file():
+                        candidates.append(path)
+
+        if OUTPUT_DIR.is_dir():
+            for path in OUTPUT_DIR.rglob("*.mp4"):
+                try:
+                    if path.stat().st_mtime >= started_at - 5 and "Telegram_Turbo" in path.name:
+                        candidates.append(path)
+                except OSError:
+                    continue
+
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            key = str(path.resolve()).lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(path)
+        audio = [path for path in unique if path.name.lower().endswith("-audio.mp4")]
+        return (audio or unique)[0] if (audio or unique) else None
+
+    def run(self) -> None:
+        self.send_safe(
+            self.allowed_chat_id,
+            "MiniMax H3 Turbo Telegram 控制器已啟動。輸入 /help 查看用法。",
+        )
+        while True:
+            try:
+                updates = self.telegram.get_updates(self.offset)
+                for update in updates:
+                    self.offset = int(update["update_id"]) + 1
+                    message = update.get("message")
+                    if message:
+                        self.handle_message(message)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                print(f"polling error: {exc}", flush=True)
+                time.sleep(5)
+
+
+class TelegramMenuBot(TelegramTurboBot):
+    """Button-driven Telegram UI with persistent generation settings."""
+
+    RESOLUTIONS = ((608, 352), (736, 416), (864, 480), (960, 544))
+    SECONDS = (5, 10, 12, 15)
+    LONG_SECONDS = (30, 60, 120, 180, 300, 600, 900, 1200, 1800)
+    STEPS = (4, 8, 12)
+
+    def __init__(self, token: str, allowed_chat_id: str):
+        super().__init__(token, allowed_chat_id)
+        self.settings = self.load_settings()
+        self.total_seconds = self.load_saved_total_seconds()
+        self.prompt = self.load_saved_prompt()
+        self.input_mode = self.load_saved_mode()
+        self.image_path = self.load_saved_image_path()
+        self.vram_mode = self.load_saved_vram_mode()
+        self.awaiting_prompt = False
+        self.awaiting_duration = False
+
+    @staticmethod
+    def default_settings() -> GenerationConfig:
+        return parse_config(["864", "480", "12", "15"])
+
+    def load_settings(self) -> GenerationConfig:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            return parse_config(
+                [
+                    str(saved["width"]),
+                    str(saved["height"]),
+                    str(saved["steps"]),
+                    str(saved["seconds"]),
+                ]
+            )
+        except (OSError, ValueError, KeyError, TypeError, BotError, json.JSONDecodeError):
+            return self.default_settings()
+
+    @staticmethod
+    def load_saved_prompt() -> str:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            prompt = saved.get("prompt", "")
+            return str(prompt).strip() if prompt else ""
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return ""
+
+    @staticmethod
+    def load_saved_mode() -> str:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            mode = str(saved.get("input_mode", "text"))
+            return mode if mode in {"text", "image"} else "text"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return "text"
+
+    @staticmethod
+    def load_saved_vram_mode() -> str:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            return normalize_comfyui_vram_mode(saved.get("comfy_vram_mode"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return DEFAULT_COMFYUI_VRAM_MODE
+
+    def comfyui_vram_mode(self) -> str:
+        return normalize_comfyui_vram_mode(self.vram_mode)
+
+    @staticmethod
+    def load_saved_image_path() -> Optional[Path]:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = str(saved.get("image_path", "")).strip()
+            path = Path(value) if value else None
+            if not path or not path.is_file():
+                return None
+            try:
+                path.resolve().relative_to(IMAGE_DIR.resolve())
+            except ValueError:
+                return None
+            return path
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def load_saved_total_seconds(self) -> float:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = float(saved.get("total_seconds", saved.get("seconds", 15)))
+            return validate_total_seconds(value)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        except BotError:
+            pass
+        return float(self.settings.requested_seconds)
+
+    def save_settings(self) -> None:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = STATE_PATH.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(
+                {
+                    "width": self.settings.width,
+                    "height": self.settings.height,
+                    "steps": self.settings.steps,
+                    "seconds": self.settings.requested_seconds,
+                    "total_seconds": getattr(
+                        self, "total_seconds", self.settings.requested_seconds
+                    ),
+                    "prompt": getattr(self, "prompt", ""),
+                    "input_mode": getattr(self, "input_mode", "text"),
+                    "comfy_vram_mode": normalize_comfyui_vram_mode(
+                        getattr(self, "vram_mode", DEFAULT_COMFYUI_VRAM_MODE)
+                    ),
+                    "image_path": (
+                        str(getattr(self, "image_path", ""))
+                        if getattr(self, "image_path", None)
+                        else ""
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary_path.replace(STATE_PATH)
+
+    def update_settings(
+        self,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        steps: Optional[int] = None,
+        seconds: Optional[float] = None,
+    ) -> None:
+        current = self.settings
+        self.settings = parse_config(
+            [
+                str(width if width is not None else current.width),
+                str(height if height is not None else current.height),
+                str(steps if steps is not None else current.steps),
+                str(seconds if seconds is not None else current.requested_seconds),
+            ]
+        )
+        self.save_settings()
+
+    @staticmethod
+    def selected(label: str, active: bool) -> str:
+        return ("✅ " if active else "") + label
+
+    @staticmethod
+    def duration_label(seconds: float) -> str:
+        if seconds >= 60 and seconds % 60 == 0:
+            return f"{int(seconds // 60)} 分鐘"
+        return f"{seconds:g} 秒"
+
+    def menu_markup(self) -> dict[str, Any]:
+        current = self.settings
+        mode_row = [
+            {
+                "text": self.selected("📝 文字生视频", self.input_mode == "text"),
+                "callback_data": "mode:text",
+            },
+            {
+                "text": self.selected("🖼 图片生视频", self.input_mode == "image"),
+                "callback_data": "mode:image",
+            },
+        ]
+        vram_row = [
+            {
+                "text": self.selected(
+                    "⚡ 快速 Turbo",
+                    self.comfyui_vram_mode() == "lowvram",
+                ),
+                "callback_data": "vram:lowvram",
+            },
+            {
+                "text": self.selected(
+                    "🧠 极限显存",
+                    self.comfyui_vram_mode() == "novram",
+                ),
+                "callback_data": "vram:novram",
+            },
+        ]
+        resolution_row = [
+            {
+                "text": self.selected(
+                    f"{width}×{height}",
+                    (width, height) == (current.width, current.height),
+                ),
+                "callback_data": f"res:{width}x{height}",
+            }
+            for width, height in self.RESOLUTIONS
+        ]
+        short_seconds_row = [
+            {
+                "text": self.selected(
+                    self.duration_label(seconds), abs(self.total_seconds - seconds) < 0.001
+                ),
+                "callback_data": f"sec:{seconds}",
+            }
+            for seconds in self.SECONDS
+        ]
+        long_seconds_row = [
+            {
+                "text": self.selected(
+                    self.duration_label(seconds), abs(self.total_seconds - seconds) < 0.001
+                ),
+                "callback_data": f"sec:{seconds}",
+            }
+            for seconds in self.LONG_SECONDS
+        ]
+        custom_seconds_row = [
+            {"text": "✏️ 自定義秒數", "callback_data": "sec_custom"}
+        ]
+        steps_row = [
+            {
+                "text": self.selected(f"{steps} steps", current.steps == steps),
+                "callback_data": f"steps:{steps}",
+            }
+            for steps in self.STEPS
+        ]
+        return {
+            "inline_keyboard": [
+                [{"text": "🎬 生成模式（选择一种）", "callback_data": "noop"}],
+                mode_row,
+                [{"text": "ComfyUI 顯存模式（切換後會自動重啟）", "callback_data": "noop"}],
+                vram_row,
+                [{"text": "⏱ 總片長（短片）", "callback_data": "noop"}],
+                short_seconds_row,
+                [{"text": "🎞 總片長（長片，會自動分段）", "callback_data": "noop"}],
+                long_seconds_row[:4],
+                long_seconds_row[4:8],
+                long_seconds_row[8:],
+                custom_seconds_row,
+                [{"text": "🖼 解析度（按下選擇）", "callback_data": "noop"}],
+                resolution_row,
+                [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
+                steps_row,
+                [
+                    {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
+                    {"text": "🧹 清除提示詞", "callback_data": "clear"},
+                    {"text": "🗑 清除图片", "callback_data": "clear_image"},
+                ],
+                [
+                    {"text": "🚀 生成影片", "callback_data": "generate"},
+                    {"text": "♻️ 讀取上次設定", "callback_data": "last"},
+                ],
+                [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
+                [
+                    {"text": "▶️ 啟動 ComfyUI", "callback_data": "comfy_start"},
+                    {"text": "📡 ComfyUI 狀態", "callback_data": "comfy_status"},
+                ],
+                [
+                    {"text": "🔄 重啟 ComfyUI", "callback_data": "comfy_restart"},
+                    {"text": "⏹ 關閉 ComfyUI", "callback_data": "comfy_stop"},
+                ],
+            ]
+        }
+
+    def effective_config(self) -> GenerationConfig:
+        segment_seconds = min(self.total_seconds, MAX_SEGMENT_SECONDS)
+        return parse_config(
+            [
+                str(self.settings.width),
+                str(self.settings.height),
+                str(self.settings.steps),
+                str(segment_seconds),
+            ]
+        )
+
+    def set_total_seconds(self, seconds: float) -> None:
+        if not math.isfinite(seconds):
+            raise BotError("總片長必須是有效數字，範圍為 2 至 1800 秒。")
+        self.total_seconds = validate_total_seconds(seconds)
+        self.update_settings(seconds=min(self.total_seconds, MAX_SEGMENT_SECONDS))
+
+    def start_selected_generation(self, chat_id: str, prompt: str) -> None:
+        config = self.effective_config()
+        input_image_path = (
+            self.image_path
+            if self.input_mode == "image" and self.image_path and self.image_path.is_file()
+            else None
+        )
+        if self.total_seconds > MAX_SEGMENT_SECONDS:
+            self.start_long_generation(
+                chat_id,
+                config,
+                prompt,
+                self.total_seconds,
+                input_image_path=input_image_path,
+            )
+        else:
+            self.start_generation(chat_id, config, prompt, input_image_path=input_image_path)
+
+    def start_long_generation(
+        self,
+        chat_id: str,
+        config: GenerationConfig,
+        prompt: str,
+        total_seconds: float,
+        input_image_path: Optional[Path] = None,
+    ) -> None:
+        prompt = prompt.strip()
+        if not prompt:
+            self.send_safe(chat_id, "提示詞不可為空白。")
+            return
+        total_seconds = validate_total_seconds(total_seconds)
+        segment_total = math.ceil(total_seconds / MAX_SEGMENT_SECONDS)
+        batch_prefix = f"{OUTPUT_PREFIX}/long_{uuid.uuid4().hex[:12]}"
+        with self.lock:
+            if self.job:
+                self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或使用 /cancel。")
+                return
+            job = JobState(
+                chat_id,
+                config,
+                prompt,
+                time.time(),
+                cancel_event=threading.Event(),
+                output_prefix=batch_prefix,
+                segment_total=segment_total,
+                total_seconds=total_seconds,
+                input_image_path=input_image_path,
+            )
+            self.job = job
+        thread = threading.Thread(target=self.run_long_job, args=(job,), daemon=True)
+        thread.start()
+
+    def run_long_job(self, job: JobState) -> None:
+        try:
+            self.ensure_comfyui_ready(job)
+            base_prefix = job.output_prefix
+            video_paths: list[Path] = []
+            if job.input_image_path is not None:
+                self.send_safe(
+                    job.chat_id,
+                    "圖片長片會把圖片用作第一段首幀，後續段落用提示詞接續生成。",
+                )
+            for index in range(1, job.segment_total + 1):
+                if job.cancel_event.is_set():
+                    return
+                job.segment_index = index
+                job.output_prefix = f"{base_prefix}/segment_{index:02d}"
+                self.send_safe(
+                    job.chat_id,
+                    f"長片第 {index}/{job.segment_total} 段開始生成（每段約 "
+                    f"{job.config.actual_seconds:.2f} 秒）。",
+                )
+                video_path = self.run_segment(job, announce=False)
+                video_paths.append(video_path)
+                if index < job.segment_total:
+                    previous_frame = job.continuation_image_path
+                    continuation_path = (
+                        CONTINUATION_DIR
+                        / f"{uuid.uuid4().hex}_segment_{index:03d}.png"
+                    )
+                    job.continuation_image_path = extract_last_frame(
+                        video_path, continuation_path
+                    )
+                    if previous_frame and previous_frame != continuation_path:
+                        try:
+                            previous_frame.unlink()
+                        except OSError:
+                            pass
+                self.send_safe(job.chat_id, f"長片第 {index}/{job.segment_total} 段完成。")
+
+            if job.cancel_event.is_set():
+                return
+            batch_name = base_prefix.rsplit("/", 1)[-1]
+            output_path = OUTPUT_DIR / base_prefix / f"{batch_name}.mp4"
+            with job.progress_lock:
+                job.progress_phase = "merging"
+                job.progress_percent = 100.0
+                job.progress_node_id = None
+                job.progress_node_state = "merging"
+            concat_videos(video_paths, output_path, job.total_seconds)
+            with job.progress_lock:
+                job.progress_phase = "uploading"
+            caption = (
+                f"MiniMax H3 Turbo 長片完成\n{job.total_seconds:.0f} 秒 | "
+                f"{job.config.width}×{job.config.height} | {job.config.steps} steps | "
+                f"{job.segment_total} 段合併"
+            )
+            self.telegram.send_video(job.chat_id, output_path, caption)
+        except Exception as exc:
+            if not job.cancel_event.is_set():
+                self.send_safe(job.chat_id, f"長片生成失敗：{exc}")
+            print(f"long generation error: {exc}", flush=True)
+        finally:
+            if job.continuation_image_path:
+                try:
+                    job.continuation_image_path.unlink()
+                except OSError:
+                    pass
+            with self.lock:
+                if self.job is job:
+                    self.job = None
+
+    def menu_text(self, notice: str = "") -> str:
+        current = self.settings
+        prompt_status = f"已輸入（{len(self.prompt)} 字）" if self.prompt else "尚未輸入"
+        mode_text = "圖片生視頻" if self.input_mode == "image" else "文字生視頻"
+        image_status = "已收到" if self.image_path and self.image_path.is_file() else "未收到"
+        prefix = f"{notice}\n\n" if notice else ""
+        if self.total_seconds > MAX_SEGMENT_SECONDS:
+            segment_count = math.ceil(self.total_seconds / MAX_SEGMENT_SECONDS)
+            duration_text = (
+                f"總片長：約 {self.total_seconds:.0f} 秒（{segment_count} 段，每段最多 15 秒）"
+            )
+        else:
+            effective = self.effective_config()
+            duration_text = (
+                f"總片長：約 {effective.actual_seconds:.2f} 秒（{effective.length} frames）"
+            )
+        return (
+            f"{prefix}MiniMax H3 Turbo 控制面板\n\n"
+            f"模式：{mode_text}\n"
+            f"輸入圖片：{image_status}\n"
+            f"解析度：{current.width}×{current.height}\n"
+            f"步數：{current.steps}\n"
+                f"{duration_text}\n"
+                f"ComfyUI 顯存模式：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"
+            f"提示詞：{prompt_status}\n\n"
+            "圖片模式：先發圖片，再輸入提示詞；文字模式：直接輸入提示詞。\n"
+            "最後按「生成影片」。\n"
+            "長片會自動分段生成後合併，設定和提示詞會自動保存。"
+        )
+
+    def show_progress(
+        self,
+        chat_id: str,
+        message_id: Optional[int] = None,
+    ) -> None:
+        text = self.progress_text()
+        markup = self.menu_markup()
+        try:
+            if message_id is None:
+                self.telegram.send_message(chat_id, text, reply_markup=markup)
+            else:
+                self.telegram.edit_message_text(
+                    chat_id, message_id, text, reply_markup=markup
+                )
+        except BotError as exc:
+            if message_id is not None and "not modified" in str(exc).lower():
+                return
+            self.send_safe(chat_id, f"讀取生成進度失敗：{exc}")
+
+    def show_menu(
+        self,
+        chat_id: str,
+        message_id: Optional[int] = None,
+        notice: str = "",
+    ) -> None:
+        text = self.menu_text(notice)
+        markup = self.menu_markup()
+        try:
+            if message_id is None:
+                self.telegram.send_message(chat_id, text, reply_markup=markup)
+            else:
+                self.telegram.edit_message_text(
+                    chat_id, message_id, text, reply_markup=markup
+                )
+        except BotError as exc:
+            if message_id is not None and "not modified" in str(exc).lower():
+                return
+            self.send_safe(chat_id, f"選單更新失敗：{exc}")
+
+    def request_duration(self, chat_id: str) -> None:
+        self.awaiting_duration = True
+        self.awaiting_prompt = False
+        self.telegram.send_message(
+            chat_id,
+            "請輸入總片長秒數（2 至 1800），例如 37、180、600 或 1800。",
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "例如 600",
+            },
+        )
+
+    def request_prompt(self, chat_id: str) -> None:
+        self.awaiting_duration = False
+        self.awaiting_prompt = True
+        self.telegram.send_message(
+            chat_id,
+            "請下一則訊息貼上提示詞，可以是多行文字。完成後回到面板按「生成影片」。",
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "貼上影片提示詞",
+            },
+        )
+
+    def comfy_status_text(self) -> str:
+        if comfyui_is_online():
+            return f"ComfyUI 正常運行中：{COMFY_URL}"
+        if _comfy_process is not None and _comfy_process.poll() is None:
+            return f"ComfyUI 程序已啟動，仍在載入：PID {_comfy_process.pid}"
+        return f"ComfyUI 目前未運行：{COMFY_URL}"
+
+    def ensure_comfyui_ready(self, job: JobState) -> None:
+        if comfyui_is_online():
+            return
+        self.send_safe(job.chat_id, start_comfyui_process(self.comfyui_vram_mode()))
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if job.cancel_event.is_set():
+                return
+            if comfyui_is_online():
+                self.send_safe(job.chat_id, "ComfyUI 已就緒，開始送出影片工作。")
+                return
+            time.sleep(3)
+        raise BotError(f"ComfyUI 在 180 秒內沒有就緒，請查看日誌：{COMFYUI_LOG}")
+
+    @staticmethod
+    def image_file_id(message: dict[str, Any]) -> Optional[str]:
+        photos = message.get("photo")
+        if isinstance(photos, list) and photos:
+            largest = photos[-1]
+            if isinstance(largest, dict) and largest.get("file_id"):
+                return str(largest["file_id"])
+        document = message.get("document")
+        if isinstance(document, dict) and document.get("file_id"):
+            mime_type = str(document.get("mime_type", "")).lower()
+            file_name = str(document.get("file_name", "")).lower()
+            if mime_type.startswith("image/") or Path(file_name).suffix.lower() in {
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".bmp",
+            }:
+                return str(document["file_id"])
+        return None
+
+    def handle_image_message(self, message: dict[str, Any], chat_id: str) -> None:
+        file_id = self.image_file_id(message)
+        if not file_id:
+            return
+        try:
+            remote_path = self.telegram.get_file(file_id)
+            suffix = Path(remote_path).suffix.lower()
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+                suffix = ".jpg"
+            IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+            for old_path in IMAGE_DIR.glob("current_input.*"):
+                try:
+                    old_path.unlink()
+                except OSError:
+                    pass
+            target_path = IMAGE_DIR / f"current_input{suffix}"
+            self.telegram.download_file(remote_path, target_path)
+            self.image_path = target_path
+            self.input_mode = "image"
+            self.awaiting_prompt = False
+            self.awaiting_duration = False
+            caption = str(message.get("caption", "")).strip()
+            if caption:
+                self.prompt = caption
+            self.save_settings()
+            if caption:
+                self.show_menu(chat_id, notice="图片和提示詞已收到")
+            else:
+                self.show_menu(chat_id, notice="图片已收到；现在输入提示詞")
+        except BotError as exc:
+            self.send_safe(chat_id, f"处理图片失败：{exc}")
+
+    def handle_message(self, message: dict[str, Any]) -> None:
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        if chat_id != self.allowed_chat_id:
+            return
+        if self.image_file_id(message):
+            self.handle_image_message(message, chat_id)
+            return
+        text = str(message.get("text", "")).strip()
+        if not text:
+            return
+        if self.awaiting_duration and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            try:
+                self.set_total_seconds(float(text))
+                self.awaiting_duration = False
+                self.show_menu(chat_id, notice="自定義總片長已更新")
+            except (BotError, ValueError) as exc:
+                self.send_safe(chat_id, str(exc))
+            return
+        if self.awaiting_prompt and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            self.prompt = text
+            self.awaiting_prompt = False
+            self.save_settings()
+            self.show_menu(chat_id, notice="提示詞已更新")
+            return
+        if text.startswith("/"):
+            self.handle_command(chat_id, text)
+        else:
+            self.show_menu(chat_id)
+
+    def handle_callback(self, callback: dict[str, Any]) -> None:
+        query_id = str(callback.get("id", ""))
+        message = callback.get("message") or {}
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        if chat_id != self.allowed_chat_id:
+            return
+        try:
+            self.telegram.answer_callback_query(query_id)
+        except BotError:
+            pass
+
+        data = str(callback.get("data", ""))
+        message_id = message.get("message_id")
+        try:
+            if data == "noop":
+                return
+            if data == "progress":
+                self.show_progress(chat_id, message_id)
+                return
+            if data == "mode:text":
+                self.input_mode = "text"
+                self.save_settings()
+                self.show_menu(chat_id, message_id, "已切换到文字生视频")
+                return
+            if data == "mode:image":
+                self.input_mode = "image"
+                self.save_settings()
+                self.show_menu(chat_id, message_id, "请发送一张图片")
+                return
+            if data.startswith("res:"):
+                width, height = data.removeprefix("res:").split("x", 1)
+                self.update_settings(width=int(width), height=int(height))
+                self.show_menu(chat_id, message_id, "解析度已更新")
+                return
+            if data == "sec_custom":
+                self.request_duration(chat_id)
+                return
+            if data.startswith("sec:"):
+                self.set_total_seconds(float(data.removeprefix("sec:")))
+                self.show_menu(chat_id, message_id, "總片長已更新；超過 15 秒會自動分段合併")
+                return
+            if data.startswith("steps:"):
+                self.update_settings(steps=int(data.removeprefix("steps:")))
+                self.show_menu(chat_id, message_id, "steps 已更新")
+                return
+            if data == "last":
+                self.settings = self.load_settings()
+                self.total_seconds = self.load_saved_total_seconds()
+                self.prompt = self.load_saved_prompt()
+                self.input_mode = self.load_saved_mode()
+                self.image_path = self.load_saved_image_path()
+                self.show_menu(chat_id, message_id, "已讀取上次設定")
+                return
+            if data == "prompt":
+                self.request_prompt(chat_id)
+                return
+            if data == "clear":
+                self.prompt = ""
+                self.awaiting_prompt = False
+                self.save_settings()
+                self.show_menu(chat_id, message_id, "提示詞已清除")
+                return
+            if data == "clear_image":
+                if self.image_path and self.image_path.is_file():
+                    try:
+                        self.image_path.unlink()
+                    except OSError:
+                        pass
+                self.image_path = None
+                self.save_settings()
+                self.show_menu(chat_id, message_id, "输入图片已清除")
+                return
+            if data.startswith("vram:"):
+                mode = normalize_comfyui_vram_mode(data.removeprefix("vram:"))
+                self.vram_mode = mode
+                self.save_settings()
+                cancelled = self.cancel_job_for_comfy_control()
+                result = restart_comfyui_process(mode)
+                prefix = "已取消目前生成工作。\n" if cancelled else ""
+                self.send_safe(
+                    chat_id,
+                    prefix
+                    + f"已切換到{comfyui_vram_mode_label(mode)}，正在重啟 ComfyUI。\n"
+                    + result,
+                )
+                self.show_menu(chat_id, message_id)
+                return
+            if data == "comfy_start":
+                self.send_safe(chat_id, start_comfyui_process(self.comfyui_vram_mode()))
+                return
+            if data == "comfy_status":
+                self.send_safe(chat_id, self.comfy_status_text())
+                return
+            if data == "comfy_restart":
+                cancelled = self.cancel_job_for_comfy_control()
+                result = restart_comfyui_process(self.comfyui_vram_mode())
+                prefix = "目前生成已取消。\n" if cancelled else ""
+                self.send_safe(chat_id, prefix + result)
+                return
+            if data == "comfy_stop":
+                cancelled = self.cancel_job_for_comfy_control()
+                result = stop_comfyui_process()
+                prefix = "目前生成已取消。\n" if cancelled else ""
+                self.send_safe(chat_id, prefix + result)
+                return
+            if data == "generate":
+                if self.awaiting_duration:
+                    self.send_safe(chat_id, "請先輸入自定義總片長秒數，或使用 /cancel 取消。")
+                elif self.awaiting_prompt:
+                    self.send_safe(chat_id, "請先貼上提示詞，或使用 /cancel。")
+                elif self.input_mode == "image" and not self.image_path:
+                    self.send_safe(chat_id, "圖片模式還沒有圖片；請先發送一張圖片。")
+                elif not self.prompt:
+                    self.request_prompt(chat_id)
+                else:
+                    self.start_selected_generation(chat_id, self.prompt)
+                    self.show_menu(chat_id, message_id, "已送出生成工作")
+        except (BotError, ValueError) as exc:
+            self.send_safe(chat_id, str(exc))
+
+    def handle_command(self, chat_id: str, text: str) -> None:
+        lines = text.splitlines()
+        parts = lines[0].strip().split()
+        command = parts[0].split("@", 1)[0].lower()
+
+        if command in {"/start", "/menu", "/help"}:
+            self.show_menu(chat_id)
+            return
+        if command == "/prompt":
+            self.request_prompt(chat_id)
+            return
+        if command == "/image":
+            self.input_mode = "image"
+            self.save_settings()
+            self.send_safe(chat_id, "已切换到图片生视频；请发送一张图片。")
+            return
+        if command == "/text":
+            self.input_mode = "text"
+            self.save_settings()
+            self.send_safe(chat_id, "已切换到文字生视频。")
+            return
+        if command in {"/comfy_status", "/comfy"}:
+            self.send_safe(chat_id, self.comfy_status_text())
+            return
+        if command == "/comfy_start":
+            try:
+                self.send_safe(chat_id, start_comfyui_process(self.comfyui_vram_mode()))
+            except BotError as exc:
+                self.send_safe(chat_id, str(exc))
+            return
+        if command == "/comfy_restart":
+            try:
+                cancelled = self.cancel_job_for_comfy_control()
+                result = restart_comfyui_process(self.comfyui_vram_mode())
+                prefix = "目前生成已取消。\n" if cancelled else ""
+                self.send_safe(chat_id, prefix + result)
+            except BotError as exc:
+                self.send_safe(chat_id, str(exc))
+            return
+        if command == "/comfy_stop":
+            try:
+                cancelled = self.cancel_job_for_comfy_control()
+                result = stop_comfyui_process()
+                prefix = "目前生成已取消。\n" if cancelled else ""
+                self.send_safe(chat_id, prefix + result)
+            except BotError as exc:
+                self.send_safe(chat_id, str(exc))
+            return
+        if command == "/progress":
+            self.send_safe(chat_id, self.progress_text())
+            return
+        if command == "/status":
+            with self.lock:
+                job = self.job
+            if job:
+                self.send_safe(chat_id, self.progress_text())
+            elif self.awaiting_prompt:
+                self.send_safe(chat_id, "等待你貼上提示詞。")
+            else:
+                self.show_menu(chat_id)
+            return
+        if command == "/cancel":
+            self.awaiting_prompt = False
+            self.awaiting_duration = False
+            with self.lock:
+                job = self.job
+                if job:
+                    job.cancel_event.set()
+            if job:
+                try:
+                    comfy_post("/interrupt", {})
+                except BotError:
+                    pass
+                self.send_safe(chat_id, "已要求取消目前生成。")
+            else:
+                self.show_menu(chat_id, notice="已取消輸入")
+            return
+        if command in {"/duration", "/seconds"}:
+            if len(parts) < 2:
+                self.request_duration(chat_id)
+                return
+            try:
+                self.set_total_seconds(float(parts[1]))
+                self.awaiting_duration = False
+                self.show_menu(chat_id, notice="自定義總片長已更新")
+            except (BotError, ValueError) as exc:
+                self.send_safe(chat_id, str(exc))
+            return
+        if command == "/long":
+            if len(parts) < 5:
+                self.send_safe(chat_id, "格式：/long 寬度 高度 steps 總秒數（30、60 或 120）")
+                return
+            try:
+                total_seconds = validate_total_seconds(float(parts[4]))
+                if not (MIN_TOTAL_SECONDS <= total_seconds <= MAX_TOTAL_SECONDS):
+                    raise BotError("長片總秒數只支援 30、60 或 120 秒。")
+                config = parse_config([parts[1], parts[2], parts[3], "15"])
+                self.settings = config
+                self.total_seconds = total_seconds
+                self.save_settings()
+            except (BotError, ValueError) as exc:
+                self.send_safe(chat_id, str(exc))
+                return
+            inline_prompt = " ".join(parts[5:]).strip()
+            if len(lines) > 1:
+                inline_prompt = (inline_prompt + "\n" + "\n".join(lines[1:])).strip()
+            if inline_prompt:
+                self.prompt = inline_prompt
+                self.save_settings()
+                self.start_selected_generation(chat_id, self.prompt)
+            else:
+                self.request_prompt(chat_id)
+            return
+        if command == "/gen":
+            if len(parts) < 5:
+                self.send_safe(chat_id, "也可以使用按鈕；格式：/gen 寬度 高度 steps 秒數")
+                return
+            try:
+                total_seconds = validate_total_seconds(float(parts[4]))
+                self.settings = parse_config(
+                    [parts[1], parts[2], parts[3], str(min(total_seconds, MAX_SEGMENT_SECONDS))]
+                )
+                self.total_seconds = total_seconds
+                self.save_settings()
+            except (BotError, ValueError) as exc:
+                self.send_safe(chat_id, str(exc))
+                return
+            inline_prompt = " ".join(parts[5:]).strip()
+            if len(lines) > 1:
+                inline_prompt = (inline_prompt + "\n" + "\n".join(lines[1:])).strip()
+            if inline_prompt:
+                self.prompt = inline_prompt
+                self.save_settings()
+                self.start_selected_generation(chat_id, self.prompt)
+            else:
+                self.request_prompt(chat_id)
+            return
+        self.send_safe(chat_id, "輸入 /menu 開啟按鈕控制面板。")
+
+    def run(self) -> None:
+        self.show_menu(self.allowed_chat_id, notice="Turbo Telegram 控制器已啟動")
+        while True:
+            try:
+                updates = self.telegram.get_updates(self.offset)
+                for update in updates:
+                    self.offset = int(update["update_id"]) + 1
+                    if update.get("callback_query"):
+                        self.handle_callback(update["callback_query"])
+                    elif update.get("message"):
+                        self.handle_message(update["message"])
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                print(f"polling error: {exc}", flush=True)
+                time.sleep(5)
+
+
+def check_installation() -> None:
+    config = GenerationConfig(864, 480, 12, 15, valid_length(15))
+    workflow = build_workflow(config, "A short bright test scene with clear motion and synchronized sound.")
+    print("workflow=ok")
+    print(f"template={T8_API_TEMPLATE}")
+    print(f"comfy={COMFY_URL}")
+    print(f"comfy_base={COMFYUI_BASE_DIR}")
+    print(f"output={OUTPUT_DIR}")
+    print(f"length={workflow['6']['inputs']['length']} frames ({config.actual_seconds:.2f}s)")
+    print(f"steps={workflow['7']['inputs']['steps']}")
+
+
+class SingleInstanceGuard:
+    """Prevent multiple hidden Bot processes from polling the same token."""
+
+    ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self) -> None:
+        self.handle: Any = None
+        self.kernel32: Any = None
+
+    def acquire(self) -> bool:
+        if os.name != "nt":
+            return True
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_bool,
+            ctypes.c_wchar_p,
+        ]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.CreateMutexW(
+            None,
+            True,
+            "Local\\MiniMaxH3TelegramBotSingleInstance",
+        )
+        if not handle:
+            return False
+        if ctypes.get_last_error() == self.ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        self.kernel32 = kernel32
+        self.handle = handle
+        return True
+
+    def release(self) -> None:
+        if self.handle is not None and self.kernel32 is not None:
+            self.kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+
+def main() -> int:
+    if "--check" in sys.argv:
+        try:
+            check_installation()
+            return 0
+        except Exception as exc:
+            print(f"check failed: {exc}", file=sys.stderr)
+            return 1
+
+    token = os.environ.get("MINIMAX_TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("MINIMAX_TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print(
+            "Missing MINIMAX_TELEGRAM_BOT_TOKEN or MINIMAX_TELEGRAM_CHAT_ID. "
+            "Run Configure-MiniMax-H3-Telegram.cmd first.",
+            file=sys.stderr,
+        )
+        return 2
+    guard = SingleInstanceGuard()
+    if not guard.acquire():
+        print("MiniMax H3 Telegram Bot is already running; exiting.", flush=True)
+        return 0
+    try:
+        TelegramMenuBot(token, chat_id).run()
+    except KeyboardInterrupt:
+        print("stopped", flush=True)
+    finally:
+        guard.release()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
