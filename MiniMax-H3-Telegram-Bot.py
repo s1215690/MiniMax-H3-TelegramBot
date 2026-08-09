@@ -1502,6 +1502,9 @@ class TelegramTurboBot:
                     message = update.get("message")
                     if message:
                         self.handle_message(message)
+                    callback = update.get("callback_query")
+                    if callback:
+                        self.handle_callback(callback)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
