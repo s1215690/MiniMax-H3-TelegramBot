@@ -507,6 +507,15 @@ def parse_config(parts: list[str]) -> GenerationConfig:
     return GenerationConfig(width, height, steps, seconds, length)
 
 
+def megapixel_label(width: int, height: int) -> str:
+    """Return the one-decimal megapixel label used by H3 size references."""
+    return f"{width * height / 1_000_000:.1f} MP"
+
+
+def resolution_label(width: int, height: int) -> str:
+    return f"{megapixel_label(width, height)} · {width}×{height}"
+
+
 def extract_last_frame(video_path: Path, output_path: Path) -> Path:
     """Extract a single PNG used to anchor the next long-video segment."""
     if not video_path.is_file():
@@ -2475,7 +2484,7 @@ class TelegramMenuBot(TelegramTurboBot):
         resolution_row = [
             {
                 "text": self.selected(
-                    f"{width}×{height}",
+                    resolution_label(width, height),
                     (width, height) == (current.width, current.height),
                 ),
                 "callback_data": f"res:{width}x{height}",
@@ -2552,7 +2561,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 long_seconds_row[4:8],
                 long_seconds_row[8:],
                 custom_seconds_row,
-                [{"text": "🖼 解析度（按下選擇）", "callback_data": "noop"}],
+                [{"text": "🖼 解析度／MP（按下選擇）", "callback_data": "noop"}],
                 resolution_row,
                 [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
                 steps_row,
@@ -3025,7 +3034,7 @@ class TelegramMenuBot(TelegramTurboBot):
             f"{prefix}MiniMax H3 Turbo 控制面板\n\n"
             f"模式：{mode_text}\n"
             f"輸入圖片：{image_status}\n"
-            f"解析度：{current.width}×{current.height}\n"
+            f"解析度：{resolution_label(current.width, current.height)}\n"
             f"步數：{current.steps}\n"
                 f"{duration_text}\n"
                 f"ComfyUI 顯存模式：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"

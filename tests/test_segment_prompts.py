@@ -26,6 +26,10 @@ def make_job(prompt: str, segment_index: int, segment_total: int = 2):
 
 
 class SegmentedPromptTests(unittest.TestCase):
+    def test_resolution_label_includes_megapixels(self):
+        self.assertEqual("0.3 MP · 736×416", BOT.resolution_label(736, 416))
+        self.assertEqual("0.5 MP · 960×544", BOT.resolution_label(960, 544))
+
     def test_current_segment_isolated_from_other_actions(self):
         prompt = """GLOBAL:
 same person, costume, room and daylight
