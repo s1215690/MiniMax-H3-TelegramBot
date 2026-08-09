@@ -102,6 +102,9 @@ STATE_PATH = Path(
 )
 IMAGE_DIR = STATE_PATH.parent / "input_images"
 MAX_SEGMENT_SECONDS = 15.0
+MAX_SHOT_SECONDS = 8.0
+SHOT_TRANSITION_SECONDS = 0.12
+TIMELINE_TOLERANCE_SECONDS = 0.25
 MIN_TOTAL_SECONDS = 2.0
 MAX_TOTAL_SECONDS = 30.0 * 60.0
 CONTINUATION_DIR = STATE_PATH.parent / "continuation_frames"
@@ -259,6 +262,10 @@ class JobState:
     segment_index: int = 1
     segment_total: int = 1
     total_seconds: float = 0.0
+    shot_plan: tuple[ShotSpec, ...] = field(default_factory=tuple)
+    story_global_text: str = ""
+    segment_start_seconds: float = 0.0
+    segment_end_seconds: float = 0.0
     input_image_path: Optional[Path] = None
     comfy_image_name: Optional[str] = None
     continuation_image_path: Optional[Path] = None
@@ -506,7 +513,7 @@ def extract_last_frame(video_path: Path, output_path: Path) -> Path:
         "-loglevel",
         "error",
         "-sseof",
-        "-0.15",
+        "-0.05",
         "-i",
         str(video_path),
         "-frames:v",
@@ -538,8 +545,51 @@ class SegmentedPrompt:
     segments: dict[int, str]
 
 
+@dataclass(frozen=True)
+class TimelineScene:
+    start_seconds: float
+    end_seconds: float
+    label: str
+    action: str
+
+    @property
+    def duration(self) -> float:
+        return self.end_seconds - self.start_seconds
+
+
+@dataclass(frozen=True)
+class TimelinePrompt:
+    global_text: str
+    scenes: tuple[TimelineScene, ...]
+
+
+@dataclass(frozen=True)
+class ShotSpec:
+    start_seconds: float
+    end_seconds: float
+    label: str
+    action: str
+
+    @property
+    def duration(self) -> float:
+        return self.end_seconds - self.start_seconds
+
+
+@dataclass(frozen=True)
+class LongVideoPlan:
+    global_text: str
+    shots: tuple[ShotSpec, ...]
+    source_format: str
+
+
 SEGMENT_HEADER_RE = re.compile(
     r"(?im)^[ \t]*(GLOBAL|SEGMENT[ \t]+([1-9][0-9]*))[ \t]*[:：][ \t]*(.*)$"
+)
+TIMELINE_HEADER_RE = re.compile(
+    r"(?im)^[ \t]*(?P<label>[^\n:：()（）]{0,40}?)[ \t]*"
+    r"[（(][ \t]*(?P<start>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+    r"(?:-|–|—|~|～|至|到)[ \t]*(?P<end>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+    r"(?:秒|s|sec|seconds?)?[ \t]*[）)][ \t]*[:：]?[ \t]*(?P<inline>.*)$"
 )
 SHARED_TAIL_SEPARATOR_RE = re.compile(
     r"(?m)^[ \t]*(?:-{3,}|─{3,}|={3,})[ \t]*$"
@@ -595,6 +645,159 @@ def parse_segmented_prompt(prompt: str) -> Optional[SegmentedPrompt]:
     )
 
 
+def parse_timeline_prompt(prompt: str) -> Optional[TimelinePrompt]:
+    """Parse headings such as `第一幕（5-15秒）：` into ordered scenes."""
+    matches = list(TIMELINE_HEADER_RE.finditer(prompt))
+    if not matches:
+        return None
+
+    preamble = prompt[: matches[0].start()].strip()
+    scenes: list[TimelineScene] = []
+    for position, match in enumerate(matches):
+        body_end = matches[position + 1].start() if position + 1 < len(matches) else len(prompt)
+        inline_text = match.group("inline").strip()
+        body_text = prompt[match.end() : body_end].strip()
+        action = "\n".join(part for part in (inline_text, body_text) if part).strip()
+        label = match.group("label").strip(" \t【】[]") or f"場景 {position + 1}"
+        start_seconds = float(match.group("start"))
+        end_seconds = float(match.group("end"))
+        if end_seconds <= start_seconds:
+            raise BotError(
+                f"時間軸「{label}」的結束時間必須大於開始時間："
+                f"{start_seconds:g}-{end_seconds:g} 秒。"
+            )
+        if not action:
+            raise BotError(f"時間軸「{label}」沒有任何畫面或動作內容。")
+        scenes.append(
+            TimelineScene(
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                label=label,
+                action=action,
+            )
+        )
+    return TimelinePrompt(global_text=preamble, scenes=tuple(scenes))
+
+
+def split_action_units(text: str) -> list[str]:
+    """Split a scene into ordered visual beats without reordering its text."""
+    units: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pieces = re.findall(r".+?(?:[。！？!?；;.]+|$)", line)
+        units.extend(piece.strip() for piece in pieces if piece.strip())
+    return units or [text.strip()]
+
+
+def split_scene_into_shots(scene: TimelineScene) -> list[ShotSpec]:
+    """Split one timeline scene into 5–8 second generation shots."""
+    part_count = max(1, math.ceil(scene.duration / MAX_SHOT_SECONDS))
+    part_duration = scene.duration / part_count
+    if part_duration < MIN_TOTAL_SECONDS:
+        raise BotError(
+            f"時間軸「{scene.label}」切分後每個鏡頭少於 2 秒；"
+            "請合併過短場景或延長時間。"
+        )
+
+    units = split_action_units(scene.action)
+    shots: list[ShotSpec] = []
+    for index in range(part_count):
+        start_seconds = scene.start_seconds + part_duration * index
+        end_seconds = (
+            scene.end_seconds
+            if index == part_count - 1
+            else scene.start_seconds + part_duration * (index + 1)
+        )
+        if len(units) >= part_count:
+            unit_start = math.floor(index * len(units) / part_count)
+            unit_end = math.floor((index + 1) * len(units) / part_count)
+            unit_end = max(unit_start + 1, unit_end)
+            action = "\n".join(units[unit_start:unit_end]).strip()
+        else:
+            action = units[min(index, len(units) - 1)]
+        shots.append(
+            ShotSpec(
+                start_seconds=round(start_seconds, 3),
+                end_seconds=round(end_seconds, 3),
+                label=scene.label,
+                action=action,
+            )
+        )
+    return shots
+
+
+def validate_timeline_coverage(
+    scenes: tuple[TimelineScene, ...], total_seconds: float
+) -> None:
+    cursor = 0.0
+    for scene in scenes:
+        if scene.start_seconds > cursor + TIMELINE_TOLERANCE_SECONDS:
+            raise BotError(
+                f"時間軸在 {cursor:g}-{scene.start_seconds:g} 秒沒有內容。"
+            )
+        if scene.start_seconds < cursor - TIMELINE_TOLERANCE_SECONDS:
+            raise BotError(
+                f"時間軸「{scene.label}」與上一幕重疊："
+                f"{scene.start_seconds:g} 秒早於 {cursor:g} 秒。"
+            )
+        cursor = scene.end_seconds
+    if cursor < total_seconds - TIMELINE_TOLERANCE_SECONDS:
+        raise BotError(
+            f"時間軸只寫到 {cursor:g} 秒，但目前總片長是 {total_seconds:g} 秒；"
+            f"請補上 {cursor:g}-{total_seconds:g} 秒的結尾。"
+        )
+    if cursor > total_seconds + TIMELINE_TOLERANCE_SECONDS:
+        raise BotError(
+            f"時間軸寫到 {cursor:g} 秒，超過目前設定的 {total_seconds:g} 秒。"
+        )
+
+
+def build_long_video_plan(prompt: str, total_seconds: float) -> LongVideoPlan:
+    """Build an explicit short-shot plan; never replay one long prompt blindly."""
+    timeline = parse_timeline_prompt(prompt)
+    if timeline is not None:
+        validate_timeline_coverage(timeline.scenes, total_seconds)
+        shots = tuple(
+            shot
+            for scene in timeline.scenes
+            for shot in split_scene_into_shots(scene)
+        )
+        return LongVideoPlan(timeline.global_text, shots, "timeline")
+
+    segmented = parse_segmented_prompt(prompt)
+    if segmented is not None:
+        segment_total = math.ceil(total_seconds / MAX_SEGMENT_SECONDS)
+        missing = [
+            number
+            for number in range(1, segment_total + 1)
+            if number not in segmented.segments
+        ]
+        if missing:
+            missing_text = "、".join(f"SEGMENT {number}" for number in missing)
+            raise BotError(
+                f"這條影片需要 {segment_total} 個 SEGMENT，但缺少 {missing_text}。"
+            )
+        shots: list[ShotSpec] = []
+        for number in range(1, segment_total + 1):
+            start_seconds = (number - 1) * MAX_SEGMENT_SECONDS
+            end_seconds = min(number * MAX_SEGMENT_SECONDS, total_seconds)
+            scene = TimelineScene(
+                start_seconds,
+                end_seconds,
+                f"SEGMENT {number}",
+                segmented.segments[number],
+            )
+            shots.extend(split_scene_into_shots(scene))
+        return LongVideoPlan(segmented.global_text, tuple(shots), "segments")
+
+    raise BotError(
+        "超過 15 秒的長片必須提供時間軸，例如「第一幕（0-8秒）：……」；"
+        "也可以使用 GLOBAL／SEGMENT 1／SEGMENT 2 格式。"
+    )
+
+
 def continuity_instruction(job: JobState) -> str:
     audio_rule = (
         " Keep the same music bed, tempo, instrumentation and ambience as <Audio 1>, "
@@ -619,6 +822,28 @@ def continuity_instruction(job: JobState) -> str:
 
 def segment_prompt(job: JobState) -> str:
     """Give each long-video segment a focused time window and continuity rule."""
+    if job.shot_plan:
+        shot = job.shot_plan[job.segment_index - 1]
+        continuity = continuity_instruction(job)
+        blocks = []
+        if job.story_global_text:
+            blocks.append(f"GLOBAL CONTINUITY RULES:\n{job.story_global_text}")
+        blocks.extend(
+            [
+                (
+                    f"LONG VIDEO SHOT {job.segment_index}/{job.segment_total}; "
+                    f"story time window {shot.start_seconds:g}-{shot.end_seconds:g} seconds.\n"
+                    f"{continuity}\n"
+                    "Preserve the exact same character identity, face, hairstyle, costume, "
+                    "props, location continuity, lighting direction and camera language. "
+                    "This shot must begin from the supplied continuation frame and must not "
+                    "repeat any earlier action."
+                ),
+                f"CURRENT SHOT ACTION — {shot.label}:\n{shot.action}",
+            ]
+        )
+        return "\n\n".join(blocks)
+
     parsed = parse_segmented_prompt(job.prompt)
     start_seconds = (job.segment_index - 1) * MAX_SEGMENT_SECONDS
     end_seconds = min(job.segment_index * MAX_SEGMENT_SECONDS, job.total_seconds)
@@ -1089,8 +1314,54 @@ def multipart_request(url: str, fields: dict[str, str], file_field: str, file_pa
     return result
 
 
-def concat_videos(video_paths: list[Path], output_path: Path, total_seconds: float) -> Path:
-    """Join generated MP4 segments without re-encoding their video/audio streams."""
+def build_transition_filter(
+    shots: list[ShotSpec] | tuple[ShotSpec, ...],
+    transition_seconds: float = SHOT_TRANSITION_SECONDS,
+) -> tuple[str, str, str]:
+    """Build a duration-preserving FFmpeg xfade/acrossfade graph."""
+    if len(shots) < 2:
+        raise BotError("轉場至少需要兩個鏡頭。")
+    filters: list[str] = []
+    for index, shot in enumerate(shots):
+        trim_duration = shot.duration
+        if index < len(shots) - 1:
+            trim_duration += transition_seconds
+        filters.append(
+            f"[{index}:v]trim=duration={trim_duration:.3f},"
+            f"setpts=PTS-STARTPTS,fps=24,format=yuv420p[v{index}]"
+        )
+        filters.append(
+            f"[{index}:a]atrim=duration={trim_duration:.3f},"
+            f"asetpts=PTS-STARTPTS,aresample=48000[a{index}]"
+        )
+
+    current_video = "v0"
+    current_audio = "a0"
+    offset = shots[0].duration
+    for index in range(1, len(shots)):
+        next_video = f"vx{index}"
+        next_audio = f"ax{index}"
+        filters.append(
+            f"[{current_video}][v{index}]xfade=transition=fade:"
+            f"duration={transition_seconds:.3f}:offset={offset:.3f}[{next_video}]"
+        )
+        filters.append(
+            f"[{current_audio}][a{index}]acrossfade=d={transition_seconds:.3f}:"
+            f"c1=tri:c2=tri[{next_audio}]"
+        )
+        current_video = next_video
+        current_audio = next_audio
+        offset += shots[index].duration
+    return ";".join(filters), f"[{current_video}]", f"[{current_audio}]"
+
+
+def concat_videos(
+    video_paths: list[Path],
+    output_path: Path,
+    total_seconds: float,
+    shot_plan: Optional[tuple[ShotSpec, ...]] = None,
+) -> Path:
+    """Join generated shots, preferring short audio/video crossfades."""
     if len(video_paths) < 2:
         raise BotError("長片至少需要兩段影片才能合併。")
     if shutil.which(FFMPEG_PATH) is None and not Path(FFMPEG_PATH).is_file():
@@ -1099,6 +1370,62 @@ def concat_videos(video_paths: list[Path], output_path: Path, total_seconds: flo
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if shot_plan and len(shot_plan) == len(video_paths):
+        filter_graph, video_output, audio_output = build_transition_filter(shot_plan)
+        transition_command = [FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y"]
+        for video_path in video_paths:
+            transition_command.extend(["-i", str(video_path)])
+        transition_command.extend(
+            [
+                "-filter_complex",
+                filter_graph,
+                "-map",
+                video_output,
+                "-map",
+                audio_output,
+                "-t",
+                f"{total_seconds:.3f}",
+                "-r",
+                "24",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+        try:
+            transition_result = subprocess.run(
+                transition_command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1800,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"transition merge unavailable, using stream-copy fallback: {exc}", flush=True)
+        else:
+            if transition_result.returncode == 0 and output_path.is_file():
+                return output_path
+            detail = (transition_result.stderr or "").strip()
+            print(
+                "transition merge failed, using stream-copy fallback: "
+                + detail[-800:],
+                flush=True,
+            )
+
     list_path = output_path.with_suffix(".concat.txt")
     lines = []
     for video_path in video_paths:
@@ -1268,7 +1595,7 @@ class TelegramTurboBot:
             "/gen 864 480 12 15\n你的提示詞\n\n"
             "/status 查看狀態\n"
             "/progress 查看即時生成進度\n"
-            "/pause 暫停長片（在目前分段完成後）\n"
+            "/pause 暫停長片（在目前鏡頭完成後）\n"
             "/resume 或 /play 繼續長片\n"
             "/temperature 查看 GPU／CPU 溫度\n"
             "/cancel_shutdown 取消已排程的自動關機\n"
@@ -1327,16 +1654,32 @@ class TelegramTurboBot:
         elapsed_text = f"{elapsed // 60}分 {elapsed % 60}秒"
 
         if job.segment_total > 1:
-            completed_segments = max(0, job.segment_index - 1)
-            overall = min(
-                100.0,
-                ((completed_segments + percent / 100.0) / job.segment_total) * 100.0,
-            )
-            segment_line = (
-                f"長片：第 {job.segment_index}/{job.segment_total} 段\n"
-                f"總進度：{self.progress_bar(overall)} {overall:.1f}%\n"
-                f"本段進度：{self.progress_bar(percent)} {percent:.1f}%"
-            )
+            if job.shot_plan:
+                shot = job.shot_plan[job.segment_index - 1]
+                completed_story_seconds = shot.start_seconds
+                active_story_seconds = shot.duration * percent / 100.0
+                overall = min(
+                    100.0,
+                    ((completed_story_seconds + active_story_seconds) / job.total_seconds)
+                    * 100.0,
+                )
+                segment_line = (
+                    f"長片：鏡頭 {job.segment_index}/{job.segment_total} "
+                    f"（劇情 {shot.start_seconds:g}-{shot.end_seconds:g} 秒）\n"
+                    f"總進度：{self.progress_bar(overall)} {overall:.1f}%\n"
+                    f"本鏡進度：{self.progress_bar(percent)} {percent:.1f}%"
+                )
+            else:
+                completed_segments = max(0, job.segment_index - 1)
+                overall = min(
+                    100.0,
+                    ((completed_segments + percent / 100.0) / job.segment_total) * 100.0,
+                )
+                segment_line = (
+                    f"長片：第 {job.segment_index}/{job.segment_total} 段\n"
+                    f"總進度：{self.progress_bar(overall)} {overall:.1f}%\n"
+                    f"本段進度：{self.progress_bar(percent)} {percent:.1f}%"
+                )
         else:
             overall = percent
             segment_line = f"進度：{self.progress_bar(overall)} {overall:.1f}%"
@@ -1365,7 +1708,7 @@ class TelegramTurboBot:
             control_text = (
                 "已暫停，等待播放／繼續"
                 if phase == "paused"
-                else "已收到暫停，會在目前分段完成後停下"
+                else "已收到暫停，會在目前鏡頭完成後停下"
             )
         else:
             control_text = "正常執行"
@@ -1998,7 +2341,7 @@ class TelegramMenuBot(TelegramTurboBot):
         self.update_settings(seconds=min(self.total_seconds, MAX_SEGMENT_SECONDS))
 
     def wait_for_resume(self, job: JobState) -> bool:
-        """Pause long-video work safely between 15-second segments."""
+        """Pause long-video work safely between generated shots."""
         if job.segment_total <= 1 or not job.pause_requested.is_set():
             return not job.cancel_event.is_set()
         with job.progress_lock:
@@ -2061,11 +2404,11 @@ class TelegramMenuBot(TelegramTurboBot):
                 "單段影片不能安全凍結採樣；只有長片可以在每段完成後暫停。需要停止請按「中止」。",
             )
         elif already_paused:
-            self.send_safe(chat_id, "長片已在暫停流程中，會在目前分段完成後停下。")
+            self.send_safe(chat_id, "長片已在暫停流程中，會在目前鏡頭完成後停下。")
         else:
             self.send_safe(
                 chat_id,
-                "已收到暫停要求；目前 15 秒分段完成後會暫停，不會丟失已完成分段。",
+                "已收到暫停要求；目前短鏡頭完成後會暫停，不會丟失已完成鏡頭。",
             )
         self.show_menu(chat_id, message_id)
 
@@ -2122,34 +2465,15 @@ class TelegramMenuBot(TelegramTurboBot):
             self.send_safe(chat_id, "提示詞不可為空白。")
             return
         total_seconds = validate_total_seconds(total_seconds)
-        segment_total = math.ceil(total_seconds / MAX_SEGMENT_SECONDS)
         try:
-            parsed_prompt = parse_segmented_prompt(prompt)
+            plan = build_long_video_plan(prompt, total_seconds)
         except BotError as exc:
-            self.send_safe(chat_id, f"分段提示詞格式錯誤：{exc}")
+            self.send_safe(chat_id, f"長片時間軸格式錯誤：{exc}")
             return
-        if parsed_prompt is not None:
-            missing = [
-                number
-                for number in range(1, segment_total + 1)
-                if number not in parsed_prompt.segments
-            ]
-            if missing:
-                missing_text = "、".join(f"SEGMENT {number}" for number in missing)
-                self.send_safe(
-                    chat_id,
-                    f"分段提示詞不足：這條影片需要 {segment_total} 段，但缺少 {missing_text}。",
-                )
-                return
-            extra_count = sum(
-                number > segment_total for number in parsed_prompt.segments
-            )
-            if extra_count:
-                self.send_safe(
-                    chat_id,
-                    f"已偵測到 {len(parsed_prompt.segments)} 段提示詞；"
-                    f"目前片長只需要前 {segment_total} 段，其餘 {extra_count} 段不會送給模型。",
-                )
+        segment_total = len(plan.shots)
+        if segment_total < 2:
+            self.send_safe(chat_id, "長片時間軸至少需要兩個鏡頭。")
+            return
         batch_prefix = f"{OUTPUT_PREFIX}/long_{uuid.uuid4().hex[:12]}"
         with self.lock:
             if self.job:
@@ -2164,10 +2488,19 @@ class TelegramMenuBot(TelegramTurboBot):
                 output_prefix=batch_prefix,
                 segment_total=segment_total,
                 total_seconds=total_seconds,
+                shot_plan=plan.shots,
+                story_global_text=plan.global_text,
                 input_image_path=input_image_path,
             )
             job.resume_event.set()
             self.job = job
+        format_text = "自然時間軸" if plan.source_format == "timeline" else "SEGMENT 分段"
+        self.send_safe(
+            chat_id,
+            f"已解析{format_text}：共 {segment_total} 個連續鏡頭，"
+            f"每鏡頭最多 {MAX_SHOT_SECONDS:g} 秒。\n"
+            "後續鏡頭會使用上一鏡尾幀和第一鏡音訊風格，合併時加入短音畫轉場。",
+        )
         thread = threading.Thread(target=self.run_long_job, args=(job,), daemon=True)
         thread.start()
 
@@ -2175,11 +2508,12 @@ class TelegramMenuBot(TelegramTurboBot):
         try:
             self.ensure_comfyui_ready(job)
             base_prefix = job.output_prefix
+            base_config = job.config
             video_paths: list[Path] = []
             if job.input_image_path is not None:
                 self.send_safe(
                     job.chat_id,
-                    "圖片長片會把圖片用作第一段首幀，後續段落用提示詞接續生成。",
+                    "圖片長片會把圖片用作第一鏡首幀，後續鏡頭使用上一鏡尾幀接續。",
                 )
             for index in range(1, job.segment_total + 1):
                 if not self.wait_for_resume(job):
@@ -2187,11 +2521,26 @@ class TelegramMenuBot(TelegramTurboBot):
                 if job.cancel_event.is_set():
                     return
                 job.segment_index = index
+                shot = job.shot_plan[index - 1]
+                job.segment_start_seconds = shot.start_seconds
+                job.segment_end_seconds = shot.end_seconds
+                generation_seconds = shot.duration
+                if index < job.segment_total:
+                    generation_seconds += SHOT_TRANSITION_SECONDS
+                job.config = parse_config(
+                    [
+                        str(base_config.width),
+                        str(base_config.height),
+                        str(base_config.steps),
+                        str(generation_seconds),
+                    ]
+                )
                 job.output_prefix = f"{base_prefix}/segment_{index:02d}"
                 self.send_safe(
                     job.chat_id,
-                    f"長片第 {index}/{job.segment_total} 段開始生成（每段約 "
-                    f"{job.config.actual_seconds:.2f} 秒）。",
+                    f"長片鏡頭 {index}/{job.segment_total} 開始生成："
+                    f"劇情 {shot.start_seconds:g}-{shot.end_seconds:g} 秒 | "
+                    f"模型約 {job.config.actual_seconds:.2f} 秒。",
                 )
                 video_path = self.run_segment(job, announce=False)
                 video_paths.append(video_path)
@@ -2211,7 +2560,7 @@ class TelegramMenuBot(TelegramTurboBot):
                             previous_frame.unlink()
                         except OSError:
                             pass
-                self.send_safe(job.chat_id, f"長片第 {index}/{job.segment_total} 段完成。")
+                self.send_safe(job.chat_id, f"長片鏡頭 {index}/{job.segment_total} 完成。")
 
             if job.cancel_event.is_set():
                 return
@@ -2222,13 +2571,18 @@ class TelegramMenuBot(TelegramTurboBot):
                 job.progress_percent = 100.0
                 job.progress_node_id = None
                 job.progress_node_state = "merging"
-            concat_videos(video_paths, output_path, job.total_seconds)
+            concat_videos(
+                video_paths,
+                output_path,
+                job.total_seconds,
+                shot_plan=job.shot_plan,
+            )
             with job.progress_lock:
                 job.progress_phase = "uploading"
             caption = (
                 f"MiniMax H3 Turbo 長片完成\n{job.total_seconds:.0f} 秒 | "
-                f"{job.config.width}×{job.config.height} | {job.config.steps} steps | "
-                f"{job.segment_total} 段合併"
+                f"{base_config.width}×{base_config.height} | {base_config.steps} steps | "
+                f"{job.segment_total} 鏡頭合併"
             )
             self.telegram.send_video(job.chat_id, output_path, caption)
             self.schedule_shutdown_if_enabled(job)
@@ -2253,9 +2607,9 @@ class TelegramMenuBot(TelegramTurboBot):
         image_status = "已收到" if self.image_path and self.image_path.is_file() else "未收到"
         prefix = f"{notice}\n\n" if notice else ""
         if self.total_seconds > MAX_SEGMENT_SECONDS:
-            segment_count = math.ceil(self.total_seconds / MAX_SEGMENT_SECONDS)
             duration_text = (
-                f"總片長：約 {self.total_seconds:.0f} 秒（{segment_count} 段，每段最多 15 秒）"
+                f"總片長：約 {self.total_seconds:.0f} 秒"
+                f"（按提示詞時間軸拆成最多 {MAX_SHOT_SECONDS:g} 秒鏡頭）"
             )
         else:
             effective = self.effective_config()
@@ -2294,7 +2648,7 @@ class TelegramMenuBot(TelegramTurboBot):
             f"提示詞：{prompt_status}\n\n"
             "圖片模式：先發圖片，再輸入提示詞；文字模式：直接輸入提示詞。\n"
             "最後按「生成影片」。\n"
-            "長片會自動分段生成後合併，設定和提示詞會自動保存。"
+            "長片會解析時間軸、短鏡頭接力生成後加入轉場合併；設定和提示詞會自動保存。"
         )
         with self.lock:
             has_active_job = self.job is not None

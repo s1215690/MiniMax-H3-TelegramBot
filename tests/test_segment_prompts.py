@@ -98,5 +98,104 @@ same camera language and realistic style
         self.assertEqual("LoadAudio", workflow["14"]["class_type"])
 
 
+class TimelinePromptTests(unittest.TestCase):
+    COMPLETE_TIMELINE = """【60秒反詐騙警示短片】
+
+開頭（0-5秒）：
+黑底警示標題，沉重低音音樂開始。
+
+第一幕（5-15秒）：
+同一名二十多歲女生在家看招聘廣告。
+她猶豫後按下應聘按鈕，鏡頭特寫手指。
+
+第二幕（15-25秒）：
+她拖着行李抵達機場，露出期待笑容。
+畫面逐漸轉為灰暗，節奏加快。
+
+第三幕（25-40秒）：
+接頭人收走護照和手機。
+鐵閘關上，遠處有電網和高牆。
+她驚慌站在角落。
+
+第四幕（40-50秒）：
+她被迫坐在電腦前輸入詐騙訊息。
+她眼眶泛紅，神情空洞。
+
+結尾（50-60秒）：
+畫面轉黑，出現反詐騙警示。
+音樂停止，只留下關門回響。
+"""
+
+    def test_chinese_timeline_is_split_into_short_ordered_shots(self):
+        plan = BOT.build_long_video_plan(self.COMPLETE_TIMELINE, 60.0)
+
+        self.assertEqual("timeline", plan.source_format)
+        self.assertIn("60秒反詐騙警示短片", plan.global_text)
+        self.assertEqual(11, len(plan.shots))
+        self.assertAlmostEqual(0.0, plan.shots[0].start_seconds)
+        self.assertAlmostEqual(60.0, plan.shots[-1].end_seconds)
+        self.assertTrue(all(2.0 <= shot.duration <= 8.0 for shot in plan.shots))
+        for previous, current in zip(plan.shots, plan.shots[1:]):
+            self.assertAlmostEqual(previous.end_seconds, current.start_seconds)
+
+    def test_timeline_missing_last_ten_seconds_fails_before_generation(self):
+        incomplete = self.COMPLETE_TIMELINE.split("結尾（50-60秒）：", 1)[0]
+
+        with self.assertRaisesRegex(BOT.BotError, "只寫到 50 秒"):
+            BOT.build_long_video_plan(incomplete, 60.0)
+
+    def test_plain_long_prompt_is_rejected_instead_of_replayed(self):
+        with self.assertRaisesRegex(BOT.BotError, "必須提供時間軸"):
+            BOT.build_long_video_plan("A woman walks through an airport.", 60.0)
+
+    def test_planned_shot_prompt_contains_only_current_action(self):
+        plan = BOT.build_long_video_plan(self.COMPLETE_TIMELINE, 60.0)
+        job = make_job(self.COMPLETE_TIMELINE, segment_index=2, segment_total=len(plan.shots))
+        job.total_seconds = 60.0
+        job.shot_plan = plan.shots
+        job.story_global_text = plan.global_text
+
+        rendered = BOT.segment_prompt(job)
+
+        self.assertIn("CURRENT SHOT ACTION", rendered)
+        self.assertIn(plan.shots[1].action, rendered)
+        self.assertNotIn(plan.shots[0].action, rendered)
+        self.assertNotIn(plan.shots[2].action, rendered)
+        self.assertIn("supplied first frame", rendered)
+
+    def test_segment_format_is_also_split_into_short_shots(self):
+        prompt = """GLOBAL:
+same person and costume
+SEGMENT 1:
+action one. then action two.
+SEGMENT 2:
+action three. then action four.
+SEGMENT 3:
+action five. then action six.
+SEGMENT 4:
+action seven. then action eight.
+"""
+        plan = BOT.build_long_video_plan(prompt, 60.0)
+
+        self.assertEqual("segments", plan.source_format)
+        self.assertEqual(8, len(plan.shots))
+        self.assertTrue(all(shot.duration <= 8.0 for shot in plan.shots))
+        self.assertNotEqual(plan.shots[0].action, plan.shots[1].action)
+
+    def test_transition_filter_preserves_story_offsets(self):
+        shots = (
+            BOT.ShotSpec(0.0, 5.0, "one", "first"),
+            BOT.ShotSpec(5.0, 10.0, "two", "second"),
+        )
+
+        graph, video_output, audio_output = BOT.build_transition_filter(shots)
+
+        self.assertIn("trim=duration=5.120", graph)
+        self.assertIn("duration=0.120:offset=5.000", graph)
+        self.assertIn("acrossfade=d=0.120", graph)
+        self.assertEqual("[vx1]", video_output)
+        self.assertEqual("[ax1]", audio_output)
+
+
 if __name__ == "__main__":
     unittest.main()
