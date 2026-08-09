@@ -91,7 +91,7 @@ CLIP_NAME = os.environ.get(
 )
 UNET_NAME = os.environ.get("MINIMAX_UNET", "minimax_h3_fl2va_int8_convrot.safetensors")
 LORA_NAME = os.environ.get(
-    "MINIMAX_LORA", "minimax_h3_fl2v_turbo_4step_v0.1_lightx2v.safetensors"
+    "MINIMAX_LORA", "minimax_h3_turbo_v4_step600_ema.safetensors"
 )
 OUTPUT_PREFIX = "MiniMaxH3/Telegram_Turbo"
 STATE_PATH = Path(
