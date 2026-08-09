@@ -1567,6 +1567,13 @@ class TelegramClient:
             params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
         self.call("editMessageText", params, timeout=30)
 
+    def delete_message(self, chat_id: str, message_id: int) -> None:
+        self.call(
+            "deleteMessage",
+            {"chat_id": chat_id, "message_id": message_id},
+            timeout=30,
+        )
+
     def send_video(self, chat_id: str, video_path: Path, caption: str) -> None:
         multipart_request(
             f"{self.base_url}/sendVideo",
@@ -1584,6 +1591,16 @@ class TelegramTurboBot:
         self.pending_config: Optional[GenerationConfig] = None
         self.job: Optional[JobState] = None
         self.lock = threading.Lock()
+        self.progress_message_lock = threading.Lock()
+        self.progress_message_id: Optional[int] = None
+        self.progress_message_chat_id: Optional[str] = None
+        self.progress_message_text = ""
+        self.progress_refresh_thread = threading.Thread(
+            target=self._progress_refresh_loop,
+            name="telegram-progress-refresh",
+            daemon=True,
+        )
+        self.progress_refresh_thread.start()
 
     def help_text(self) -> str:
         return (
@@ -1610,6 +1627,40 @@ class TelegramTurboBot:
             self.telegram.send_message(chat_id, text)
         except BotError as exc:
             print(f"Telegram sendMessage error: {exc}", flush=True)
+
+    def _progress_refresh_loop(self) -> None:
+        while True:
+            time.sleep(3.0)
+            with self.lock:
+                job = self.job
+            with self.progress_message_lock:
+                message_id = self.progress_message_id
+                message_chat_id = self.progress_message_chat_id
+                previous_text = self.progress_message_text
+            if job is None or message_id is None or not message_chat_id:
+                continue
+
+            text = self.progress_text()
+            if text == previous_text:
+                continue
+            try:
+                self.telegram.edit_message_text(message_chat_id, message_id, text)
+            except BotError as exc:
+                error_text = str(exc).lower()
+                if "not modified" in error_text:
+                    continue
+                if "message to edit not found" in error_text:
+                    with self.progress_message_lock:
+                        if self.progress_message_id == message_id:
+                            self.progress_message_id = None
+                            self.progress_message_chat_id = None
+                            self.progress_message_text = ""
+                    continue
+                print(f"Telegram progress refresh error: {exc}", flush=True)
+                continue
+            with self.progress_message_lock:
+                if self.progress_message_id == message_id:
+                    self.progress_message_text = text
 
     @staticmethod
     def progress_bar(percent: float) -> str:
@@ -2650,10 +2701,6 @@ class TelegramMenuBot(TelegramTurboBot):
             "最後按「生成影片」。\n"
             "長片會解析時間軸、短鏡頭接力生成後加入轉場合併；設定和提示詞會自動保存。"
         )
-        with self.lock:
-            has_active_job = self.job is not None
-        if has_active_job:
-            return f"{menu}\n\n──────────\n{self.progress_text()}"
         return menu
 
     def schedule_shutdown_if_enabled(self, job: JobState) -> None:
@@ -2703,7 +2750,31 @@ class TelegramMenuBot(TelegramTurboBot):
         chat_id: str,
         message_id: Optional[int] = None,
     ) -> None:
-        """Refresh the progress block at the bottom of the control panel."""
+        """Show one auto-refreshing progress message at the chat bottom."""
+        text = self.progress_text()
+        with self.progress_message_lock:
+            old_message_id = self.progress_message_id
+            old_chat_id = self.progress_message_chat_id
+            self.progress_message_id = None
+            self.progress_message_chat_id = None
+            self.progress_message_text = ""
+
+        if old_message_id is not None and old_chat_id:
+            try:
+                self.telegram.delete_message(old_chat_id, old_message_id)
+            except BotError:
+                pass
+
+        try:
+            result = self.telegram.send_message(chat_id, text)
+            new_message_id = result.get("message_id") if isinstance(result, dict) else None
+            if new_message_id:
+                with self.progress_message_lock:
+                    self.progress_message_id = int(new_message_id)
+                    self.progress_message_chat_id = chat_id
+                    self.progress_message_text = text
+        except BotError as exc:
+            self.send_safe(chat_id, f"顯示生成進度失敗：{exc}")
         self.show_menu(chat_id, message_id)
 
     def show_menu(
