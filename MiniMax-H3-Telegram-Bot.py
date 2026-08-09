@@ -275,6 +275,7 @@ class JobState:
     comfy_image_name: Optional[str] = None
     continuation_image_path: Optional[Path] = None
     audio_reference_name: Optional[str] = None
+    workflow_reports: list[str] = field(default_factory=list)
     progress_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     progress_percent: float = 0.0
     progress_node_id: Optional[str] = None
@@ -895,6 +896,114 @@ def segment_prompt(job: JobState) -> str:
         "location, lighting, camera language and motion direction. Smoothly carry over the "
         "last pose and momentum from the previous segment. Do not replay earlier events."
     )
+
+
+def _workflow_node_input(
+    workflow: dict[str, Any], node_id: str, name: str, default: Any = ""
+) -> Any:
+    node = workflow.get(str(node_id), {})
+    if not isinstance(node, dict):
+        return default
+    inputs = node.get("inputs", {})
+    if not isinstance(inputs, dict):
+        return default
+    value = inputs.get(name, default)
+    return default if isinstance(value, (list, dict)) else value
+
+
+def _model_filename(value: Any) -> str:
+    text = str(value or "").strip()
+    return Path(text.replace("\\", "/")).name or "未設定"
+
+
+def workflow_usage_report(workflow: dict[str, Any], vram_mode: str) -> str:
+    """Describe the actual models and acceleration nodes in the submitted graph."""
+    class_types = {
+        str(node.get("class_type"))
+        for node in workflow.values()
+        if isinstance(node, dict) and node.get("class_type")
+    }
+    sampler_type = str(workflow.get("7", {}).get("class_type", "未設定"))
+    if sampler_type == "MiniMaxH3MultiRateSamplerEXPT8":
+        steps = (
+            f"影片 {_workflow_node_input(workflow, '7', 'video_steps')} / "
+            f"音訊 {_workflow_node_input(workflow, '7', 'audio_steps')}"
+        )
+    else:
+        steps = str(_workflow_node_input(workflow, "7", "steps", "未設定"))
+
+    acceleration_labels = {
+        "MiniMaxH3MotionContext": "Motion Context",
+        "MiniMaxH3MotionContextLoadLatent": "Motion Context latent",
+        "MiniMaxH3MemoryEfficientSageAttentionPatch": "Memory-efficient SageAttention",
+        "PathchSageAttentionKJ": "SageAttention KJ",
+        "ApplyMiniMaxH3FirstBlockCache": "First Block Cache",
+        "SpectrumApplyMiniMaxH3": "Spectrum H3",
+        "MiniMaxLowVRAMAttention": "LowVRAM Attention",
+        "MiniMaxChunkFeedForward": "Chunk FeedForward",
+    }
+    acceleration = []
+    if "LoraLoaderBypassModelOnly" in class_types or "LoraLoaderModelOnly" in class_types:
+        acceleration.append("Turbo LoRA")
+    if sampler_type == "MiniMaxH3MultiRateSamplerEXPT8":
+        acceleration.append("MultiRate EXPT8")
+    for class_type, label in acceleration_labels.items():
+        if class_type in class_types and label not in acceleration:
+            acceleration.append(label)
+
+    try:
+        vram_label = comfyui_vram_mode_label(vram_mode)
+    except NameError:
+        vram_label = vram_mode
+    return "\n".join(
+        [
+            f"模式：{_workflow_node_input(workflow, '6', 'task_type', '未設定')} / "
+            f"音訊：{_workflow_node_input(workflow, '6', 'audio_mode', '未設定')}",
+            f"採樣：{sampler_type} | 步數：{steps}",
+            f"主模型：{_model_filename(_workflow_node_input(workflow, '4', 'unet_name'))}",
+            f"CLIP：{_model_filename(_workflow_node_input(workflow, '3', 'clip_name'))}",
+            f"Turbo LoRA：{_model_filename(_workflow_node_input(workflow, '5', 'lora_name'))}",
+            f"加速組件：{'、'.join(acceleration) if acceleration else '無額外加速節點'}",
+            f"顯存模式：{vram_label}",
+        ]
+    )
+
+
+def format_elapsed(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    minutes, remainder = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {remainder:02d} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小時 {minutes:02d} 分 {remainder:02d} 秒"
+
+
+def completion_report(
+    job: JobState,
+    elapsed_seconds: float,
+    duration_seconds: Optional[float] = None,
+    config: Optional[GenerationConfig] = None,
+    partial: bool = False,
+) -> str:
+    display_config = config or job.config
+    duration = (
+        float(duration_seconds)
+        if duration_seconds is not None
+        else display_config.actual_seconds
+    )
+    lines = [
+        "📊 長片部分結果資訊" if partial else "📊 本次生成資訊",
+        f"⏱ 總耗時：{format_elapsed(elapsed_seconds)}",
+        f"🎞 影片：{display_config.width}×{display_config.height} / {duration:.2f} 秒",
+    ]
+    reports = job.workflow_reports or ["未記錄工作流資訊"]
+    for index, report in enumerate(reports, start=1):
+        if len(reports) > 1:
+            lines.append(f"\n工作流配置 {index}：")
+        else:
+            lines.append("\n實際使用配置：")
+        lines.append(report)
+    return "\n".join(lines)
 
 
 def build_workflow(
@@ -2161,6 +2270,9 @@ class TelegramTurboBot:
             save_latent_prefix=save_latent_prefix,
             save_latent_clip_index=save_latent_clip_index,
         )
+        usage_report = workflow_usage_report(workflow, self.comfyui_vram_mode())
+        if usage_report not in job.workflow_reports:
+            job.workflow_reports.append(usage_report)
         response = comfy_post(
             "/prompt",
             {"prompt": workflow, "client_id": "telegram-turbo-bot"},
@@ -2237,6 +2349,10 @@ class TelegramTurboBot:
                 f"{job.config.steps} steps | {job.config.actual_seconds:.2f} 秒"
             )
             self.telegram.send_video(job.chat_id, video_path, caption)
+            self.send_safe(
+                job.chat_id,
+                completion_report(job, time.time() - job.started_at),
+            )
         except Exception as exc:  # keep the long-polling bot alive after one job fails
             if not job.cancel_event.is_set():
                 self.send_safe(job.chat_id, f"生成失败：{exc}")
@@ -2848,6 +2964,15 @@ class TelegramMenuBot(TelegramTurboBot):
                 f"{job.config.steps} steps | {completed_count}/{job.segment_total} 段"
             )
             self.telegram.send_video(job.chat_id, output_path, caption)
+            self.send_safe(
+                job.chat_id,
+                completion_report(
+                    job,
+                    time.time() - job.started_at,
+                    duration_seconds=completed_seconds,
+                    partial=True,
+                ),
+            )
             print(f"partial long job sent: {output_path}", flush=True)
             return output_path
         except Exception as exc:
@@ -2994,6 +3119,15 @@ class TelegramMenuBot(TelegramTurboBot):
                 f"{job.segment_total} 鏡頭合併"
             )
             self.telegram.send_video(job.chat_id, output_path, caption)
+            self.send_safe(
+                job.chat_id,
+                completion_report(
+                    job,
+                    time.time() - job.started_at,
+                    duration_seconds=job.total_seconds,
+                    config=base_config,
+                ),
+            )
             self.schedule_shutdown_if_enabled(job)
         except Exception as exc:
             if job.cancel_event.is_set():
