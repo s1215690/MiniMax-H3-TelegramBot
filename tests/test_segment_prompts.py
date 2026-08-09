@@ -90,6 +90,7 @@ same camera language and realistic style
             audio_reference_name=job.audio_reference_name,
         )
         conditioning = workflow["6"]["inputs"]
+        self.assertEqual("auto", conditioning["task_type"])
         self.assertEqual("reference_only", conditioning["audio_mode"])
         self.assertTrue(conditioning["add_source_as_reference"])
         self.assertEqual(1, conditioning["prompt_primary_audio_ordinal"])

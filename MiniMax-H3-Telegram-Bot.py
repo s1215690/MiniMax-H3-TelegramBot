@@ -685,7 +685,13 @@ def build_workflow(
     conditioning["width"] = config.width
     conditioning["height"] = config.height
     conditioning["length"] = config.length
-    conditioning["task_type"] = "I2VA" if image_name else "T2VA"
+    # Audio references plus a continuation first frame require T8 Auto,
+    # which resolves to Hybrid; explicit I2VA rejects reference media.
+    conditioning["task_type"] = (
+        "auto"
+        if audio_reference_name
+        else ("I2VA" if image_name else "T2VA")
+    )
     conditioning["audio_mode"] = "reference_only" if audio_reference_name else "native"
     conditioning["add_source_as_reference"] = bool(audio_reference_name)
     conditioning["prompt_primary_audio_ordinal"] = 1 if audio_reference_name else 0
