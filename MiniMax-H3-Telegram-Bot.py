@@ -1698,6 +1698,7 @@ class TelegramMenuBot(TelegramTurboBot):
         self._shutdown_pending = False
         self.awaiting_prompt = False
         self.awaiting_duration = False
+        self.menu_message_id: Optional[int] = None
 
     @staticmethod
     def default_settings() -> GenerationConfig:
@@ -1958,7 +1959,6 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "🚀 生成影片", "callback_data": "generate"},
                     {"text": "♻️ 讀取上次設定", "callback_data": "last"},
                 ],
-                [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
                 job_control_row,
                 shutdown_row,
                 [{"text": "🌡 查看電腦溫度", "callback_data": "temperature"}],
@@ -1970,6 +1970,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "🔄 重啟 ComfyUI", "callback_data": "comfy_restart"},
                     {"text": "⏹ 關閉 ComfyUI", "callback_data": "comfy_stop"},
                 ],
+                [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
             ]
         }
 
@@ -2274,7 +2275,7 @@ class TelegramMenuBot(TelegramTurboBot):
             )
         else:
             job_text = "當前任務：生成中"
-        return (
+        menu = (
             f"{prefix}MiniMax H3 Turbo 控制面板\n\n"
             f"模式：{mode_text}\n"
             f"輸入圖片：{image_status}\n"
@@ -2289,6 +2290,11 @@ class TelegramMenuBot(TelegramTurboBot):
             "最後按「生成影片」。\n"
             "長片會自動分段生成後合併，設定和提示詞會自動保存。"
         )
+        with self.lock:
+            has_active_job = self.job is not None
+        if has_active_job:
+            return f"{menu}\n\n──────────\n{self.progress_text()}"
+        return menu
 
     def schedule_shutdown_if_enabled(self, job: JobState) -> None:
         with self.lock:
@@ -2337,19 +2343,8 @@ class TelegramMenuBot(TelegramTurboBot):
         chat_id: str,
         message_id: Optional[int] = None,
     ) -> None:
-        text = self.progress_text()
-        markup = self.menu_markup()
-        try:
-            if message_id is None:
-                self.telegram.send_message(chat_id, text, reply_markup=markup)
-            else:
-                self.telegram.edit_message_text(
-                    chat_id, message_id, text, reply_markup=markup
-                )
-        except BotError as exc:
-            if message_id is not None and "not modified" in str(exc).lower():
-                return
-            self.send_safe(chat_id, f"讀取生成進度失敗：{exc}")
+        """Refresh the progress block at the bottom of the control panel."""
+        self.show_menu(chat_id, message_id)
 
     def show_menu(
         self,
@@ -2359,16 +2354,31 @@ class TelegramMenuBot(TelegramTurboBot):
     ) -> None:
         text = self.menu_text(notice)
         markup = self.menu_markup()
+        target_message_id = message_id or self.menu_message_id
         try:
-            if message_id is None:
-                self.telegram.send_message(chat_id, text, reply_markup=markup)
+            if target_message_id is None:
+                result = self.telegram.send_message(chat_id, text, reply_markup=markup)
+                if isinstance(result, dict) and result.get("message_id"):
+                    self.menu_message_id = int(result["message_id"])
             else:
                 self.telegram.edit_message_text(
-                    chat_id, message_id, text, reply_markup=markup
+                    chat_id, target_message_id, text, reply_markup=markup
                 )
+                self.menu_message_id = target_message_id
         except BotError as exc:
-            if message_id is not None and "not modified" in str(exc).lower():
+            if target_message_id is not None and "not modified" in str(exc).lower():
                 return
+            if target_message_id is not None:
+                self.menu_message_id = None
+                try:
+                    result = self.telegram.send_message(
+                        chat_id, text, reply_markup=markup
+                    )
+                    if isinstance(result, dict) and result.get("message_id"):
+                        self.menu_message_id = int(result["message_id"])
+                    return
+                except BotError:
+                    pass
             self.send_safe(chat_id, f"選單更新失敗：{exc}")
 
     def request_duration(self, chat_id: str) -> None:
