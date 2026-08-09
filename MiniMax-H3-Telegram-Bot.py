@@ -1500,6 +1500,23 @@ class TelegramClient:
             raise BotError(result.get("description", "Telegram API 失敗。"))
         return result.get("result")
 
+    def set_my_commands(self, commands: list[dict[str, str]]) -> None:
+        self.call(
+            "setMyCommands",
+            {"commands": json.dumps(commands, ensure_ascii=False)},
+            timeout=30,
+        )
+
+    def set_chat_menu_button(self, chat_id: str) -> None:
+        self.call(
+            "setChatMenuButton",
+            {
+                "chat_id": chat_id,
+                "menu_button": json.dumps({"type": "commands"}),
+            },
+            timeout=30,
+        )
+
     def get_file(self, file_id: str) -> str:
         result = self.call("getFile", {"file_id": file_id}, timeout=30)
         file_path = result.get("file_path") if isinstance(result, dict) else None
@@ -3245,7 +3262,34 @@ class TelegramMenuBot(TelegramTurboBot):
             return
         self.send_safe(chat_id, "輸入 /menu 開啟按鈕控制面板。")
 
+    def configure_telegram_menu(self) -> None:
+        commands = [
+            {"command": "menu", "description": "開啟控制面板"},
+            {"command": "progress", "description": "查看生成進度"},
+            {"command": "prompt", "description": "輸入提示詞"},
+            {"command": "image", "description": "切換圖生視頻"},
+            {"command": "text", "description": "切換文生視頻"},
+            {"command": "duration", "description": "設定秒數"},
+            {"command": "status", "description": "查看目前狀態"},
+            {"command": "cancel", "description": "中止目前生成"},
+            {"command": "pause", "description": "暫停長片"},
+            {"command": "resume", "description": "繼續長片"},
+            {"command": "temperature", "description": "查看電腦溫度"},
+            {"command": "comfy_status", "description": "查看 ComfyUI 狀態"},
+            {"command": "comfy_start", "description": "啟動 ComfyUI"},
+            {"command": "comfy_restart", "description": "重啟 ComfyUI"},
+            {"command": "comfy_stop", "description": "關閉 ComfyUI"},
+            {"command": "bot_restart", "description": "重啟 Telegram Bot"},
+            {"command": "help", "description": "查看說明"},
+        ]
+        try:
+            self.telegram.set_my_commands(commands)
+            self.telegram.set_chat_menu_button(self.allowed_chat_id)
+        except BotError as exc:
+            print(f"Telegram menu setup failed: {exc}", flush=True)
+
     def run(self) -> None:
+        self.configure_telegram_menu()
         self.show_menu(self.allowed_chat_id, notice="Turbo Telegram 控制器已啟動")
         while True:
             try:
