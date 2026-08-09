@@ -56,7 +56,7 @@ INPUT_DIR = Path(os.environ.get("MINIMAX_COMFY_INPUT", str(OUTPUT_DIR.parent / "
 T8_API_TEMPLATE = Path(
     os.environ.get(
         "MINIMAX_T8_API_TEMPLATE",
-        str(PROJECT_DIR / "workflow" / "dual_clock_4step_api.json"),
+        str(PROJECT_DIR / "workflow" / "dual_clock_multirate_api.json"),
     )
 )
 COMFYUI_PORT = int(os.environ.get("MINIMAX_COMFY_PORT", "8191"))
@@ -925,7 +925,9 @@ def build_workflow(
     workflow["5"]["inputs"]["strength_model"] = 1.0
 
     conditioning = workflow["6"]["inputs"]
-    conditioning["prompt"] = prompt.strip()
+    prompt_enhancer = workflow.get("30", {}).get("class_type") == "MiniMaxH3PromptEnhancer"
+    if not prompt_enhancer:
+        conditioning["prompt"] = prompt.strip()
     conditioning["width"] = config.width
     conditioning["height"] = config.height
     conditioning["length"] = config.length
@@ -949,6 +951,13 @@ def build_workflow(
         conditioning["audio_mode"] = "reference_only" if audio_reference_name else "native"
         conditioning["add_source_as_reference"] = bool(audio_reference_name)
         conditioning["prompt_primary_audio_ordinal"] = 1 if audio_reference_name else 0
+    if prompt_enhancer:
+        workflow["30"]["inputs"]["manual_prompt"] = prompt.strip()
+        workflow["30"]["inputs"]["mode_report"] = (
+            f"H3 task_type={conditioning['task_type']}; "
+            f"audio_mode={conditioning['audio_mode']}; "
+            "preserve the user's requested content and timing."
+        )
     if image_name and not motion_context:
         workflow["13"] = {
             "inputs": {"image": image_name},
@@ -956,6 +965,8 @@ def build_workflow(
             "_meta": {"title": "Telegram input image"},
         }
         conditioning["first_frame"] = ["13", 0]
+        if prompt_enhancer:
+            workflow["30"]["inputs"]["image"] = ["13", 0]
     if audio_reference_name and not motion_context:
         workflow["14"] = {
             "inputs": {"audio": audio_reference_name},
@@ -1026,9 +1037,14 @@ def build_workflow(
             "_meta": {"title": "Save H3 AV latent for next segment"},
         }
 
-    workflow["7"]["inputs"]["steps"] = config.steps
-    workflow["7"]["inputs"]["shift_video"] = 12.0
-    workflow["7"]["inputs"]["shift_audio"] = 3.0
+    sampler_inputs = workflow["7"]["inputs"]
+    if workflow["7"].get("class_type") == "MiniMaxH3MultiRateSamplerEXPT8":
+        sampler_inputs["video_steps"] = min(4, config.steps)
+        sampler_inputs["audio_steps"] = config.steps
+    else:
+        sampler_inputs["steps"] = config.steps
+    sampler_inputs["shift_video"] = 12.0
+    sampler_inputs["shift_audio"] = 3.0
     workflow["8"]["inputs"]["noise_seed"] = secrets.randbits(63)
     workflow["12"]["inputs"]["filename_prefix"] = output_prefix
     return workflow
@@ -3643,7 +3659,14 @@ def check_installation() -> None:
     print(f"comfy_base={COMFYUI_BASE_DIR}")
     print(f"output={OUTPUT_DIR}")
     print(f"length={workflow['6']['inputs']['length']} frames ({config.actual_seconds:.2f}s)")
-    print(f"steps={workflow['7']['inputs']['steps']}")
+    sampler_inputs = workflow["7"]["inputs"]
+    if workflow["7"].get("class_type") == "MiniMaxH3MultiRateSamplerEXPT8":
+        print(
+            f"steps={sampler_inputs['video_steps']} video / "
+            f"{sampler_inputs['audio_steps']} audio"
+        )
+    else:
+        print(f"steps={sampler_inputs['steps']}")
 
 
 class SingleInstanceGuard:
