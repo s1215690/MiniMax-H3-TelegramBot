@@ -13,6 +13,7 @@ import json
 import asyncio
 import math
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -530,22 +531,113 @@ def extract_last_frame(video_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+@dataclass(frozen=True)
+class SegmentedPrompt:
+    global_text: str
+    segments: dict[int, str]
+
+
+SEGMENT_HEADER_RE = re.compile(
+    r"(?im)^[ \t]*(GLOBAL|SEGMENT[ \t]+([1-9][0-9]*))[ \t]*[:：][ \t]*(.*)$"
+)
+SHARED_TAIL_SEPARATOR_RE = re.compile(
+    r"(?m)^[ \t]*(?:-{3,}|─{3,}|={3,})[ \t]*$"
+)
+
+
+def parse_segmented_prompt(prompt: str) -> Optional[SegmentedPrompt]:
+    """Parse GLOBAL/SEGMENT headings while preserving multiline prompt text."""
+    matches = list(SEGMENT_HEADER_RE.finditer(prompt))
+    if not any(match.group(2) for match in matches):
+        return None
+
+    global_parts: list[str] = []
+    segments: dict[int, str] = {}
+    preamble = prompt[: matches[0].start()].strip()
+    if preamble:
+        global_parts.append(preamble)
+
+    for position, match in enumerate(matches):
+        body_end = matches[position + 1].start() if position + 1 < len(matches) else len(prompt)
+        inline_text = match.group(3).strip()
+        body_text = prompt[match.end() : body_end].strip()
+        text = "\n".join(part for part in (inline_text, body_text) if part).strip()
+
+        segment_number = match.group(2)
+        if segment_number is None:
+            if text:
+                global_parts.append(text)
+            continue
+
+        number = int(segment_number)
+        if number in segments:
+            raise BotError(f"分段提示詞重複了 SEGMENT {number}。")
+        if not text:
+            raise BotError(f"SEGMENT {number} 沒有任何提示詞內容。")
+        segments[number] = text
+
+    # A shared style block is often placed after the final SEGMENT behind a
+    # separator. Treat it as GLOBAL text instead of assigning it only to the
+    # final segment.
+    if global_parts and segments:
+        final_number = max(segments)
+        tail_parts = SHARED_TAIL_SEPARATOR_RE.split(segments[final_number], maxsplit=1)
+        if len(tail_parts) == 2 and tail_parts[1].strip():
+            segments[final_number] = tail_parts[0].strip()
+            global_parts.append(tail_parts[1].strip())
+            if not segments[final_number]:
+                raise BotError(f"SEGMENT {final_number} 沒有任何提示詞內容。")
+
+    return SegmentedPrompt(
+        global_text="\n\n".join(global_parts).strip(),
+        segments=segments,
+    )
+
+
+def continuity_instruction(job: JobState) -> str:
+    if job.segment_index == 1:
+        return (
+            "This is the opening segment. Perform only the CURRENT SEGMENT action. "
+            "Do not advance into later segments."
+        )
+    return (
+        "Directly continue from the supplied first frame. During the first second, "
+        "keep the same character identity, pose, framing and motion direction with "
+        "only small natural movement; then perform only the CURRENT SEGMENT action. "
+        "Do not restart the scene or replay any earlier action."
+    )
+
+
 def segment_prompt(job: JobState) -> str:
     """Give each long-video segment a focused time window and continuity rule."""
-    if job.segment_total <= 1:
-        return job.prompt
+    parsed = parse_segmented_prompt(job.prompt)
     start_seconds = (job.segment_index - 1) * MAX_SEGMENT_SECONDS
     end_seconds = min(job.segment_index * MAX_SEGMENT_SECONDS, job.total_seconds)
-    if job.segment_index == 1:
-        continuity = (
-            "This is the opening segment. Establish the scene and begin the action naturally."
+    continuity = continuity_instruction(job)
+
+    if parsed is not None:
+        current = parsed.segments.get(job.segment_index)
+        if current is None:
+            raise BotError(f"分段提示詞缺少 SEGMENT {job.segment_index}。")
+        blocks = []
+        if parsed.global_text:
+            blocks.append(f"GLOBAL CONTINUITY RULES:\n{parsed.global_text}")
+        blocks.extend(
+            [
+                (
+                    f"LONG VIDEO SEGMENT {job.segment_index}/{job.segment_total}; "
+                    f"story time window {start_seconds:g}-{end_seconds:g} seconds.\n"
+                    f"{continuity}\n"
+                    "Preserve the same characters, costumes, location, lighting and "
+                    "camera direction across the cut."
+                ),
+                f"CURRENT SEGMENT ACTION:\n{current}",
+            ]
         )
-    else:
-        continuity = (
-            "This is a direct continuation of the previous segment. Start from the supplied "
-            "first frame and continue the exact ongoing action. Do not restart the scene, "
-            "do not repeat the opening, and do not introduce a second version of the same fight."
-        )
+        return "\n\n".join(blocks)
+
+    if job.segment_total <= 1:
+        return job.prompt
     return (
         f"{job.prompt}\n\n"
         f"LONG VIDEO SEGMENT {job.segment_index}/{job.segment_total}; "
@@ -1950,6 +2042,33 @@ class TelegramMenuBot(TelegramTurboBot):
             return
         total_seconds = validate_total_seconds(total_seconds)
         segment_total = math.ceil(total_seconds / MAX_SEGMENT_SECONDS)
+        try:
+            parsed_prompt = parse_segmented_prompt(prompt)
+        except BotError as exc:
+            self.send_safe(chat_id, f"分段提示詞格式錯誤：{exc}")
+            return
+        if parsed_prompt is not None:
+            missing = [
+                number
+                for number in range(1, segment_total + 1)
+                if number not in parsed_prompt.segments
+            ]
+            if missing:
+                missing_text = "、".join(f"SEGMENT {number}" for number in missing)
+                self.send_safe(
+                    chat_id,
+                    f"分段提示詞不足：這條影片需要 {segment_total} 段，但缺少 {missing_text}。",
+                )
+                return
+            extra_count = sum(
+                number > segment_total for number in parsed_prompt.segments
+            )
+            if extra_count:
+                self.send_safe(
+                    chat_id,
+                    f"已偵測到 {len(parsed_prompt.segments)} 段提示詞；"
+                    f"目前片長只需要前 {segment_total} 段，其餘 {extra_count} 段不會送給模型。",
+                )
         batch_prefix = f"{OUTPUT_PREFIX}/long_{uuid.uuid4().hex[:12]}"
         with self.lock:
             if self.job:
