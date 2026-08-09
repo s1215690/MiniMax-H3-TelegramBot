@@ -108,6 +108,11 @@ TIMELINE_TOLERANCE_SECONDS = 0.25
 MIN_TOTAL_SECONDS = 2.0
 MAX_TOTAL_SECONDS = 30.0 * 60.0
 CONTINUATION_DIR = STATE_PATH.parent / "continuation_frames"
+LONG_CONTINUITY_MODE = os.environ.get(
+    "MINIMAX_H3_LONG_CONTINUITY", "motion_context"
+).strip().lower()
+MOTION_CONTEXT_LENGTH = 22
+MOTION_CONTEXT_EXTRA_SECONDS = MOTION_CONTEXT_LENGTH / 24.0
 
 
 class BotError(RuntimeError):
@@ -889,6 +894,11 @@ def build_workflow(
     output_prefix: str = OUTPUT_PREFIX,
     image_name: Optional[str] = None,
     audio_reference_name: Optional[str] = None,
+    motion_context: bool = False,
+    context_video_name: Optional[str] = None,
+    context_latent_path: Optional[str] = None,
+    save_latent_prefix: Optional[str] = None,
+    save_latent_clip_index: Optional[int] = None,
 ) -> dict[str, Any]:
     if not T8_API_TEMPLATE.is_file():
         raise BotError(f"找不到 T8 API 工作流模板：{T8_API_TEMPLATE}")
@@ -910,30 +920,102 @@ def build_workflow(
     conditioning["width"] = config.width
     conditioning["height"] = config.height
     conditioning["length"] = config.length
-    # Audio references plus a continuation first frame require T8 Auto,
-    # which resolves to Hybrid; explicit I2VA rejects reference media.
-    conditioning["task_type"] = (
-        "auto"
-        if audio_reference_name
-        else ("I2VA" if image_name else "T2VA")
-    )
-    conditioning["audio_mode"] = "reference_only" if audio_reference_name else "native"
-    conditioning["add_source_as_reference"] = bool(audio_reference_name)
-    conditioning["prompt_primary_audio_ordinal"] = 1 if audio_reference_name else 0
-    if image_name:
+    if motion_context:
+        if not context_video_name or not context_latent_path:
+            raise BotError(
+                "Motion Context 需要上一段影片和上一段 AV latent。"
+            )
+        conditioning["task_type"] = "T2VA"
+        conditioning["audio_mode"] = "native"
+        conditioning["add_source_as_reference"] = False
+        conditioning["prompt_primary_audio_ordinal"] = 0
+    else:
+        # Audio references plus a continuation first frame require T8 Auto,
+        # which resolves to Hybrid; explicit I2VA rejects reference media.
+        conditioning["task_type"] = (
+            "auto"
+            if audio_reference_name
+            else ("I2VA" if image_name else "T2VA")
+        )
+        conditioning["audio_mode"] = "reference_only" if audio_reference_name else "native"
+        conditioning["add_source_as_reference"] = bool(audio_reference_name)
+        conditioning["prompt_primary_audio_ordinal"] = 1 if audio_reference_name else 0
+    if image_name and not motion_context:
         workflow["13"] = {
             "inputs": {"image": image_name},
             "class_type": "LoadImage",
             "_meta": {"title": "Telegram input image"},
         }
         conditioning["first_frame"] = ["13", 0]
-    if audio_reference_name:
+    if audio_reference_name and not motion_context:
         workflow["14"] = {
             "inputs": {"audio": audio_reference_name},
             "class_type": "LoadAudio",
             "_meta": {"title": "Previous segment audio reference"},
         }
         conditioning["drive_audio"] = ["14", 0]
+
+    if motion_context:
+        workflow["15"] = {
+            "inputs": {"file": context_video_name},
+            "class_type": "LoadVideo",
+            "_meta": {"title": "Previous segment for H3 Motion Context"},
+        }
+        workflow["16"] = {
+            "inputs": {"video": ["15", 0]},
+            "class_type": "GetVideoComponents",
+            "_meta": {"title": "Previous segment frames and audio"},
+        }
+        workflow["17"] = {
+            "inputs": {
+                "latent_path": context_latent_path,
+                "clip_index": 0,
+            },
+            "class_type": "MiniMaxH3MotionContextLoadLatent",
+            "_meta": {"title": "Previous H3 AV latent"},
+        }
+        workflow["18"] = {
+            "inputs": {
+                "conditioning": ["6", 0],
+                "vae": ["1", 0],
+                "latent": ["6", 1],
+                "context_frames": ["16", 0],
+                "context_length": MOTION_CONTEXT_LENGTH,
+                "encode_mode": "video",
+                "anchor_mode": "head",
+                "crop": "disabled",
+                "audio_context_length": MOTION_CONTEXT_LENGTH,
+                "audio_mode": "timeline",
+                "context_latent": ["17", 0],
+            },
+            "class_type": "MiniMaxH3MotionContext",
+            "_meta": {"title": "Experimental H3 AV latent continuation"},
+        }
+        workflow["9"]["inputs"]["conditioning"] = ["18", 0]
+        workflow["19"] = {
+            "inputs": {
+                "images": ["11", 0],
+                "audio": ["11", 1],
+                "trim_frames": ["18", 1],
+                "fps": 24.0,
+                "match_tail": True,
+            },
+            "class_type": "MiniMaxH3MotionContextTrim",
+            "_meta": {"title": "Trim duplicated context audio and frames"},
+        }
+        workflow["12"]["inputs"]["images"] = ["19", 0]
+        workflow["12"]["inputs"]["audio"] = ["19", 1]
+
+    if save_latent_prefix:
+        workflow["20"] = {
+            "inputs": {
+                "latent": ["10", 0],
+                "filename_prefix": save_latent_prefix,
+                "clip_index": int(save_latent_clip_index or 0),
+            },
+            "class_type": "MiniMaxH3MotionContextSaveLatent",
+            "_meta": {"title": "Save H3 AV latent for next segment"},
+        }
 
     workflow["7"]["inputs"]["steps"] = config.steps
     workflow["7"]["inputs"]["shift_video"] = 12.0
@@ -965,6 +1047,21 @@ def json_request(url: str, payload: Optional[dict[str, Any]] = None, timeout: fl
 
 def comfy_post(path: str, payload: Optional[dict[str, Any]] = None) -> Any:
     return json_request(f"{COMFY_URL}{path}", payload)
+
+
+def motion_context_nodes_available() -> bool:
+    """Check that the experimental AV-latent continuation nodes are loaded."""
+    required = {
+        "MiniMaxH3MotionContext",
+        "MiniMaxH3MotionContextTrim",
+        "MiniMaxH3MotionContextSaveLatent",
+        "MiniMaxH3MotionContextLoadLatent",
+    }
+    try:
+        object_info = json_request(f"{COMFY_URL}/object_info", timeout=15.0)
+        return required.issubset(object_info.keys())
+    except Exception:
+        return False
 
 
 def upload_image_to_comfy(image_path: Path) -> str:
@@ -1477,6 +1574,80 @@ def concat_videos(
     return output_path
 
 
+def trim_single_video(
+    video_path: Path,
+    output_path: Path,
+    duration_seconds: float,
+) -> Path:
+    """Trim one completed shot for an early-cancel partial result."""
+    if not video_path.is_file():
+        raise BotError(f"找不到已完成影片：{video_path}")
+    if duration_seconds <= 0:
+        raise BotError("部分合成的影片長度必須大於 0 秒。")
+    if shutil.which(FFMPEG_PATH) is None and not Path(FFMPEG_PATH).is_file():
+        raise BotError(
+            f"找不到 FFmpeg：{FFMPEG_PATH}。請安裝 FFmpeg，或設定 MINIMAX_FFMPEG。"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{duration_seconds:.3f}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BotError(f"單段部分合成失敗：{exc}") from exc
+    if result.returncode != 0 or not output_path.is_file():
+        detail = (result.stderr or "").strip()
+        raise BotError(f"單段部分合成失敗：{detail[-800:]}")
+    return output_path
+
+
+def merge_completed_segments(
+    video_paths: list[Path],
+    output_path: Path,
+    total_seconds: float,
+    shot_plan: Optional[tuple[ShotSpec, ...]] = None,
+) -> Path:
+    """Merge all completed shots, including a one-shot early cancellation."""
+    if not video_paths:
+        raise BotError("沒有已完成的分段可以合成。")
+    if len(video_paths) == 1:
+        return trim_single_video(video_paths[0], output_path, total_seconds)
+    return concat_videos(video_paths, output_path, total_seconds, shot_plan=shot_plan)
+
+
+def upload_video_to_comfy(video_path: Path) -> str:
+    """Upload a previous MP4 so LoadVideo can expose its frame batch."""
+    return upload_audio_to_comfy(video_path)
+
+
 class TelegramClient:
     def __init__(self, token: str):
         self.base_url = f"https://api.telegram.org/bot{token}"
@@ -1931,21 +2102,39 @@ class TelegramTurboBot:
                 job.resume_event.set()
         return job is not None
 
-    def run_segment(self, job: JobState, announce: bool = True) -> Path:
+    def run_segment(
+        self,
+        job: JobState,
+        announce: bool = True,
+        motion_context: bool = False,
+        context_video_name: Optional[str] = None,
+        context_latent_path: Optional[str] = None,
+        save_latent_prefix: Optional[str] = None,
+        save_latent_clip_index: Optional[int] = None,
+    ) -> Path:
         segment_started_at = time.time()
         image_name: Optional[str] = None
-        if job.input_image_path is not None and job.segment_index == 1:
+        if not motion_context and job.input_image_path is not None and job.segment_index == 1:
             if job.comfy_image_name is None:
                 job.comfy_image_name = upload_image_to_comfy(job.input_image_path)
             image_name = job.comfy_image_name
-        elif job.segment_index > 1 and job.continuation_image_path is not None:
+        elif (
+            not motion_context
+            and job.segment_index > 1
+            and job.continuation_image_path is not None
+        ):
             image_name = upload_image_to_comfy(job.continuation_image_path)
         workflow = build_workflow(
             job.config,
             segment_prompt(job),
             job.output_prefix,
             image_name=image_name,
-            audio_reference_name=job.audio_reference_name,
+            audio_reference_name=(None if motion_context else job.audio_reference_name),
+            motion_context=motion_context,
+            context_video_name=context_video_name,
+            context_latent_path=context_latent_path,
+            save_latent_prefix=save_latent_prefix,
+            save_latent_clip_index=save_latent_clip_index,
         )
         response = comfy_post(
             "/prompt",
@@ -2572,12 +2761,113 @@ class TelegramMenuBot(TelegramTurboBot):
         thread = threading.Thread(target=self.run_long_job, args=(job,), daemon=True)
         thread.start()
 
+    def send_partial_long_result(
+        self,
+        job: JobState,
+        video_paths: list[Path],
+        base_prefix: str,
+    ) -> Optional[Path]:
+        """Merge and send completed shots after a long job is cancelled."""
+        if not video_paths:
+            self.send_safe(job.chat_id, "長片已中止，尚未完成任何分段，沒有影片可以合成。")
+            return None
+
+        completed_count = len(video_paths)
+        completed_shots = (
+            job.shot_plan[:completed_count]
+            if len(job.shot_plan) >= completed_count
+            else tuple()
+        )
+        if completed_shots:
+            completed_seconds = min(
+                job.total_seconds,
+                sum(shot.duration for shot in completed_shots),
+            )
+        else:
+            completed_seconds = min(
+                job.total_seconds,
+                job.total_seconds * completed_count / max(job.segment_total, 1),
+            )
+        batch_name = base_prefix.rsplit("/", 1)[-1]
+        output_path = (
+            OUTPUT_DIR
+            / base_prefix
+            / f"{batch_name}_partial_{completed_count:02d}.mp4"
+        )
+        with job.progress_lock:
+            job.progress_phase = "merging"
+            job.progress_percent = min(
+                99.0,
+                completed_count / max(job.segment_total, 1) * 100.0,
+            )
+            job.progress_node_id = None
+            job.progress_node_state = "merging completed segments"
+        self.send_safe(
+            job.chat_id,
+            f"已中止，正在合成已完成的 {completed_count}/{job.segment_total} 段，"
+            f"約 {completed_seconds:.2f} 秒。",
+        )
+        try:
+            merge_completed_segments(
+                video_paths,
+                output_path,
+                completed_seconds,
+                shot_plan=completed_shots or None,
+            )
+            with job.progress_lock:
+                job.progress_phase = "uploading"
+                job.progress_percent = 100.0
+            caption = (
+                "MiniMax H3 Turbo 長片已提早中止，已合成部分結果\n"
+                f"{completed_seconds:.2f} 秒 | {job.config.width}×{job.config.height} | "
+                f"{job.config.steps} steps | {completed_count}/{job.segment_total} 段"
+            )
+            self.telegram.send_video(job.chat_id, output_path, caption)
+            print(f"partial long job sent: {output_path}", flush=True)
+            return output_path
+        except Exception as exc:
+            print(f"partial long job merge error: {exc}", flush=True)
+            self.send_safe(job.chat_id, f"已中止，但部分影片合成失敗：{exc}")
+            return None
+
     def run_long_job(self, job: JobState) -> None:
+        partial_reported = False
+        video_paths: list[Path] = []
+        base_prefix = job.output_prefix
+
+        def report_partial() -> None:
+            nonlocal partial_reported
+            if partial_reported:
+                return
+            partial_reported = True
+            self.send_partial_long_result(job, video_paths, base_prefix)
+
         try:
             self.ensure_comfyui_ready(job)
-            base_prefix = job.output_prefix
             base_config = job.config
-            video_paths: list[Path] = []
+            motion_context_enabled = (
+                LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
+                and motion_context_nodes_available()
+            )
+            if LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}:
+                if motion_context_enabled:
+                    self.send_safe(
+                        job.chat_id,
+                        "已啟用實驗性 H3 Motion Context：後續鏡頭會接續上一段的尾幀、"
+                        "影像 latent 和音訊 latent。",
+                    )
+                else:
+                    self.send_safe(
+                        job.chat_id,
+                        "Motion Context 節點未就緒，這次先使用穩定的尾幀＋音訊參考模式。",
+                    )
+            context_video_name: Optional[str] = None
+            context_latent_path: Optional[str] = None
+            latent_prefix = (
+                f"{base_prefix}/motion_context/latent"
+                if motion_context_enabled
+                else None
+            )
             if job.input_image_path is not None:
                 self.send_safe(
                     job.chat_id,
@@ -2585,8 +2875,10 @@ class TelegramMenuBot(TelegramTurboBot):
                 )
             for index in range(1, job.segment_total + 1):
                 if not self.wait_for_resume(job):
+                    report_partial()
                     return
                 if job.cancel_event.is_set():
+                    report_partial()
                     return
                 job.segment_index = index
                 shot = job.shot_plan[index - 1]
@@ -2595,6 +2887,12 @@ class TelegramMenuBot(TelegramTurboBot):
                 generation_seconds = shot.duration
                 if index < job.segment_total:
                     generation_seconds += SHOT_TRANSITION_SECONDS
+                use_motion_context = motion_context_enabled and index > 1
+                if use_motion_context:
+                    # Motion Context pins a 22-frame head which is trimmed from
+                    # the decoded result. Generate that head plus the requested
+                    # shot duration so the delivered shot keeps its timeline.
+                    generation_seconds += MOTION_CONTEXT_EXTRA_SECONDS
                 job.config = parse_config(
                     [
                         str(base_config.width),
@@ -2610,27 +2908,45 @@ class TelegramMenuBot(TelegramTurboBot):
                     f"劇情 {shot.start_seconds:g}-{shot.end_seconds:g} 秒 | "
                     f"模型約 {job.config.actual_seconds:.2f} 秒。",
                 )
-                video_path = self.run_segment(job, announce=False)
+                video_path = self.run_segment(
+                    job,
+                    announce=False,
+                    motion_context=use_motion_context,
+                    context_video_name=context_video_name,
+                    context_latent_path=context_latent_path,
+                    save_latent_prefix=latent_prefix,
+                    save_latent_clip_index=index if latent_prefix else None,
+                )
                 video_paths.append(video_path)
                 if index < job.segment_total:
-                    if index == 1:
+                    if motion_context_enabled:
+                        # The next graph reads the previous MP4 and loads this
+                        # segment's paired AV latent.
+                        context_video_name = upload_video_to_comfy(video_path)
+                        context_latent_path = (
+                            f"{latent_prefix}_{index:05d}.safetensors"
+                        )
+                    else:
+                        # Keep the immediate previous segment as the stable
+                        # reference instead of always reusing segment 1.
                         job.audio_reference_name = upload_audio_to_comfy(video_path)
-                    previous_frame = job.continuation_image_path
-                    continuation_path = (
-                        CONTINUATION_DIR
-                        / f"{uuid.uuid4().hex}_segment_{index:03d}.png"
-                    )
-                    job.continuation_image_path = extract_last_frame(
-                        video_path, continuation_path
-                    )
-                    if previous_frame and previous_frame != continuation_path:
-                        try:
-                            previous_frame.unlink()
-                        except OSError:
-                            pass
+                        previous_frame = job.continuation_image_path
+                        continuation_path = (
+                            CONTINUATION_DIR
+                            / f"{uuid.uuid4().hex}_segment_{index:03d}.png"
+                        )
+                        job.continuation_image_path = extract_last_frame(
+                            video_path, continuation_path
+                        )
+                        if previous_frame and previous_frame != continuation_path:
+                            try:
+                                previous_frame.unlink()
+                            except OSError:
+                                pass
                 self.send_safe(job.chat_id, f"長片鏡頭 {index}/{job.segment_total} 完成。")
 
             if job.cancel_event.is_set():
+                report_partial()
                 return
             batch_name = base_prefix.rsplit("/", 1)[-1]
             output_path = OUTPUT_DIR / base_prefix / f"{batch_name}.mp4"
@@ -2655,7 +2971,9 @@ class TelegramMenuBot(TelegramTurboBot):
             self.telegram.send_video(job.chat_id, output_path, caption)
             self.schedule_shutdown_if_enabled(job)
         except Exception as exc:
-            if not job.cancel_event.is_set():
+            if job.cancel_event.is_set():
+                report_partial()
+            else:
                 self.send_safe(job.chat_id, f"長片生成失敗：{exc}")
             print(f"long generation error: {exc}", flush=True)
         finally:

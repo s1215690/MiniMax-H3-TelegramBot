@@ -151,6 +151,20 @@ SEGMENT 2:
 
 面板上的「🌡 查看電腦溫度」會讀取 NVIDIA GPU 溫度、GPU 使用率和 VRAM；CPU 溫度只有在 Windows/主機板提供感測器時才會顯示。選擇超過 15 秒的長片後，可以開啟「🔌 長片完成後關機」；影片合併並成功傳回 Telegram 後，系統會在 60 秒後關機。倒數期間可以按「🛑 取消即將關機」，或輸入 `/cancel_shutdown`。
 
+## 長片連貫與音訊接續
+
+長片預設會嘗試使用 `ComfyUI-H3-Motion-Context`。它會把上一段的影片、尾端影像 context，以及上一段儲存的配對 AV latent 一起交給下一段，並裁走用來接續的 22 個影格；因此不只是重複提交同一條 prompt，也不只是把上一段音訊當作聲音參考。
+
+請先在 ComfyUI 的 `custom_nodes` 安裝 [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)，然後重啟 ComfyUI。Bot 會透過 `/object_info` 自動檢查節點；節點不存在時會自動回退到穩定的「上一段尾幀＋音訊參考」模式。
+
+如果要手動回退穩定模式，設定環境變數後重啟 Bot：
+
+```powershell
+[Environment]::SetEnvironmentVariable('MINIMAX_H3_LONG_CONTINUITY', 'stable', 'User')
+```
+
+長片中按「中止」時，Bot 會停止目前 ComfyUI 任務，並把已完成的分段先合併成 `_partial.mp4` 傳回 Telegram；未完成的分段不會被假裝成已完成。由於 H3 每個分段仍是獨立採樣，Motion Context 只能改善接續，不能保證跨很多段後人物、音樂和音效完全不漂移。
+
 ## 顯存配置
 
 本專案固定使用 Turbo 工作流和 `--lowvram`。這只是 ComfyUI 的顯存管理方式，不會切換成其他模型；Telegram 面板不再提供極限顯存模式。
