@@ -103,7 +103,7 @@ MINIMAX_LORA
 cinematic bright daylight scene with smooth camera movement and clear synchronized sound
 ```
 
-總片長超過 15 秒時，Bot 會使用上一段最後畫面作為下一段首幀，然後合併成一個 MP4。首幀是模型條件而非硬性鎖幀，因此仍可能有輕微跳變。
+總片長超過 15 秒時，Bot 會使用上一段最後畫面作為下一段首幀；第二段開始也會把第一段音訊作為 <Audio 1> 參考，使用 reference_only 延續音樂風格、節奏和環境聲，然後合併成一個 MP4。首幀和音訊參考都是模型條件而非硬性鎖定，因此仍可能有輕微漂移。
 
 要讓劇情真正向前推進，可以使用分段提示詞。Bot 每段只會送出 `GLOBAL` 和對應的 `SEGMENT N`：
 

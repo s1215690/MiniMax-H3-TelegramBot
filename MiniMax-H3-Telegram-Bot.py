@@ -262,6 +262,7 @@ class JobState:
     input_image_path: Optional[Path] = None
     comfy_image_name: Optional[str] = None
     continuation_image_path: Optional[Path] = None
+    audio_reference_name: Optional[str] = None
     progress_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     progress_percent: float = 0.0
     progress_node_id: Optional[str] = None
@@ -595,16 +596,24 @@ def parse_segmented_prompt(prompt: str) -> Optional[SegmentedPrompt]:
 
 
 def continuity_instruction(job: JobState) -> str:
+    audio_rule = (
+        " Keep the same music bed, tempo, instrumentation and ambience as <Audio 1>, "
+        "while generating new audio for this segment."
+        if job.audio_reference_name
+        else ""
+    )
     if job.segment_index == 1:
         return (
             "This is the opening segment. Perform only the CURRENT SEGMENT action. "
             "Do not advance into later segments."
+            + audio_rule
         )
     return (
         "Directly continue from the supplied first frame. During the first second, "
         "keep the same character identity, pose, framing and motion direction with "
         "only small natural movement; then perform only the CURRENT SEGMENT action. "
         "Do not restart the scene or replay any earlier action."
+        + audio_rule
     )
 
 
@@ -654,6 +663,7 @@ def build_workflow(
     prompt: str,
     output_prefix: str = OUTPUT_PREFIX,
     image_name: Optional[str] = None,
+    audio_reference_name: Optional[str] = None,
 ) -> dict[str, Any]:
     if not T8_API_TEMPLATE.is_file():
         raise BotError(f"找不到 T8 API 工作流模板：{T8_API_TEMPLATE}")
@@ -676,9 +686,9 @@ def build_workflow(
     conditioning["height"] = config.height
     conditioning["length"] = config.length
     conditioning["task_type"] = "I2VA" if image_name else "T2VA"
-    conditioning["audio_mode"] = "native"
-    conditioning["add_source_as_reference"] = False
-    conditioning["prompt_primary_audio_ordinal"] = 0
+    conditioning["audio_mode"] = "reference_only" if audio_reference_name else "native"
+    conditioning["add_source_as_reference"] = bool(audio_reference_name)
+    conditioning["prompt_primary_audio_ordinal"] = 1 if audio_reference_name else 0
     if image_name:
         workflow["13"] = {
             "inputs": {"image": image_name},
@@ -686,6 +696,13 @@ def build_workflow(
             "_meta": {"title": "Telegram input image"},
         }
         conditioning["first_frame"] = ["13", 0]
+    if audio_reference_name:
+        workflow["14"] = {
+            "inputs": {"audio": audio_reference_name},
+            "class_type": "LoadAudio",
+            "_meta": {"title": "Previous segment audio reference"},
+        }
+        conditioning["drive_audio"] = ["14", 0]
 
     workflow["7"]["inputs"]["steps"] = config.steps
     workflow["7"]["inputs"]["shift_video"] = 12.0
@@ -772,6 +789,62 @@ def upload_image_to_comfy(image_path: Path) -> str:
         raise BotError(f"圖片上傳到 ComfyUI 失敗：{exc}") from exc
     if not result.get("name"):
         raise BotError(f"ComfyUI 沒有回傳圖片名稱：{result}")
+    subfolder = str(result.get("subfolder", "")).strip("/\\")
+    name = str(result["name"])
+    return f"{subfolder}/{name}" if subfolder else name
+
+
+def upload_audio_to_comfy(audio_path: Path) -> str:
+    """Upload an MP4/WAV reference that ComfyUI's LoadAudio can read."""
+    if not audio_path.is_file():
+        raise BotError(f"找不到音訊參考檔：{audio_path}")
+    boundary = f"----MiniMaxH3Audio{uuid.uuid4().hex}"
+    boundary_bytes = boundary.encode("ascii")
+    remote_name = f"telegram_audio_{uuid.uuid4().hex}{audio_path.suffix.lower() or '.wav'}"
+    chunks: list[bytes] = []
+    for name, value in {
+        "type": "input",
+        "subfolder": "TelegramAudio",
+        "overwrite": "true",
+    }.items():
+        chunks.extend(
+            [
+                b"--" + boundary_bytes + b"\r\n",
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    chunks.extend(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            (
+                f'Content-Disposition: form-data; name="image"; '
+                f'filename="{remote_name}"\r\n'
+            ).encode("utf-8"),
+            b"Content-Type: application/octet-stream\r\n\r\n",
+            audio_path.read_bytes(),
+            b"\r\n--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+    request = Request(
+        f"{COMFY_URL}/upload/image",
+        data=b"".join(chunks),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise BotError(f"音訊參考上傳到 ComfyUI 失敗：{http_error_detail(exc)}") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise BotError(f"音訊參考上傳到 ComfyUI 失敗：{exc}") from exc
+    if not result.get("name"):
+        raise BotError(f"ComfyUI 沒有回傳音訊名稱：{result}")
     subfolder = str(result.get("subfolder", "")).strip("/\\")
     name = str(result["name"])
     return f"{subfolder}/{name}" if subfolder else name
@@ -1455,6 +1528,7 @@ class TelegramTurboBot:
             segment_prompt(job),
             job.output_prefix,
             image_name=image_name,
+            audio_reference_name=job.audio_reference_name,
         )
         response = comfy_post(
             "/prompt",
@@ -2115,6 +2189,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 video_path = self.run_segment(job, announce=False)
                 video_paths.append(video_path)
                 if index < job.segment_total:
+                    if index == 1:
+                        job.audio_reference_name = upload_audio_to_comfy(video_path)
                     previous_frame = job.continuation_image_path
                     continuation_path = (
                         CONTINUATION_DIR

@@ -75,6 +75,27 @@ same camera language and realistic style
         self.assertIn("supplied first frame", result)
         self.assertNotIn("same fight", result)
 
+    def test_later_segment_uses_first_audio_as_style_reference(self):
+        job = make_job("GLOBAL:\nsame style\nSEGMENT 1:\nstart\nSEGMENT 2:\ncontinue", 2)
+        job.audio_reference_name = "TelegramAudio/first_segment.mp4"
+        rendered = BOT.segment_prompt(job)
+        self.assertIn("<Audio 1>", rendered)
+        self.assertIn("same music bed", rendered)
+
+        workflow = BOT.build_workflow(
+            job.config,
+            rendered,
+            output_prefix="test/audio",
+            image_name="TelegramInputs/continuation.png",
+            audio_reference_name=job.audio_reference_name,
+        )
+        conditioning = workflow["6"]["inputs"]
+        self.assertEqual("reference_only", conditioning["audio_mode"])
+        self.assertTrue(conditioning["add_source_as_reference"])
+        self.assertEqual(1, conditioning["prompt_primary_audio_ordinal"])
+        self.assertEqual(["14", 0], conditioning["drive_audio"])
+        self.assertEqual("LoadAudio", workflow["14"]["class_type"])
+
 
 if __name__ == "__main__":
     unittest.main()
