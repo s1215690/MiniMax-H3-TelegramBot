@@ -14,6 +14,7 @@
 - GPU 溫度、使用率和 VRAM 查詢按鈕
 - 長片完成並傳回 Telegram 後自動關機，可在倒數期間取消
 - ComfyUI 啟動、停止、重啟和生成進度查詢
+- 長片生成中的中止、分段暫停和播放／繼續按鈕
 - Turbo 工作流（固定使用 `--lowvram` 顯存管理）
 - Windows 登入後自動啟動 Bot
 - Token 只從 Windows 使用者環境變數讀取
@@ -83,6 +84,8 @@ MINIMAX_LORA
 /image                 切換到圖片生視頻
 /text                  切換到文字生視頻
 /progress              查看生成進度
+/pause                 暫停長片（目前分段完成後生效）
+/resume 或 /play       繼續長片生成
 /status                查看 Bot 狀態
 /temperature           查看 GPU／CPU 溫度
 /cancel_shutdown       取消已排程的自動關機
@@ -101,6 +104,8 @@ cinematic bright daylight scene with smooth camera movement and clear synchroniz
 ```
 
 總片長超過 15 秒時，Bot 會使用上一段最後畫面作為下一段首幀，然後合併成一個 MP4。
+
+生成中的面板提供「⛔ 中止」「⏸ 暫停」和「▶️ 播放／繼續」。中止會打斷目前 ComfyUI 工作；暫停會在目前最多 15 秒分段完成後生效，播放／繼續會生成下一段。因為 ComfyUI 不保存採樣中的中間狀態，單段短片不能安全地在採樣中途暫停。
 
 面板上的「🌡 查看電腦溫度」會讀取 NVIDIA GPU 溫度、GPU 使用率和 VRAM；CPU 溫度只有在 Windows/主機板提供感測器時才會顯示。選擇超過 15 秒的長片後，可以開啟「🔌 長片完成後關機」；影片合併並成功傳回 Telegram 後，系統會在 60 秒後關機。倒數期間可以按「🛑 取消即將關機」，或輸入 `/cancel_shutdown`。
 

@@ -252,6 +252,8 @@ class JobState:
     started_at: float
     prompt_id: Optional[str] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    pause_requested: threading.Event = field(default_factory=threading.Event)
+    resume_event: threading.Event = field(default_factory=threading.Event)
     output_prefix: str = OUTPUT_PREFIX
     segment_index: int = 1
     segment_total: int = 1
@@ -1095,6 +1097,8 @@ class TelegramTurboBot:
             "/gen 864 480 12 15\n你的提示詞\n\n"
             "/status 查看狀態\n"
             "/progress 查看即時生成進度\n"
+            "/pause 暫停長片（在目前分段完成後）\n"
+            "/resume 或 /play 繼續長片\n"
             "/temperature 查看 GPU／CPU 溫度\n"
             "/cancel_shutdown 取消已排程的自動關機\n"
             "/comfy_restart 重啟 ComfyUI\n"
@@ -1140,6 +1144,7 @@ class TelegramTurboBot:
             "waiting": "等待 ComfyUI 回報進度",
             "running": "執行 ComfyUI 節點",
             "sampling": "採樣中",
+            "paused": "已暫停，等待播放／繼續",
             "finishing": "正在整理影片與音訊",
             "completed": "本段生成完成",
             "merging": "正在合併長片分段",
@@ -1185,6 +1190,15 @@ class TelegramTurboBot:
             f"狀態：{phase_text}",
             f"已用時間：{elapsed_text}",
         ]
+        if job.pause_requested.is_set():
+            control_text = (
+                "已暫停，等待播放／繼續"
+                if phase == "paused"
+                else "已收到暫停，會在目前分段完成後停下"
+            )
+        else:
+            control_text = "正常執行"
+        lines.append(f"控制：{control_text}")
         if node_id is not None:
             node_name = node_labels.get(str(node_id), f"ComfyUI 節點 {node_id}")
             if node_total:
@@ -1314,6 +1328,7 @@ class TelegramTurboBot:
                 cancel_event=threading.Event(),
                 input_image_path=input_image_path,
             )
+            job.resume_event.set()
             self.job = job
         thread = threading.Thread(target=self.run_job, args=(job,), daemon=True)
         thread.start()
@@ -1331,6 +1346,7 @@ class TelegramTurboBot:
             job = self.job
             if job is not None:
                 job.cancel_event.set()
+                job.resume_event.set()
         return job is not None
 
     def run_segment(self, job: JobState, announce: bool = True) -> Path:
@@ -1718,6 +1734,17 @@ class TelegramMenuBot(TelegramTurboBot):
             }
             for steps in self.STEPS
         ]
+        with self.lock:
+            active_job = self.job
+        if active_job is not None and active_job.pause_requested.is_set():
+            pause_button = {"text": "⏸ 暫停中", "callback_data": "job_pause"}
+        else:
+            pause_button = {"text": "⏸ 暫停", "callback_data": "job_pause"}
+        job_control_row = [
+            {"text": "⛔ 中止", "callback_data": "job_abort"},
+            pause_button,
+            {"text": "▶️ 播放／繼續", "callback_data": "job_resume"},
+        ]
         if self._shutdown_pending:
             shutdown_row = [
                 {"text": "🛑 取消即將關機", "callback_data": "shutdown_cancel"}
@@ -1763,6 +1790,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "♻️ 讀取上次設定", "callback_data": "last"},
                 ],
                 [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
+                job_control_row,
                 shutdown_row,
                 [{"text": "🌡 查看電腦溫度", "callback_data": "temperature"}],
                 [
@@ -1792,6 +1820,100 @@ class TelegramMenuBot(TelegramTurboBot):
             raise BotError("總片長必須是有效數字，範圍為 2 至 1800 秒。")
         self.total_seconds = validate_total_seconds(seconds)
         self.update_settings(seconds=min(self.total_seconds, MAX_SEGMENT_SECONDS))
+
+    def wait_for_resume(self, job: JobState) -> bool:
+        """Pause long-video work safely between 15-second segments."""
+        if job.segment_total <= 1 or not job.pause_requested.is_set():
+            return not job.cancel_event.is_set()
+        with job.progress_lock:
+            job.progress_phase = "paused"
+            job.progress_node_state = "paused"
+        self.send_safe(
+            job.chat_id,
+            "目前長片已暫停，會保留已完成分段；按「▶️ 播放／繼續」生成下一段。",
+        )
+        while job.pause_requested.is_set() and not job.cancel_event.is_set():
+            job.resume_event.wait(1.0)
+        if job.cancel_event.is_set():
+            return False
+        with job.progress_lock:
+            job.progress_phase = "waiting"
+            job.progress_node_state = "resumed"
+        self.send_safe(job.chat_id, "已繼續長片生成。")
+        return True
+
+    def abort_current_job(
+        self, chat_id: str, message_id: Optional[int] = None
+    ) -> None:
+        with self.lock:
+            job = self.job
+            prompt_id = job.prompt_id if job is not None else None
+            if job is not None:
+                job.cancel_event.set()
+                job.resume_event.set()
+        if job is None:
+            self.show_menu(chat_id, message_id, "目前沒有生成中的任務")
+            return
+        if prompt_id:
+            try:
+                comfy_post("/interrupt", {"prompt_id": prompt_id})
+            except BotError as exc:
+                self.send_safe(chat_id, f"已標記中止，但 ComfyUI 中止請求失敗：{exc}")
+        self.send_safe(chat_id, "已中止目前生成任務，未完成分段不會繼續。")
+        self.show_menu(chat_id, message_id)
+
+    def pause_current_job(
+        self, chat_id: str, message_id: Optional[int] = None
+    ) -> None:
+        with self.lock:
+            job = self.job
+            if job is not None and job.segment_total > 1:
+                if job.pause_requested.is_set():
+                    already_paused = True
+                else:
+                    already_paused = False
+                    job.pause_requested.set()
+                    job.resume_event.clear()
+            else:
+                already_paused = False
+        if job is None:
+            self.show_menu(chat_id, message_id, "目前沒有生成中的任務")
+            return
+        if job.segment_total <= 1:
+            self.send_safe(
+                chat_id,
+                "單段影片不能安全凍結採樣；只有長片可以在每段完成後暫停。需要停止請按「中止」。",
+            )
+        elif already_paused:
+            self.send_safe(chat_id, "長片已在暫停流程中，會在目前分段完成後停下。")
+        else:
+            self.send_safe(
+                chat_id,
+                "已收到暫停要求；目前 15 秒分段完成後會暫停，不會丟失已完成分段。",
+            )
+        self.show_menu(chat_id, message_id)
+
+    def resume_current_job(
+        self, chat_id: str, message_id: Optional[int] = None
+    ) -> None:
+        with self.lock:
+            job = self.job
+            if job is not None and job.pause_requested.is_set():
+                job.pause_requested.clear()
+                job.resume_event.set()
+                was_paused = True
+            else:
+                was_paused = False
+        if job is None:
+            self.show_menu(chat_id, message_id, "目前沒有生成中的任務")
+            return
+        if job.segment_total <= 1:
+            self.send_safe(chat_id, "單段影片沒有暫停狀態。")
+        elif was_paused:
+            self.send_safe(chat_id, "已播放／繼續；下一段會繼續生成。")
+        else:
+            self.send_safe(chat_id, "目前任務沒有暫停，會繼續生成。")
+        self.show_menu(chat_id, message_id)
 
     def start_selected_generation(self, chat_id: str, prompt: str) -> None:
         config = self.effective_config()
@@ -1841,6 +1963,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 total_seconds=total_seconds,
                 input_image_path=input_image_path,
             )
+            job.resume_event.set()
             self.job = job
         thread = threading.Thread(target=self.run_long_job, args=(job,), daemon=True)
         thread.start()
@@ -1856,6 +1979,8 @@ class TelegramMenuBot(TelegramTurboBot):
                     "圖片長片會把圖片用作第一段首幀，後續段落用提示詞接續生成。",
                 )
             for index in range(1, job.segment_total + 1):
+                if not self.wait_for_resume(job):
+                    return
                 if job.cancel_event.is_set():
                     return
                 job.segment_index = index
@@ -1938,6 +2063,19 @@ class TelegramMenuBot(TelegramTurboBot):
             shutdown_text = "完成後關機：已開啟（只對長片生效）"
         else:
             shutdown_text = "完成後關機：關閉"
+        with self.lock:
+            active_job = self.job
+        if active_job is None:
+            job_text = "當前任務：無"
+        elif active_job.pause_requested.is_set():
+            job_text = "當前任務：已暫停／等待播放"
+        elif active_job.segment_total > 1:
+            job_text = (
+                f"當前任務：長片第 {active_job.segment_index}/"
+                f"{active_job.segment_total} 段"
+            )
+        else:
+            job_text = "當前任務：生成中"
         return (
             f"{prefix}MiniMax H3 Turbo 控制面板\n\n"
             f"模式：{mode_text}\n"
@@ -1947,6 +2085,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 f"{duration_text}\n"
                 f"ComfyUI 顯存模式：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"
             f"{shutdown_text}\n"
+            f"{job_text}\n"
             f"提示詞：{prompt_status}\n\n"
             "圖片模式：先發圖片，再輸入提示詞；文字模式：直接輸入提示詞。\n"
             "最後按「生成影片」。\n"
@@ -2186,6 +2325,15 @@ class TelegramMenuBot(TelegramTurboBot):
             if data == "progress":
                 self.show_progress(chat_id, message_id)
                 return
+            if data == "job_abort":
+                self.abort_current_job(chat_id, message_id)
+                return
+            if data == "job_pause":
+                self.pause_current_job(chat_id, message_id)
+                return
+            if data == "job_resume":
+                self.resume_current_job(chat_id, message_id)
+                return
             if data == "mode:text":
                 self.input_mode = "text"
                 self.save_settings()
@@ -2361,6 +2509,12 @@ class TelegramMenuBot(TelegramTurboBot):
         if command == "/progress":
             self.send_safe(chat_id, self.progress_text())
             return
+        if command == "/pause":
+            self.pause_current_job(chat_id)
+            return
+        if command in {"/resume", "/play"}:
+            self.resume_current_job(chat_id)
+            return
         if command in {"/temperature", "/temp"}:
             self.send_safe(chat_id, temperature_report())
             return
@@ -2381,15 +2535,9 @@ class TelegramMenuBot(TelegramTurboBot):
             self.awaiting_prompt = False
             self.awaiting_duration = False
             with self.lock:
-                job = self.job
-                if job:
-                    job.cancel_event.set()
-            if job:
-                try:
-                    comfy_post("/interrupt", {})
-                except BotError:
-                    pass
-                self.send_safe(chat_id, "已要求取消目前生成。")
+                has_job = self.job is not None
+            if has_job:
+                self.abort_current_job(chat_id)
             elif self._shutdown_pending:
                 self.cancel_scheduled_shutdown(chat_id)
             else:
