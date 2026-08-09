@@ -2711,10 +2711,11 @@ class TelegramMenuBot(TelegramTurboBot):
         chat_id: str,
         message_id: Optional[int] = None,
         notice: str = "",
+        force_new: bool = False,
     ) -> None:
         text = self.menu_text(notice)
         markup = self.menu_markup()
-        target_message_id = message_id or self.menu_message_id
+        target_message_id = None if force_new else (message_id or self.menu_message_id)
         try:
             if target_message_id is None:
                 result = self.telegram.send_message(chat_id, text, reply_markup=markup)
@@ -3032,7 +3033,7 @@ class TelegramMenuBot(TelegramTurboBot):
         command = parts[0].split("@", 1)[0].lower()
 
         if command in {"/start", "/menu", "/help"}:
-            self.show_menu(chat_id)
+            self.show_menu(chat_id, force_new=True)
             return
         if command == "/prompt":
             self.request_prompt(chat_id)
