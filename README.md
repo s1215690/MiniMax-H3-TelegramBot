@@ -10,12 +10,6 @@
 
 Token 只會存放在 Windows 使用者環境變數，不會寫入這個資料夾。
 
-## ComfyUI 依賴
-
-目前的 H3 INT8 和 LTX 2.3 INT8 工作流使用 safetensors，不需要 GGUF 擴展。只有使用舊版 `*.gguf` 工作流時，才需要另外安裝 [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) 到 ComfyUI 的 `custom_nodes` 資料夾。模型權重和 ComfyUI 本體不包含在這個倉庫內，請依照工作流中的檔名自行下載。
-
-本倉庫只發布 Bot 程式、可重建的工作流、啟動腳本和測試；Telegram Token、Chat ID、模型權重、輸入／輸出影片、日誌和本機執行狀態不會發布。
-
 Bot 只接受設定好的 Chat ID。生成時如果 ComfyUI 未運行，Bot 會以目前 10GB 顯存設定自動啟動：
 `127.0.0.1:8191`、Turbo 工作流和 `--lowvram`，並等待 API 就緒後才送出工作。
 
@@ -119,6 +113,8 @@ Bot 回覆等待提示詞後，直接貼一段或多段文字即可。也可以�
 /gen 864 480 12 15
 Bright photorealistic Japanese restaurant scene with two adult women eating dinner.
 ```
+
+提示詞太長時，不要貼到 Telegram 輸入框；直接把提示詞另存為 `.txt` 或 `.text` 檔案後傳給 Bot。Bot 會讀取整個檔案、保留換行和 `GLOBAL`／`SEGMENT` 時間軸，然後保存成目前提示詞。建議使用 UTF-8 編碼，檔案上限為 512 KB；如果之前已上傳圖片，傳 TXT 不會清除圖片模式。
 
 其他指令：
 

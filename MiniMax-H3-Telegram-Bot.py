@@ -120,6 +120,8 @@ NVIDIA_SMI_PATH = os.environ.get(
 )
 SHUTDOWN_DELAY_SECONDS = 60
 MAX_TELEGRAM_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_TELEGRAM_PROMPT_BYTES = 512 * 1024
+PROMPT_FILE_EXTENSIONS = {".txt", ".text"}
 SAGE_ATTENTION_ENABLED = os.environ.get("MINIMAX_SAGE_ATTENTION", "1").strip().lower() not in {
     "0",
     "false",
@@ -218,6 +220,25 @@ def http_error_detail(exc: HTTPError) -> str:
     except Exception:
         body = ""
     return f"HTTP Error {exc.code}: {body[:1200]}" if body else str(exc)
+
+
+def decode_prompt_text(data: bytes) -> str:
+    """Decode a Telegram text file without losing multiline prompt structure."""
+    if not data:
+        raise BotError("TXT 檔案是空白的，請先加入提示詞內容。")
+
+    encodings = ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "gb18030", "big5")
+    for encoding in encodings:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if "\x00" in text:
+            continue
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if normalized:
+            return normalized
+    raise BotError("無法讀取 TXT 編碼，請另存為 UTF-8 後再上傳。")
 
 
 def run_hidden_command(
@@ -2409,11 +2430,15 @@ class TelegramClient:
         result = self.call("getFile", {"file_id": file_id}, timeout=30)
         file_path = result.get("file_path") if isinstance(result, dict) else None
         if not file_path:
-            raise BotError("Telegram 沒有回傳圖片檔案路徑。")
+            raise BotError("Telegram 沒有回傳檔案路徑。")
         return str(file_path)
 
-    def download_file(self, file_path: str, target_path: Path) -> None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+    def download_bytes(
+        self,
+        file_path: str,
+        max_bytes: int,
+        kind: str = "檔案",
+    ) -> bytes:
         try:
             with urlopen(
                 Request(
@@ -2422,11 +2447,16 @@ class TelegramClient:
                 ),
                 timeout=120,
             ) as response:
-                data = response.read(MAX_TELEGRAM_IMAGE_BYTES + 1)
+                data = response.read(max_bytes + 1)
         except (HTTPError, URLError, TimeoutError) as exc:
-            raise BotError(f"下載 Telegram 圖片失敗：{exc}") from exc
-        if len(data) > MAX_TELEGRAM_IMAGE_BYTES:
-            raise BotError("圖片太大，請控制在 20 MB 以內。")
+            raise BotError(f"下載 Telegram {kind}失敗：{exc}") from exc
+        if len(data) > max_bytes:
+            raise BotError(f"{kind}太大，請控制在 {max_bytes / 1024:g} KB 以內。")
+        return data
+
+    def download_file(self, file_path: str, target_path: Path) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        data = self.download_bytes(file_path, MAX_TELEGRAM_IMAGE_BYTES, "圖片")
         target_path.write_bytes(data)
 
     def get_updates(self, offset: Optional[int]) -> list[dict[str, Any]]:
@@ -5503,6 +5533,7 @@ class TelegramMenuBot(TelegramTurboBot):
             f"{queue_text}\n"
             f"提示詞：{prompt_status}\n\n"
             "圖片模式：先發圖片，再輸入提示詞；文字模式：直接輸入提示詞。\n"
+            "提示詞太長時，可直接上傳 UTF-8 的 .txt 檔案，Bot 會完整讀取。\n"
             "最後按「生成影片」。\n"
             "長片會解析時間軸、短鏡頭接力生成後加入轉場合併；設定和提示詞會自動保存。"
         )
@@ -5718,6 +5749,29 @@ class TelegramMenuBot(TelegramTurboBot):
                 return str(document["file_id"])
         return None
 
+    @staticmethod
+    def prompt_file_info(
+        message: dict[str, Any],
+    ) -> Optional[tuple[str, str, Optional[int]]]:
+        """Return file id, name and size for a supported TXT document."""
+        document = message.get("document")
+        if not isinstance(document, dict) or not document.get("file_id"):
+            return None
+        file_name = str(document.get("file_name", "prompt.txt")).strip() or "prompt.txt"
+        mime_type = str(document.get("mime_type", "")).lower()
+        suffix = Path(file_name).suffix.lower()
+        if suffix not in PROMPT_FILE_EXTENSIONS and mime_type not in {
+            "text/plain",
+            "text/markdown",
+        }:
+            return None
+        raw_size = document.get("file_size")
+        try:
+            file_size = int(raw_size) if raw_size is not None else None
+        except (TypeError, ValueError):
+            file_size = None
+        return str(document["file_id"]), file_name, file_size
+
     def handle_image_message(self, message: dict[str, Any], chat_id: str) -> None:
         file_id = self.image_file_id(message)
         if not file_id:
@@ -5750,12 +5804,69 @@ class TelegramMenuBot(TelegramTurboBot):
         except BotError as exc:
             self.send_safe(chat_id, f"处理图片失败：{exc}")
 
+    def handle_prompt_file_message(self, message: dict[str, Any], chat_id: str) -> None:
+        file_info = self.prompt_file_info(message)
+        if file_info is None:
+            return
+        file_id, file_name, file_size = file_info
+        if file_size is not None and file_size > MAX_TELEGRAM_PROMPT_BYTES:
+            self.send_safe(
+                chat_id,
+                f"TXT 檔案太大，請控制在 {MAX_TELEGRAM_PROMPT_BYTES / 1024:g} KB 以內。",
+            )
+            return
+        try:
+            remote_path = self.telegram.get_file(file_id)
+            data = self.telegram.download_bytes(
+                remote_path,
+                MAX_TELEGRAM_PROMPT_BYTES,
+                "TXT 提示詞",
+            )
+            prompt = decode_prompt_text(data)
+        except BotError as exc:
+            self.send_safe(chat_id, f"讀取 TXT 提示詞失敗：{exc}")
+            return
+
+        if self.awaiting_extension_prompt:
+            checkpoint_id = self.extension_checkpoint_id
+            extension_seconds = self.extension_seconds
+            self.awaiting_extension_prompt = False
+            if checkpoint_id and extension_seconds is not None:
+                self.start_extension_generation(
+                    chat_id,
+                    checkpoint_id,
+                    extension_seconds,
+                    prompt,
+                )
+            else:
+                self.send_safe(chat_id, "延續設定已過期，請重新按 /extend。")
+            return
+
+        if self.awaiting_queue_prompt:
+            self.enqueue_story_prompts(chat_id, prompt)
+            return
+
+        self.prompt = prompt
+        self.awaiting_prompt = False
+        self.awaiting_duration = False
+        self.awaiting_extension_duration = False
+        self.awaiting_extension_prompt = False
+        self.awaiting_queue_prompt = False
+        self.save_settings()
+        self.show_menu(chat_id, notice=f"已讀取 {file_name}，提示詞已更新（{len(prompt)} 字）")
+
     def handle_message(self, message: dict[str, Any]) -> None:
         chat_id = str(message.get("chat", {}).get("id", ""))
         if chat_id != self.allowed_chat_id:
             return
         if self.image_file_id(message):
             self.handle_image_message(message, chat_id)
+            return
+        if self.prompt_file_info(message):
+            self.handle_prompt_file_message(message, chat_id)
+            return
+        if isinstance(message.get("document"), dict):
+            self.send_safe(chat_id, "目前只支援上傳 .txt 或 .text 提示詞檔案。")
             return
         text = str(message.get("text", "")).strip()
         if not text:
@@ -6392,7 +6503,7 @@ class TelegramMenuBot(TelegramTurboBot):
         commands = [
             {"command": "menu", "description": "開啟控制面板"},
             {"command": "progress", "description": "查看生成進度"},
-            {"command": "prompt", "description": "輸入提示詞"},
+            {"command": "prompt", "description": "輸入提示詞或上傳 TXT"},
             {"command": "model", "description": "選擇 MiniMax H3 或 LTX 2.3"},
             {"command": "image", "description": "切換圖生視頻"},
             {"command": "text", "description": "切換文生視頻"},
