@@ -59,6 +59,12 @@ T8_API_TEMPLATE = Path(
         str(PROJECT_DIR / "workflow" / "dual_clock_multirate_api.json"),
     )
 )
+SEEDVR2_API_TEMPLATE = Path(
+    os.environ.get(
+        "MINIMAX_SEEDVR2_API_TEMPLATE",
+        str(PROJECT_DIR / "workflow" / "seedvr2_3b_int8_upscale_video_api.json"),
+    )
+)
 COMFYUI_PORT = int(os.environ.get("MINIMAX_COMFY_PORT", "8191"))
 COMFYUI_LOG = Path(
     os.environ.get(
@@ -83,6 +89,12 @@ NVIDIA_SMI_PATH = os.environ.get(
 )
 SHUTDOWN_DELAY_SECONDS = 60
 MAX_TELEGRAM_IMAGE_BYTES = 20 * 1024 * 1024
+SAGE_ATTENTION_ENABLED = os.environ.get("MINIMAX_SAGE_ATTENTION", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 VIDEO_VAE = os.environ.get("MINIMAX_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors")
 AUDIO_VAE = os.environ.get("MINIMAX_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors")
@@ -104,6 +116,11 @@ IMAGE_DIR = STATE_PATH.parent / "input_images"
 MAX_SEGMENT_SECONDS = 15.0
 MAX_SHOT_SECONDS = 8.0
 SHOT_TRANSITION_SECONDS = 0.12
+SEEDVR2_UNET_NAME = "seedvr2_3b_int8_convrot.safetensors"
+SEEDVR2_VAE_NAME = "seedvr2_ema_vae_fp16.safetensors"
+SEEDVR2_FHD_LONG_EDGE = 1920
+SEEDVR2_2K_LONG_EDGE = 2560
+SEEDVR2_SPLIT_SECONDS = 8.0
 TIMELINE_TOLERANCE_SECONDS = 0.25
 MIN_TOTAL_SECONDS = 2.0
 MAX_TOTAL_SECONDS = 30.0 * 60.0
@@ -287,6 +304,21 @@ class JobState:
     progress_queue_remaining: Optional[int] = None
     progress_phase: str = "queued"
     progress_tracker: Any = field(default=None, repr=False, compare=False)
+    task_type: str = "h3"
+    upscale_source_path: Optional[Path] = None
+    upscale_target_width: int = 0
+    upscale_target_height: int = 0
+
+
+@dataclass(frozen=True)
+class PendingUpscale:
+    token: str
+    chat_id: str
+    source_path: Path
+    source_width: int
+    source_height: int
+    duration_seconds: float
+    shutdown_after_choice: bool = False
 
 
 class ComfyProgressTracker:
@@ -943,6 +975,8 @@ def workflow_usage_report(workflow: dict[str, Any], vram_mode: str) -> str:
         "MiniMaxChunkFeedForward": "Chunk FeedForward",
     }
     acceleration = []
+    if SAGE_ATTENTION_ENABLED:
+        acceleration.append("SageAttention")
     if "LoraLoaderBypassModelOnly" in class_types or "LoraLoaderModelOnly" in class_types:
         acceleration.append("Turbo LoRA")
     if sampler_type == "MiniMaxH3MultiRateSamplerEXPT8":
@@ -1159,6 +1193,62 @@ def build_workflow(
     return workflow
 
 
+def round_video_dimension(value: float) -> int:
+    """Round a SeedVR2 target to a safe 32-pixel alignment."""
+    return max(32, int(round(value / 32.0) * 32))
+
+
+def upscale_dimensions(width: int, height: int, longer_edge: int) -> tuple[int, int]:
+    """Preserve the source aspect ratio while choosing a SeedVR2 long edge."""
+    scale = float(longer_edge) / max(width, height)
+    return (
+        round_video_dimension(width * scale),
+        round_video_dimension(height * scale),
+    )
+
+
+def build_seedvr2_workflow(
+    input_video_name: str,
+    target_long_edge: int,
+    output_prefix: str,
+    split_latent: bool = False,
+) -> dict[str, Any]:
+    """Build the native ComfyUI SeedVR2 3B INT8 video-upscale graph."""
+    if not SEEDVR2_API_TEMPLATE.is_file():
+        raise BotError(f"找不到 SeedVR2 API 工作流模板：{SEEDVR2_API_TEMPLATE}")
+    with SEEDVR2_API_TEMPLATE.open("r", encoding="utf-8") as handle:
+        workflow = json.load(handle)
+    workflow["1"]["inputs"]["file"] = input_video_name
+    resize_inputs = workflow["3"]["inputs"]
+    resize_inputs["resize_type"] = "scale longer dimension"
+    resize_inputs["resize_type.longer_size"] = int(target_long_edge)
+    resize_inputs["scale_method"] = "lanczos"
+    workflow["5"]["inputs"]["vae_name"] = SEEDVR2_VAE_NAME
+    workflow["7"]["inputs"]["unet_name"] = SEEDVR2_UNET_NAME
+    workflow["10"]["inputs"]["seed"] = secrets.randbits(63)
+    workflow["14"]["inputs"]["filename_prefix"] = output_prefix
+    if not split_latent:
+        workflow["8"]["inputs"]["vae_conditioning"] = ["6", 0]
+        workflow["10"]["inputs"]["latent_image"] = ["6", 0]
+        workflow["12"]["inputs"]["samples"] = ["10", 0]
+    return workflow
+
+
+def seedvr2_usage_report(target_long_edge: int) -> str:
+    acceleration = ["SeedVR2 3B INT8", "1-step", "tiled VAE", "automatic temporal chunks"]
+    if SAGE_ATTENTION_ENABLED:
+        acceleration.append("SageAttention")
+    return "\n".join(
+        [
+            f"放大目標：長邊 {target_long_edge}px",
+            f"SeedVR2 VAE：{SEEDVR2_VAE_NAME}",
+            f"SeedVR2 模型：{SEEDVR2_UNET_NAME}",
+            "放大配置：" + "、".join(acceleration),
+            "ComfyUI 顯存模式：lowvram",
+        ]
+    )
+
+
 def json_request(url: str, payload: Optional[dict[str, Any]] = None, timeout: float = 45.0) -> Any:
     data = None
     headers = {"Accept": "application/json"}
@@ -1361,6 +1451,8 @@ def start_comfyui_process(vram_mode: Optional[str] = None) -> str:
         COMFYUI_USER_DIR.mkdir(parents=True, exist_ok=True)
         database_url = f"sqlite:///{COMFYUI_DATABASE.as_posix()}"
         memory_flags = ["--lowvram"]
+        if SAGE_ATTENTION_ENABLED:
+            memory_flags.append("--use-sage-attention")
         command = [
             str(COMFYUI_PYTHON),
             "main.py",
@@ -1912,6 +2004,7 @@ class TelegramTurboBot:
         self.offset: Optional[int] = None
         self.pending_config: Optional[GenerationConfig] = None
         self.job: Optional[JobState] = None
+        self.pending_upscale: Optional[PendingUpscale] = None
         self.lock = threading.Lock()
         self.progress_message_lock = threading.Lock()
         self.progress_message_id: Optional[int] = None
@@ -1949,6 +2042,169 @@ class TelegramTurboBot:
             self.telegram.send_message(chat_id, text)
         except BotError as exc:
             print(f"Telegram sendMessage error: {exc}", flush=True)
+
+    def offer_upscale(
+        self,
+        chat_id: str,
+        video_path: Path,
+        source_width: int,
+        source_height: int,
+        duration_seconds: float,
+        shutdown_after_choice: bool = False,
+    ) -> None:
+        """Keep the original and expose optional SeedVR2 actions in Telegram."""
+        token = uuid.uuid4().hex[:12]
+        pending = PendingUpscale(
+            token=token,
+            chat_id=str(chat_id),
+            source_path=video_path,
+            source_width=int(source_width),
+            source_height=int(source_height),
+            duration_seconds=float(duration_seconds),
+            shutdown_after_choice=shutdown_after_choice,
+        )
+        with self.lock:
+            self.pending_upscale = pending
+        markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "⬆️ 放大到 1080p",
+                        "callback_data": f"upscale:1080:{token}",
+                    }
+                ],
+                [
+                    {
+                        "text": "⬆️ 放大到 2K",
+                        "callback_data": f"upscale:2k:{token}",
+                    }
+                ],
+                [
+                    {
+                        "text": "✅ 保留原片",
+                        "callback_data": f"upscale:keep:{token}",
+                    }
+                ],
+            ]
+        }
+        try:
+            self.telegram.send_message(
+                chat_id,
+                "原片已回傳。要不要用 SeedVR2 3B INT8 放大？\n"
+                "放大會另外建立 ComfyUI 任務，原片會保留。",
+                reply_markup=markup,
+            )
+        except BotError as exc:
+            print(f"Telegram upscale menu error: {exc}", flush=True)
+
+    def finalize_upscale_choice(
+        self, chat_id: str, pending: PendingUpscale
+    ) -> None:
+        """Hook for the menu bot to apply deferred long-video shutdown."""
+        return
+
+    def run_upscale_job(self, job: JobState, pending: PendingUpscale) -> None:
+        """Run one optional SeedVR2 upscale after H3 has returned the source."""
+        started_at = time.time()
+        source_path = pending.source_path
+        try:
+            if source_path is None or not source_path.is_file():
+                raise BotError("找不到要放大的原片，請重新生成一次。")
+            self.ensure_comfyui_ready(job)
+            self.send_safe(job.chat_id, "SeedVR2 放大開始：正在載入原片與模型，請稍候。")
+            try:
+                comfy_post("/free", {"unload_models": True, "free_memory": True})
+            except BotError as exc:
+                print(f"ComfyUI memory release before SeedVR2 was unavailable: {exc}", flush=True)
+            input_video_name = upload_video_to_comfy(source_path)
+            target_long_edge = max(job.upscale_target_width, job.upscale_target_height)
+            output_prefix = f"MiniMaxH3/Telegram_Turbo_Upscale/{uuid.uuid4().hex[:12]}"
+            workflow = build_seedvr2_workflow(
+                input_video_name,
+                target_long_edge,
+                output_prefix,
+                split_latent=pending.duration_seconds > SEEDVR2_SPLIT_SECONDS,
+            )
+            response = comfy_post(
+                "/prompt",
+                {"prompt": workflow, "client_id": "telegram-turbo-bot"},
+            )
+            prompt_id = response.get("prompt_id")
+            if not prompt_id:
+                raise BotError(f"ComfyUI 沒有回傳放大 prompt_id：{response}")
+            job.prompt_id = str(prompt_id)
+            with job.progress_lock:
+                job.progress_percent = 0.0
+                job.progress_phase = "waiting"
+                job.progress_node_state = "queued"
+                job.progress_queue_remaining = None
+            progress_tracker = ComfyProgressTracker(job)
+            job.progress_tracker = progress_tracker
+            progress_tracker.start()
+            self.send_safe(
+                job.chat_id,
+                f"已開始 SeedVR2 放大：{job.upscale_target_width}×{job.upscale_target_height}\n"
+                f"Prompt ID: {prompt_id}",
+            )
+            try:
+                history: Optional[dict[str, Any]] = None
+                while True:
+                    if job.cancel_event.is_set():
+                        raise BotError("SeedVR2 放大已取消。")
+                    try:
+                        history_all = comfy_post(f"/history/{prompt_id}")
+                        history = (
+                            history_all.get(str(prompt_id))
+                            if isinstance(history_all, dict)
+                            else None
+                        )
+                    except BotError:
+                        history = None
+                    if history:
+                        status = history.get("status", {})
+                        status_name = status.get("status_str")
+                        if status_name == "error":
+                            raise BotError(self.execution_error(history))
+                        if status.get("completed") or status_name == "success":
+                            break
+                    time.sleep(3)
+            finally:
+                progress_tracker.stop()
+                if job.progress_tracker is progress_tracker:
+                    job.progress_tracker = None
+
+            output_path = self.find_video(
+                history or {}, started_at, name_hint="Telegram_Turbo_Upscale"
+            )
+            if output_path is None:
+                raise BotError("SeedVR2 已完成，但找不到放大後的 MP4。")
+            with job.progress_lock:
+                job.progress_percent = 100.0
+                job.progress_phase = "uploading"
+                job.progress_node_state = "finished"
+            elapsed = time.time() - started_at
+            caption = (
+                f"SeedVR2 放大完成\n{job.upscale_target_width}×{job.upscale_target_height} | "
+                f"{format_elapsed(elapsed)}"
+            )
+            self.telegram.send_video(job.chat_id, output_path, caption)
+            self.send_safe(
+                job.chat_id,
+                "SeedVR2 放大完成。\n"
+                f"總用時：{format_elapsed(elapsed)}\n"
+                f"{seedvr2_usage_report(target_long_edge)}",
+            )
+            self.finalize_upscale_choice(job.chat_id, pending)
+            print(f"seedvr2 upscale done: {output_path}", flush=True)
+        except Exception as exc:
+            if not job.cancel_event.is_set():
+                self.send_safe(job.chat_id, f"SeedVR2 放大失敗：{exc}")
+            print(f"seedvr2 upscale error: {exc}", flush=True)
+            print(f"upscale error: {exc}", flush=True)
+        finally:
+            with self.lock:
+                if self.job is job:
+                    self.job = None
 
     def _progress_refresh_loop(self) -> None:
         while True:
@@ -2072,7 +2328,7 @@ class TelegramTurboBot:
             "12": "儲存影片",
         }
         lines = [
-            "📊 MiniMax H3 生成進度",
+            f"📊 {'SeedVR2 放大' if job.task_type == 'seedvr2' else 'MiniMax H3'} 進度",
             segment_line,
             f"狀態：{phase_text}",
             f"已用時間：{elapsed_text}",
@@ -2353,6 +2609,13 @@ class TelegramTurboBot:
                 job.chat_id,
                 completion_report(job, time.time() - job.started_at),
             )
+            self.offer_upscale(
+                job.chat_id,
+                video_path,
+                job.config.width,
+                job.config.height,
+                job.config.actual_seconds,
+            )
         except Exception as exc:  # keep the long-polling bot alive after one job fails
             if not job.cancel_event.is_set():
                 self.send_safe(job.chat_id, f"生成失败：{exc}")
@@ -2371,7 +2634,11 @@ class TelegramTurboBot:
         return "ComfyUI execution error"
 
     @staticmethod
-    def find_video(history: dict[str, Any], started_at: float) -> Optional[Path]:
+    def find_video(
+        history: dict[str, Any],
+        started_at: float,
+        name_hint: str = "Telegram_Turbo",
+    ) -> Optional[Path]:
         candidates: list[Path] = []
         for node_output in history.get("outputs", {}).values():
             if not isinstance(node_output, dict):
@@ -2387,7 +2654,7 @@ class TelegramTurboBot:
         if OUTPUT_DIR.is_dir():
             for path in OUTPUT_DIR.rglob("*.mp4"):
                 try:
-                    if path.stat().st_mtime >= started_at - 5 and "Telegram_Turbo" in path.name:
+                    if path.stat().st_mtime >= started_at - 5 and name_hint.lower() in path.name.lower():
                         candidates.append(path)
                 except OSError:
                     continue
@@ -2973,6 +3240,13 @@ class TelegramMenuBot(TelegramTurboBot):
                     partial=True,
                 ),
             )
+            self.offer_upscale(
+                job.chat_id,
+                output_path,
+                job.config.width,
+                job.config.height,
+                completed_seconds,
+            )
             print(f"partial long job sent: {output_path}", flush=True)
             return output_path
         except Exception as exc:
@@ -3128,7 +3402,14 @@ class TelegramMenuBot(TelegramTurboBot):
                     config=base_config,
                 ),
             )
-            self.schedule_shutdown_if_enabled(job)
+            self.offer_upscale(
+                job.chat_id,
+                output_path,
+                base_config.width,
+                base_config.height,
+                job.total_seconds,
+                shutdown_after_choice=True,
+            )
         except Exception as exc:
             if job.cancel_event.is_set():
                 report_partial()
@@ -3196,6 +3477,27 @@ class TelegramMenuBot(TelegramTurboBot):
             "長片會解析時間軸、短鏡頭接力生成後加入轉場合併；設定和提示詞會自動保存。"
         )
         return menu
+
+    def finalize_upscale_choice(
+        self, chat_id: str, pending: PendingUpscale
+    ) -> None:
+        if not pending.shutdown_after_choice or not self.shutdown_after_generation:
+            return
+        with self.lock:
+            if self._shutdown_pending:
+                return
+            self._shutdown_pending = True
+        try:
+            schedule_windows_shutdown()
+        except BotError as exc:
+            with self.lock:
+                self._shutdown_pending = False
+            self.send_safe(chat_id, f"放大後安排關機失敗：{exc}")
+            return
+        self.send_safe(
+            chat_id,
+            f"已安排放大後 {SHUTDOWN_DELAY_SECONDS} 秒關機；如要取消請按選單按鈕。",
+        )
 
     def schedule_shutdown_if_enabled(self, job: JobState) -> None:
         with self.lock:
@@ -3440,6 +3742,90 @@ class TelegramMenuBot(TelegramTurboBot):
         else:
             self.show_menu(chat_id)
 
+    def handle_upscale_callback(
+        self, chat_id: str, message_id: Optional[int], data: str
+    ) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            self.send_safe(chat_id, "放大選項無效，請重新生成影片。")
+            return
+        choice, token = parts[1], parts[2]
+        with self.lock:
+            pending = self.pending_upscale
+            active_job = self.job
+        if pending is None or pending.token != token or pending.chat_id != chat_id:
+            self.send_safe(chat_id, "這個放大選項已過期，請重新生成影片。")
+            return
+        if active_job is not None:
+            self.send_safe(chat_id, "目前仍有任務執行中，請等它完成後再放大。")
+            return
+        if not pending.source_path.is_file():
+            with self.lock:
+                self.pending_upscale = None
+            self.send_safe(chat_id, "原片已不在輸出目錄，請重新生成影片。")
+            return
+        if choice == "keep":
+            with self.lock:
+                self.pending_upscale = None
+            self.send_safe(chat_id, "已保留原片，不進行放大。")
+            self.finalize_upscale_choice(chat_id, pending)
+            self.show_menu(chat_id, message_id)
+            return
+        if choice == "1080":
+            target_long_edge = SEEDVR2_FHD_LONG_EDGE
+            label = "1080p"
+        elif choice == "2k":
+            target_long_edge = SEEDVR2_2K_LONG_EDGE
+            label = "2K"
+        else:
+            self.send_safe(chat_id, "未知的放大尺寸。")
+            return
+        target_width, target_height = upscale_dimensions(
+            pending.source_width,
+            pending.source_height,
+            target_long_edge,
+        )
+        preview_seconds = min(
+            MAX_SEGMENT_SECONDS,
+            max(MIN_TOTAL_SECONDS, pending.duration_seconds),
+        )
+        config = GenerationConfig(
+            pending.source_width,
+            pending.source_height,
+            1,
+            preview_seconds,
+            valid_length(preview_seconds),
+        )
+        job = JobState(
+            chat_id=chat_id,
+            config=config,
+            prompt=f"SeedVR2 {label} video upscale",
+            started_at=time.time(),
+            output_prefix=f"MiniMaxH3/Telegram_Turbo_Upscale/{token}",
+            total_seconds=pending.duration_seconds,
+            task_type="seedvr2",
+            upscale_source_path=pending.source_path,
+            upscale_target_width=target_width,
+            upscale_target_height=target_height,
+        )
+        job.resume_event.set()
+        with self.lock:
+            self.pending_upscale = None
+            self.job = job
+        self.send_safe(
+            chat_id,
+            f"已選擇 SeedVR2 {label}：目標約 {target_width}×{target_height}。\n"
+            "原片會保留，放大期間可按「中止」或輸入 /cancel。",
+        )
+        thread = threading.Thread(
+            target=self.run_upscale_job,
+            args=(job, pending),
+            name="seedvr2-upscale",
+            daemon=True,
+        )
+        thread.start()
+        self.show_menu(chat_id, message_id)
+
     def handle_callback(self, callback: dict[str, Any]) -> None:
         query_id = str(callback.get("id", ""))
         message = callback.get("message") or {}
@@ -3454,6 +3840,9 @@ class TelegramMenuBot(TelegramTurboBot):
         data = str(callback.get("data", ""))
         message_id = message.get("message_id")
         try:
+            if data.startswith("upscale:"):
+                self.handle_upscale_callback(chat_id, message_id, data)
+                return
             if data == "noop":
                 return
             if data == "progress":

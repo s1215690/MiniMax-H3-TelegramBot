@@ -15,6 +15,8 @@
 - 長片完成並傳回 Telegram 後自動關機，可在倒數期間取消
 - ComfyUI 啟動、停止、重啟和生成進度查詢
 - 長片生成中的中止、鏡頭間暫停和播放／繼續按鈕
+- H3 原片先回傳，再用 Telegram 按鈕選擇 SeedVR2 1080p、2K 或保留原片
+- SeedVR2 放大保留原片音訊；超過約 8 秒會自動啟用 temporal chunk，降低長片顯存壓力
 - Turbo 工作流（固定使用 `--lowvram` 顯存管理）
 - Windows 登入後自動啟動 Bot
 - Token 只從 Windows 使用者環境變數讀取
@@ -60,6 +62,7 @@ Token 輸入框會隱藏內容，Token 會保存到 Windows 使用者環境變�
 | `MINIMAX_COMFY_BASE_DIR` | ComfyUI 模型和 custom nodes 的 base directory |
 | `MINIMAX_COMFY_PYTHON` | 執行 ComfyUI 的 Python |
 | `MINIMAX_T8_API_TEMPLATE` | T8 API 工作流 JSON；預設使用 `workflow/dual_clock_4step_api.json` |
+| `MINIMAX_SEEDVR2_API_TEMPLATE` | SeedVR2 放大工作流 JSON；預設使用 `workflow/seedvr2_3b_int8_upscale_video_api.json` |
 | `MINIMAX_COMFY_OUTPUT` | ComfyUI output 目錄 |
 | `MINIMAX_COMFY_INPUT` | ComfyUI input 目錄 |
 | `MINIMAX_COMFY_PORT` | ComfyUI API Port，預設 `8191` |
@@ -164,6 +167,19 @@ SEGMENT 2:
 ```
 
 長片中按「中止」時，Bot 會停止目前 ComfyUI 任務，並把已完成的分段先合併成 `_partial.mp4` 傳回 Telegram；未完成的分段不會被假裝成已完成。由於 H3 每個分段仍是獨立採樣，Motion Context 只能改善接續，不能保證跨很多段後人物、音樂和音效完全不漂移。
+
+## 可選 SeedVR2 放大
+
+H3 影片完成後會先把原片傳回 Telegram，接著顯示三個按鈕：`放大到 1080p`、`放大到 2K` 和 `保留原片`。只有按下放大按鈕才會提交另一個 ComfyUI 任務；原片不會被刪除。SeedVR2 工作流會從原片讀取影格、FPS 和音訊，再輸出 H.264 MP4。
+
+這個功能使用 ComfyUI 0.31 或更新版本內建的 SeedVR2 節點，不需要另外安裝 SeedVR2 custom node。請把以下模型放到 ComfyUI 對應目錄：
+
+```text
+models/diffusion_models/seedvr2_3b_int8_convrot.safetensors
+models/vae/seedvr2_ema_vae_fp16.safetensors
+```
+
+10GB 顯存建議先選 1080p；2K 需要更多顯存和時間，失敗時保留原片並重新選 1080p。放大期間可以用「中止」或 `/cancel` 打斷目前任務。
 
 ## 顯存配置
 

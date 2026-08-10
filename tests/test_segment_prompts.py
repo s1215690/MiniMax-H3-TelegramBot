@@ -25,6 +25,31 @@ def make_job(prompt: str, segment_index: int, segment_total: int = 2):
     )
 
 
+class SeedVR2WorkflowTests(unittest.TestCase):
+    def test_short_upscale_uses_full_latent_path(self):
+        workflow = BOT.build_seedvr2_workflow("input/test.mp4", 1920, "test/upscale")
+
+        self.assertEqual(["6", 0], workflow["8"]["inputs"]["vae_conditioning"])
+        self.assertEqual(["6", 0], workflow["10"]["inputs"]["latent_image"])
+        self.assertEqual(["10", 0], workflow["12"]["inputs"]["samples"])
+
+    def test_long_upscale_uses_temporal_split_and_merge(self):
+        workflow = BOT.build_seedvr2_workflow(
+            "input/test.mp4", 2560, "test/upscale", split_latent=True
+        )
+
+        self.assertEqual(["9", 0], workflow["8"]["inputs"]["vae_conditioning"])
+        self.assertEqual(["9", 0], workflow["10"]["inputs"]["latent_image"])
+        self.assertEqual(["11", 0], workflow["12"]["inputs"]["samples"])
+
+    def test_upscale_dimensions_are_32_aligned(self):
+        width, height = BOT.upscale_dimensions(736, 416, BOT.SEEDVR2_FHD_LONG_EDGE)
+
+        self.assertEqual((1920, 1088), (width, height))
+        self.assertEqual(0, width % 32)
+        self.assertEqual(0, height % 32)
+
+
 class SegmentedPromptTests(unittest.TestCase):
     def test_resolution_label_includes_megapixels(self):
         self.assertEqual("0.3 MP · 736×416", BOT.resolution_label(736, 416))
