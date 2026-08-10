@@ -415,6 +415,8 @@ class JobState:
     initial_context_video_path: Optional[Path] = None
     initial_context_latent_path: Optional[str] = None
     resume_motion_context: Optional[bool] = None
+    long_resolution: Optional[tuple[int, int]] = None
+    resolution_fallbacks: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -679,6 +681,47 @@ def megapixel_label(width: int, height: int) -> str:
 
 def resolution_label(width: int, height: int) -> str:
     return f"{megapixel_label(width, height)} · {width}×{height}"
+
+
+RESOLUTION_LADDER = (
+    (448, 256),
+    (512, 288),
+    (608, 352),
+    (736, 416),
+    (864, 480),
+    (960, 544),
+    (1152, 640),
+    (1280, 736),
+    (1344, 768),
+)
+
+
+def next_lower_resolution(width: int, height: int) -> Optional[tuple[int, int]]:
+    """Return the next lower configured resolution by pixel area."""
+    current_area = int(width) * int(height)
+    candidates = [
+        resolution
+        for resolution in RESOLUTION_LADDER
+        if resolution[0] * resolution[1] < current_area
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda resolution: resolution[0] * resolution[1])
+
+
+def is_cuda_oom_error(error: BaseException) -> bool:
+    """Recognize ComfyUI/PyTorch OOM messages without hiding other failures."""
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "out of memory",
+            "cuda out of memory",
+            "allocation on device",
+            "cublas_status_alloc_failed",
+            "not enough memory",
+        )
+    )
 
 
 def probe_video_info(video_path: Path) -> tuple[float, int, int]:
@@ -1210,6 +1253,9 @@ def completion_report(
         else:
             lines.append("\n實際使用配置：")
         lines.append(report)
+    if job.resolution_fallbacks:
+        lines.append("\n顯存自動降級記錄：")
+        lines.extend(f"- {fallback}" for fallback in job.resolution_fallbacks)
     return "\n".join(lines)
 
 
@@ -2157,6 +2203,7 @@ def multipart_request(url: str, fields: dict[str, str], file_field: str, file_pa
 def build_transition_filter(
     shots: list[ShotSpec] | tuple[ShotSpec, ...],
     transition_seconds: float = SHOT_TRANSITION_SECONDS,
+    output_size: Optional[tuple[int, int]] = None,
 ) -> tuple[str, str, str]:
     """Build a duration-preserving FFmpeg xfade/acrossfade graph."""
     if len(shots) < 2:
@@ -2166,9 +2213,17 @@ def build_transition_filter(
         trim_duration = shot.duration
         if index < len(shots) - 1:
             trim_duration += transition_seconds
+        video_normalization = ""
+        if output_size is not None:
+            output_width, output_height = output_size
+            video_normalization = (
+                f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,"
+                f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                "setsar=1,"
+            )
         filters.append(
             f"[{index}:v]trim=duration={trim_duration:.3f},"
-            f"setpts=PTS-STARTPTS,fps=24,format=yuv420p[v{index}]"
+            f"setpts=PTS-STARTPTS,{video_normalization}fps=24,format=yuv420p[v{index}]"
         )
         filters.append(
             f"[{index}:a]atrim=duration={trim_duration:.3f},"
@@ -2195,11 +2250,36 @@ def build_transition_filter(
     return ";".join(filters), f"[{current_video}]", f"[{current_audio}]"
 
 
+def build_normalized_concat_filter(
+    input_count: int,
+    output_size: tuple[int, int],
+) -> tuple[str, str, str]:
+    """Build a re-encode fallback that also handles mixed segment resolutions."""
+    output_width, output_height = output_size
+    filters: list[str] = []
+    concat_inputs: list[str] = []
+    for index in range(input_count):
+        filters.append(
+            f"[{index}:v]scale={output_width}:{output_height}:"
+            "force_original_aspect_ratio=decrease,"
+            f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,fps=24,format=yuv420p[vn{index}]"
+        )
+        filters.append(f"[{index}:a]aresample=48000[an{index}]")
+        concat_inputs.extend([f"[vn{index}]", f"[an{index}]"])
+    filters.append(
+        "".join(concat_inputs)
+        + f"concat=n={input_count}:v=1:a=1[vout][aout]"
+    )
+    return ";".join(filters), "[vout]", "[aout]"
+
+
 def concat_videos(
     video_paths: list[Path],
     output_path: Path,
     total_seconds: float,
     shot_plan: Optional[tuple[ShotSpec, ...]] = None,
+    output_size: Optional[tuple[int, int]] = None,
 ) -> Path:
     """Join generated shots, preferring short audio/video crossfades."""
     if len(video_paths) < 2:
@@ -2211,7 +2291,10 @@ def concat_videos(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if shot_plan and len(shot_plan) == len(video_paths):
-        filter_graph, video_output, audio_output = build_transition_filter(shot_plan)
+        filter_graph, video_output, audio_output = build_transition_filter(
+            shot_plan,
+            output_size=output_size,
+        )
         transition_command = [FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y"]
         for video_path in video_paths:
             transition_command.extend(["-i", str(video_path)])
@@ -2265,6 +2348,65 @@ def concat_videos(
                 + detail[-800:],
                 flush=True,
             )
+
+            if output_size is not None:
+                fallback_graph, fallback_video, fallback_audio = (
+                    build_normalized_concat_filter(len(video_paths), output_size)
+                )
+                fallback_command = [FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y"]
+                for video_path in video_paths:
+                    fallback_command.extend(["-i", str(video_path)])
+                fallback_command.extend(
+                    [
+                        "-filter_complex",
+                        fallback_graph,
+                        "-map",
+                        fallback_video,
+                        "-map",
+                        fallback_audio,
+                        "-t",
+                        f"{total_seconds:.3f}",
+                        "-r",
+                        "24",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "medium",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-movflags",
+                        "+faststart",
+                        str(output_path),
+                    ]
+                )
+                try:
+                    fallback_result = subprocess.run(
+                        fallback_command,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=1800,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    fallback_result = None
+                    print(f"normalized concat fallback unavailable: {exc}", flush=True)
+                if fallback_result is not None:
+                    if fallback_result.returncode == 0 and output_path.is_file():
+                        return output_path
+                    fallback_detail = (fallback_result.stderr or "").strip()
+                    print(
+                        "normalized concat fallback failed: "
+                        + fallback_detail[-800:],
+                        flush=True,
+                    )
 
     list_path = output_path.with_suffix(".concat.txt")
     lines = []
@@ -2377,13 +2519,20 @@ def merge_completed_segments(
     output_path: Path,
     total_seconds: float,
     shot_plan: Optional[tuple[ShotSpec, ...]] = None,
+    output_size: Optional[tuple[int, int]] = None,
 ) -> Path:
     """Merge all completed shots, including a one-shot early cancellation."""
     if not video_paths:
         raise BotError("沒有已完成的分段可以合成。")
     if len(video_paths) == 1:
         return trim_single_video(video_paths[0], output_path, total_seconds)
-    return concat_videos(video_paths, output_path, total_seconds, shot_plan=shot_plan)
+    return concat_videos(
+        video_paths,
+        output_path,
+        total_seconds,
+        shot_plan=shot_plan,
+        output_size=output_size,
+    )
 
 
 class TelegramClient:
@@ -2595,6 +2744,7 @@ class TelegramTurboBot:
             "/progress 查看即時生成進度\n"
             "/pause 暫停長片（在目前鏡頭完成後）\n"
             "/resume 或 /play 繼續長片\n"
+            "長片顯存不足時會保留已完成鏡頭，自動逐級降低解析度重試\n"
              "/resume_long 從失敗檢查點繼續長片\n"
              "/extend 秒數 [提示詞] 從上一條完整長片尾端延續\n"
              "/history 查看歷史長片並選擇 ID\n"
@@ -3352,17 +3502,7 @@ class TelegramTurboBot:
 class TelegramMenuBot(TelegramTurboBot):
     """Button-driven Telegram UI with persistent generation settings."""
 
-    RESOLUTIONS = (
-        (448, 256),
-        (512, 288),
-        (608, 352),
-        (736, 416),
-        (864, 480),
-        (960, 544),
-        (1152, 640),
-        (1280, 736),
-        (1344, 768),
-    )
+    RESOLUTIONS = RESOLUTION_LADDER
     SECONDS = (5, 10, 12, 15)
     LONG_SECONDS = (30, 60, 120, 180, 300, 600, 900, 1200, 1800)
     STEPS = (4, 8, 12)
@@ -3669,6 +3809,34 @@ class TelegramMenuBot(TelegramTurboBot):
         )
 
     @staticmethod
+    def _checkpoint_long_resolution(
+        payload: dict[str, Any],
+        base_config: GenerationConfig,
+    ) -> tuple[int, int]:
+        raw_resolution = payload.get("next_resolution")
+        if isinstance(raw_resolution, dict):
+            try:
+                resolution = parse_config(
+                    [
+                        str(raw_resolution["width"]),
+                        str(raw_resolution["height"]),
+                        str(base_config.steps),
+                        str(base_config.requested_seconds),
+                    ]
+                )
+                return resolution.width, resolution.height
+            except (BotError, KeyError, TypeError, ValueError):
+                pass
+        return base_config.width, base_config.height
+
+    @staticmethod
+    def _checkpoint_resolution_fallbacks(payload: dict[str, Any]) -> list[str]:
+        raw_fallbacks = payload.get("resolution_fallbacks", [])
+        if not isinstance(raw_fallbacks, list):
+            return []
+        return [str(item).strip() for item in raw_fallbacks[:50] if str(item).strip()]
+
+    @staticmethod
     def _checkpoint_shots(payload: dict[str, Any]) -> tuple[ShotSpec, ...]:
         raw_shots = payload.get("shot_plan")
         if not isinstance(raw_shots, list) or not raw_shots:
@@ -3764,6 +3932,11 @@ class TelegramMenuBot(TelegramTurboBot):
             "motion_context_enabled": bool(motion_context_enabled),
             "latent_prefix": latent_prefix or "",
             "last_context_latent_path": context_latent_path or "",
+            "next_resolution": {
+                "width": (job.long_resolution or (base_config.width, base_config.height))[0],
+                "height": (job.long_resolution or (base_config.width, base_config.height))[1],
+            },
+            "resolution_fallbacks": list(job.resolution_fallbacks),
         }
         self._write_checkpoint_payload(job.checkpoint_path, payload)
         return job.checkpoint_path
@@ -4820,6 +4993,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 raise BotError(f"找不到已完成鏡頭：{missing[-1]}")
             last_latent = str(payload.get("last_context_latent_path", "")).strip() or None
             motion_context = bool(payload.get("motion_context_enabled")) and bool(last_latent)
+            long_resolution = self._checkpoint_long_resolution(payload, config)
+            resolution_fallbacks = self._checkpoint_resolution_fallbacks(payload)
             job = JobState(
                 chat_id=chat_id,
                 config=config,
@@ -4839,6 +5014,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 initial_context_video_path=video_paths[-1],
                 initial_context_latent_path=last_latent if motion_context else None,
                 resume_motion_context=motion_context,
+                long_resolution=long_resolution,
+                resolution_fallbacks=resolution_fallbacks,
             )
             job.resume_event.set()
         except (BotError, KeyError, TypeError, ValueError) as exc:
@@ -4981,6 +5158,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 if part
             )
             config = self._checkpoint_config(payload)
+            long_resolution = self._checkpoint_long_resolution(payload, config)
+            resolution_fallbacks = self._checkpoint_resolution_fallbacks(payload)
             last_latent = str(payload.get("last_context_latent_path", "")).strip() or None
             motion_context = bool(payload.get("motion_context_enabled")) and bool(last_latent)
             extension_prefix = (
@@ -5005,6 +5184,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 initial_context_video_path=old_paths[-1],
                 initial_context_latent_path=last_latent if motion_context else None,
                 resume_motion_context=motion_context,
+                long_resolution=long_resolution,
+                resolution_fallbacks=resolution_fallbacks,
             )
             job.resume_event.set()
             self.save_long_checkpoint(
@@ -5084,6 +5265,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 long_base_prefix=batch_prefix,
                 checkpoint_path=LONG_CHECKPOINT_DIR
                 / f"{Path(batch_prefix).name}.json",
+                long_resolution=(config.width, config.height),
             )
             job.resume_event.set()
             self.job = job
@@ -5155,11 +5337,13 @@ class TelegramMenuBot(TelegramTurboBot):
             f"約 {completed_seconds:.2f} 秒。",
         )
         try:
+            merge_config = job.base_config or job.config
             merge_completed_segments(
                 video_paths,
                 output_path,
                 completed_seconds,
                 shot_plan=completed_shots or None,
+                output_size=(merge_config.width, merge_config.height),
             )
             with job.progress_lock:
                 job.progress_phase = "uploading"
@@ -5287,6 +5471,11 @@ class TelegramMenuBot(TelegramTurboBot):
                     "圖片長片會把圖片用作第一鏡首幀，後續鏡頭使用上一鏡尾幀接續。",
                 )
             start_index = max(1, int(job.resume_from_segment))
+            current_resolution = job.long_resolution or (
+                base_config.width,
+                base_config.height,
+            )
+            job.long_resolution = current_resolution
             for index in range(start_index, job.segment_total + 1):
                 if not self.wait_for_resume(job):
                     report_partial()
@@ -5309,30 +5498,88 @@ class TelegramMenuBot(TelegramTurboBot):
                     # the decoded result. Generate that head plus the requested
                     # shot duration so the delivered shot keeps its timeline.
                     generation_seconds += MOTION_CONTEXT_EXTRA_SECONDS
-                job.config = parse_config(
-                    [
-                        str(base_config.width),
-                        str(base_config.height),
-                        str(base_config.steps),
-                        str(generation_seconds),
-                    ]
-                )
-                job.output_prefix = f"{base_prefix}/segment_{index:02d}"
-                self.send_safe(
-                    job.chat_id,
-                    f"長片鏡頭 {index}/{job.segment_total} 開始生成："
-                    f"劇情 {shot.start_seconds:g}-{shot.end_seconds:g} 秒 | "
-                    f"模型約 {job.config.actual_seconds:.2f} 秒。",
-                )
-                video_path = self.run_segment(
-                    job,
-                    announce=False,
-                    motion_context=use_motion_context,
-                    context_video_name=context_video_name,
-                    context_latent_path=context_latent_path,
-                    save_latent_prefix=latent_prefix,
-                    save_latent_clip_index=index if latent_prefix else None,
-                )
+                while True:
+                    current_width, current_height = current_resolution
+                    job.long_resolution = current_resolution
+                    job.config = parse_config(
+                        [
+                            str(current_width),
+                            str(current_height),
+                            str(base_config.steps),
+                            str(generation_seconds),
+                        ]
+                    )
+                    job.output_prefix = f"{base_prefix}/segment_{index:02d}"
+                    self.send_safe(
+                        job.chat_id,
+                        f"長片鏡頭 {index}/{job.segment_total} 開始生成："
+                        f"劇情 {shot.start_seconds:g}-{shot.end_seconds:g} 秒 | "
+                        f"解析度 {resolution_label(current_width, current_height)} | "
+                        f"模型約 {job.config.actual_seconds:.2f} 秒。",
+                    )
+                    try:
+                        video_path = self.run_segment(
+                            job,
+                            announce=False,
+                            motion_context=use_motion_context,
+                            context_video_name=context_video_name,
+                            context_latent_path=context_latent_path,
+                            save_latent_prefix=latent_prefix,
+                            save_latent_clip_index=index if latent_prefix else None,
+                        )
+                        break
+                    except Exception as exc:
+                        if job.cancel_event.is_set() or not is_cuda_oom_error(exc):
+                            raise
+                        next_resolution = next_lower_resolution(
+                            current_width,
+                            current_height,
+                        )
+                        if next_resolution is None:
+                            self.send_safe(
+                                job.chat_id,
+                                f"長片鏡頭 {index} 在最低解析度 "
+                                f"{resolution_label(current_width, current_height)} "
+                                "仍然顯存不足，無法繼續。",
+                            )
+                            raise
+                        old_label = resolution_label(current_width, current_height)
+                        new_label = resolution_label(*next_resolution)
+                        fallback_note = (
+                            f"鏡頭 {index}：{old_label} → {new_label}"
+                        )
+                        job.resolution_fallbacks.append(fallback_note)
+                        current_resolution = next_resolution
+                        job.long_resolution = current_resolution
+                        bot_log(
+                            f"long segment {index} OOM at {old_label}; "
+                            f"retrying at {new_label}: {exc}"
+                        )
+                        try:
+                            comfy_post(
+                                "/free",
+                                {"unload_models": True, "free_memory": True},
+                            )
+                        except BotError as free_exc:
+                            bot_log(
+                                f"OOM memory release before retry unavailable: {free_exc}"
+                            )
+                        self.save_long_checkpoint(
+                            job,
+                            video_paths,
+                            index,
+                            motion_context_enabled,
+                            latent_prefix,
+                            context_latent_path,
+                            status="running",
+                            error=str(exc),
+                        )
+                        self.send_safe(
+                            job.chat_id,
+                            f"⚠️ 長片鏡頭 {index} 顯存不足，前 {index - 1} 段保留不變。\n"
+                            f"自動降級：{old_label} → {new_label}\n"
+                            "正在從本鏡重新生成，不會由第一段開始。",
+                        )
                 video_paths.append(video_path)
                 job.completed_video_paths = list(video_paths)
                 next_context_latent_path = (
@@ -5410,6 +5657,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 output_path,
                 job.total_seconds,
                 shot_plan=job.shot_plan,
+                output_size=(base_config.width, base_config.height),
             )
             self.mark_long_checkpoint(job, "completed")
             with job.progress_lock:
