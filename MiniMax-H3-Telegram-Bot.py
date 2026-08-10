@@ -48,6 +48,27 @@ T8_API_TEMPLATE = Path(
         str(Path(__file__).resolve().parent / "dual_clock_multirate_api.json"),
     )
 )
+LTX_T2V_API_TEMPLATE = Path(
+    os.environ.get(
+        "MINIMAX_LTX_T2V_API_TEMPLATE",
+        str(Path(__file__).resolve().parent / "ltx23_t2v_api.json"),
+    )
+)
+LTX_I2V_API_TEMPLATE = Path(
+    os.environ.get(
+        "MINIMAX_LTX_I2V_API_TEMPLATE",
+        str(Path(__file__).resolve().parent / "ltx23_i2v_api.json"),
+    )
+)
+LTX_AUTHOR_MODEL_NAME = os.environ.get(
+    "MINIMAX_LTX_AUTHOR_MODEL",
+    "PinkCherry_FineTune_int8_v1_8_LTX23.safetensors",
+)
+LTX_AUTHOR_LORA_NAME = os.environ.get(
+    "MINIMAX_LTX_AUTHOR_LORA",
+    r"LTX-2.3\ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+)
+LTX_AUTHOR_MODEL_SIZE = 27_637_268_630
 SEEDVR2_API_TEMPLATE = Path(
     os.environ.get(
         "MINIMAX_SEEDVR2_API_TEMPLATE",
@@ -143,6 +164,35 @@ LONG_CONTINUITY_MODE = os.environ.get(
 ).strip().lower()
 MOTION_CONTEXT_LENGTH = 22
 MOTION_CONTEXT_EXTRA_SECONDS = MOTION_CONTEXT_LENGTH / 24.0
+MODEL_H3 = "h3"
+MODEL_LTX23 = "ltx23"
+
+
+def normalize_model_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {MODEL_LTX23, "ltx", "ltx2.3", "pinkcherry", "pinkcherry_ltx23"}:
+        return MODEL_LTX23
+    return MODEL_H3
+
+
+def ltx_author_model_ready() -> bool:
+    """Return true only after the separate author INT8 checkpoint is complete."""
+    for comfy_root in (COMFYUI_BASE_DIR, COMFYUI_DIR):
+        model_path = comfy_root / "models" / "checkpoints" / LTX_AUTHOR_MODEL_NAME
+        try:
+            if model_path.is_file() and model_path.stat().st_size >= LTX_AUTHOR_MODEL_SIZE:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def ltx_model_label() -> str:
+    return (
+        "LTX 2.3 PinkCherry INT8 作者 v1.8"
+        if ltx_author_model_ready()
+        else "LTX 2.3 PinkCherry Q5（備用）"
+    )
 
 
 class BotError(RuntimeError):
@@ -366,6 +416,7 @@ class QueuedStory:
     config: GenerationConfig
     total_seconds: float
     input_image_path: Optional[Path] = None
+    model_mode: str = MODEL_H3
     created_at: float = field(default_factory=time.time)
 
 
@@ -1297,6 +1348,270 @@ def build_workflow(
     return workflow
 
 
+def ltx_workflow_usage_report(vram_mode: str) -> str:
+    try:
+        vram_label = comfyui_vram_mode_label(vram_mode)
+    except NameError:
+        vram_label = vram_mode
+    return "\n".join(
+        [
+            "模型：LTX 2.3 PinkCherry NSFW v1.8",
+            "主模型：PinkCherry_FineTune_Q5_K_M_v18_LTX23.gguf",
+            "文字編碼器：Gemma 3 12B Heretic v2 INT4 + LTX projection",
+            "加速：LTX 2.3 distilled LoRA（工作流內置原生雙階段採樣）",
+            "解碼：LTX23 video VAE + audio VAE；目前不使用 H3 Turbo LoRA",
+            f"顯存模式：{vram_label}",
+        ]
+    )
+
+
+def ltx_workflow_usage_report(vram_mode: str) -> str:
+    """Report the actual LTX model/LoRA selected by the isolated branch."""
+    try:
+        vram_label = comfyui_vram_mode_label(vram_mode)
+    except NameError:
+        vram_label = vram_mode
+    if ltx_author_model_ready():
+        model_line = f"主模型：{LTX_AUTHOR_MODEL_NAME}"
+        lora_line = f"LoRA：{LTX_AUTHOR_LORA_NAME}（strength 0.6）"
+        graph_line = "作者 v1.8 graph：Chunk Feed-Forward + Preview Override + NAG"
+    else:
+        model_line = "主模型：PinkCherry_FineTune_Q5_K_M_v18_LTX23.gguf"
+        lora_line = "LoRA：dynamic distilled LTX 2.3（strength 0.5）"
+        graph_line = "簡化 LTX graph（作者 INT8 尚未完成下載）"
+    return "\n".join(
+        [
+            "LTX 2.3 PinkCherry v1.8",
+            model_line,
+            "Text encoder：Gemma 3 12B Heretic v2 INT4 + LTX projection",
+            lora_line,
+            graph_line,
+            "VAE：LTX23 video VAE + audio VAE；SaveVideo H264 CRF 8",
+            f"VRAM：{vram_label}",
+        ]
+    )
+
+
+def apply_ltx_author_graph(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade only the LTX branch to the author's standard-checkpoint graph.
+
+    The original MiniMax H3 graph is built by ``build_workflow`` and is not
+    touched here.  The old Q5/GGUF LTX graph remains the fallback until the
+    separate author INT8 checkpoint has been fully downloaded.
+    """
+    loader_id = next(
+        node_id for node_id, node in workflow.items()
+        if node.get("class_type") == "UnetLoaderGGUF"
+    )
+    lora_id = next(
+        node_id for node_id, node in workflow.items()
+        if node.get("class_type") == "LoraLoaderModelOnly"
+    )
+    clip_id = next(
+        node_id for node_id, node in workflow.items()
+        if node.get("class_type") == "DualCLIPLoaderGGUF"
+    )
+    video_vae_id = next(
+        node_id for node_id, node in workflow.items()
+        if node.get("class_type") == "VAELoader"
+        and "video_vae" in str(node.get("inputs", {}).get("vae_name", ""))
+    )
+    guider_ids = [
+        node_id for node_id, node in workflow.items()
+        if node.get("class_type") == "CFGGuider"
+    ]
+    sigma_nodes = [
+        node_id for node_id, node in workflow.items()
+        if node.get("class_type") == "ManualSigmas"
+    ]
+    workflow[loader_id] = {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {"ckpt_name": LTX_AUTHOR_MODEL_NAME},
+    }
+    workflow[lora_id]["inputs"]["lora_name"] = LTX_AUTHOR_LORA_NAME
+    workflow[lora_id]["inputs"]["strength_model"] = 0.6
+    low_sigma_id = next(
+        node_id for node_id in sigma_nodes
+        if str(workflow[node_id]["inputs"].get("sigmas", "")).strip().startswith("1.0")
+    )
+    high_sigma_id = next(node_id for node_id in sigma_nodes if node_id != low_sigma_id)
+    low_sampler_id = workflow[low_sigma_id]
+    workflow[low_sigma_id]["inputs"]["sigmas"] = (
+        "1.0, 0.998, 0.995, 0.99, 0.982, 0.97, 0.94, 0.89, "
+        "0.82, 0.73, 0.62, 0.50, 0.38, 0.27, 0.18, 0.11, "
+        "0.06, 0.03, 0.01, 0.0"
+    )
+    workflow[high_sigma_id]["inputs"]["sigmas"] = "0.85, 0.7250, 0.4219, 0.0"
+    for sampler in workflow.values():
+        if sampler.get("class_type") != "SamplerCustomAdvanced":
+            continue
+        sigma_ref = sampler.get("inputs", {}).get("sigmas")
+        if not isinstance(sigma_ref, list):
+            continue
+        sampler_select_id = sampler["inputs"].get("sampler", [None, 0])[0]
+        if sampler_select_id not in workflow:
+            continue
+        if sigma_ref[0] == low_sigma_id:
+            workflow[sampler_select_id]["inputs"]["sampler_name"] = "euler_ancestral_cfg_pp"
+        elif sigma_ref[0] == high_sigma_id:
+            workflow[sampler_select_id]["inputs"]["sampler_name"] = "euler_cfg_pp"
+
+    # These are the quality/denoise-control nodes present in the author's
+    # v1.8 workflow.  They run on the standard checkpoint, not on the old
+    # dynamic GGUF loader (which cannot evaluate NAG connectors safely).
+    workflow["1001"] = {
+        "class_type": "LTXVChunkFeedForward",
+        "inputs": {
+            "model": [lora_id, 0],
+            "chunks": 2,
+            "dim_threshold": 4096,
+        },
+    }
+    workflow["1002"] = {
+        "class_type": "LTX2SamplingPreviewOverride",
+        "inputs": {
+            "model": ["1001", 0],
+            "vae": [video_vae_id, 0],
+            "preview_rate": 8,
+        },
+    }
+    workflow["1003"] = {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "clip": [clip_id, 0],
+            "text": (
+                "logos, voice over, narration, off camera speech, watermarks, "
+                "poor anatomy, low detail, slow motion, slow, boring"
+            ),
+        },
+    }
+    workflow["1004"] = {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "clip": [clip_id, 0],
+            "text": (
+                "logos, voice over, narration, off camera speech, watermarks, "
+                "poor anatomy, low detail"
+            ),
+        },
+    }
+    workflow["1005"] = {
+        "class_type": "LTX2_NAG",
+        "inputs": {
+            "model": ["1002", 0],
+            "nag_cond_video": ["1003", 0],
+            "nag_cond_audio": ["1004", 0],
+            "nag_scale": 11.0,
+            "nag_alpha": 0.25,
+            "nag_tau": 2.5,
+            "inplace": True,
+        },
+    }
+    for guider_id in guider_ids:
+        workflow[guider_id]["inputs"]["model"] = ["1005", 0]
+
+    for node in workflow.values():
+        if not isinstance(node, dict) or node.get("class_type") != "SaveVideo":
+            continue
+        inputs = node.setdefault("inputs", {})
+        inputs.update(
+            {
+                "format": "mp4",
+                "codec": "h264",
+                "encoding": "re-encode",
+                "crf": 8,
+            }
+        )
+    return workflow
+
+
+def build_ltx_workflow(
+    config: GenerationConfig,
+    prompt: str,
+    output_prefix: str,
+    image_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build an isolated LTX 2.3 API graph without touching the H3 graph."""
+
+    template_path = LTX_I2V_API_TEMPLATE if image_name else LTX_T2V_API_TEMPLATE
+    if not template_path.is_file():
+        raise BotError(f"找不到 LTX 2.3 API 工作流模板：{template_path}")
+    with template_path.open("r", encoding="utf-8") as handle:
+        workflow = json.load(handle)
+    if not isinstance(workflow, dict):
+        raise BotError("LTX 2.3 API 工作流格式無效。")
+
+    # The converted native template exposes these four values as PrimitiveInt
+    # nodes.  Identify them by their template defaults so the Bot remains
+    # compatible with both T2V and I2V node IDs.
+    primitive_nodes = [
+        node
+        for node in workflow.values()
+        if isinstance(node, dict) and node.get("class_type") == "PrimitiveInt"
+    ]
+
+    def set_primitive(default: int, value: int) -> None:
+        for node in primitive_nodes:
+            inputs = node.setdefault("inputs", {})
+            if inputs.get("value") == default:
+                inputs["value"] = int(value)
+                return
+        raise BotError(f"LTX 工作流缺少 PrimitiveInt 參數（預設值 {default}）。")
+
+    set_primitive(512, config.width)
+    set_primitive(288, config.height)
+    set_primitive(5, max(2, int(round(config.actual_seconds))))
+    set_primitive(24, 24)
+
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type", ""))
+        inputs = node.setdefault("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        if class_type == "CLIPTextEncode" and inputs.get("text") == "replace_with_prompt":
+            inputs["text"] = prompt.strip()
+        elif class_type == "ResizeImageMaskNode":
+            # ComfyUI API v3 DynamicCombo inputs use a selector and dotted
+            # child names; a nested dict is silently discarded by the API.
+            inputs["resize_type"] = "scale dimensions"
+            inputs["resize_type.width"] = int(config.width)
+            inputs["resize_type.height"] = int(config.height)
+            inputs["resize_type.crop"] = "center"
+            inputs["scale_method"] = "lanczos"
+        elif class_type == "ResizeImagesByLongerEdge":
+            inputs["longer_edge"] = max(int(config.width), int(config.height))
+        elif class_type == "VAEDecodeTiled":
+            # Small temporal tiles can show up as frame-to-frame snow and
+            # brightness jumps.  A 10-second 864x480 validation run fits on
+            # the 10GB card without temporal tiling, so keep short clips in
+            # one decode window.  Longer clips use large 240-frame windows;
+            # this keeps memory bounded while reducing the number of seams.
+            inputs["tile_size"] = min(512, max(256, max(config.width, config.height)))
+            inputs["overlap"] = 64
+            # A nominal 10-second request is encoded as about 10.04 seconds
+            # at 24 fps, so include that small frame-rounding margin.
+            if float(config.actual_seconds) <= 10.5:
+                inputs["temporal_size"] = 4096
+                inputs["temporal_overlap"] = 8
+            else:
+                inputs["temporal_size"] = 240
+                inputs["temporal_overlap"] = 16
+        elif class_type == "RandomNoise":
+            inputs["noise_seed"] = secrets.randbits(63)
+        elif class_type == "LoadImage" and image_name:
+            inputs["image"] = image_name
+        elif class_type == "SaveVideo":
+            inputs["filename_prefix"] = (
+                output_prefix if output_prefix != OUTPUT_PREFIX else "LTX23/Telegram"
+            )
+
+    if ltx_author_model_ready():
+        workflow = apply_ltx_author_graph(workflow)
+    return workflow
+
+
 def round_video_dimension(value: float) -> int:
     """Round a SeedVR2 target to a safe 32-pixel alignment."""
     return max(32, int(round(value / 32.0) * 32))
@@ -1375,6 +1690,16 @@ def json_request(url: str, payload: Optional[dict[str, Any]] = None, timeout: fl
 
 def comfy_post(path: str, payload: Optional[dict[str, Any]] = None) -> Any:
     return json_request(f"{COMFY_URL}{path}", payload)
+
+
+def unload_comfy_models() -> None:
+    """Release a previous model before switching between H3 and LTX."""
+    try:
+        comfy_post("/free", {"unload_models": True, "free_memory": True})
+    except BotError:
+        # ComfyUI may be stopped; the normal model loader will handle that
+        # case when the selected workflow is submitted.
+        pass
 
 
 def motion_context_nodes_available() -> bool:
@@ -2694,6 +3019,7 @@ class TelegramTurboBot:
         config: GenerationConfig,
         prompt: str,
         input_image_path: Optional[Path] = None,
+        task_type: str = MODEL_H3,
     ) -> bool:
         prompt = prompt.strip()
         if not prompt:
@@ -2710,6 +3036,7 @@ class TelegramTurboBot:
                 time.time(),
                 cancel_event=threading.Event(),
                 input_image_path=input_image_path,
+                task_type=normalize_model_mode(task_type),
             )
             job.resume_event.set()
             self.job = job
@@ -2780,19 +3107,31 @@ class TelegramTurboBot:
             and job.continuation_image_path is not None
         ):
             image_name = upload_image_to_comfy(job.continuation_image_path)
-        workflow = build_workflow(
-            job.config,
-            segment_prompt(job),
-            job.output_prefix,
-            image_name=image_name,
-            audio_reference_name=(None if motion_context else job.audio_reference_name),
-            motion_context=motion_context,
-            context_video_name=context_video_name,
-            context_latent_path=context_latent_path,
-            save_latent_prefix=save_latent_prefix,
-            save_latent_clip_index=save_latent_clip_index,
-        )
-        usage_report = workflow_usage_report(workflow, self.comfyui_vram_mode())
+        if job.task_type == MODEL_LTX23:
+            if motion_context or context_video_name or context_latent_path:
+                raise BotError("LTX 2.3 暫不使用 H3 Motion Context；請切回 MiniMax H3 做長片續接。")
+            unload_comfy_models()
+            workflow = build_ltx_workflow(
+                job.config,
+                segment_prompt(job),
+                job.output_prefix,
+                image_name=image_name,
+            )
+            usage_report = ltx_workflow_usage_report(self.comfyui_vram_mode())
+        else:
+            workflow = build_workflow(
+                job.config,
+                segment_prompt(job),
+                job.output_prefix,
+                image_name=image_name,
+                audio_reference_name=(None if motion_context else job.audio_reference_name),
+                motion_context=motion_context,
+                context_video_name=context_video_name,
+                context_latent_path=context_latent_path,
+                save_latent_prefix=save_latent_prefix,
+                save_latent_clip_index=save_latent_clip_index,
+            )
+            usage_report = workflow_usage_report(workflow, self.comfyui_vram_mode())
         if usage_report not in job.workflow_reports:
             job.workflow_reports.append(usage_report)
         response = comfy_post(
@@ -2817,10 +3156,15 @@ class TelegramTurboBot:
         job.progress_tracker = progress_tracker
         progress_tracker.start()
         if announce:
+            step_label = (
+                "LTX native distill"
+                if job.task_type == MODEL_LTX23
+                else f"{job.config.steps} steps"
+            )
             self.send_safe(
                 job.chat_id,
                 f"已開始生成：{job.config.width}×{job.config.height} | "
-                f"{job.config.steps} steps | 約 {job.config.actual_seconds:.2f} 秒\n"
+                f"{step_label} | 約 {job.config.actual_seconds:.2f} 秒\n"
                 f"Prompt ID: {prompt_id}",
             )
 
@@ -2870,8 +3214,13 @@ class TelegramTurboBot:
             video_path = self.run_segment(job, announce=True)
             with job.progress_lock:
                 job.progress_phase = "uploading"
+            model_label = (
+                f"{ltx_model_label()} 完成"
+                if job.task_type == MODEL_LTX23
+                else "MiniMax H3 Turbo 完成"
+            )
             caption = (
-                f"MiniMax H3 Turbo 完成\n{job.config.width}×{job.config.height} | "
+                f"{model_label}\n{job.config.width}×{job.config.height} | "
                 f"{job.config.steps} steps | {job.config.actual_seconds:.2f} 秒"
             )
             self.telegram.send_video(job.chat_id, video_path, caption)
@@ -2917,7 +3266,11 @@ class TelegramTurboBot:
         for node_output in history.get("outputs", {}).values():
             if not isinstance(node_output, dict):
                 continue
-            for key in ("gifs", "videos", "files"):
+            # ComfyUI's SaveVideo node currently reports MP4 entries under
+            # `images` (with `animated: true`), while other video nodes may
+            # use `gifs`, `videos`, or `files`.  Accept all of them so LTX
+            # outputs are delivered instead of being reported as missing.
+            for key in ("images", "gifs", "videos", "files"):
                 for item in node_output.get(key, []) or []:
                     if not isinstance(item, dict) or not item.get("filename"):
                         continue
@@ -2969,7 +3322,17 @@ class TelegramTurboBot:
 class TelegramMenuBot(TelegramTurboBot):
     """Button-driven Telegram UI with persistent generation settings."""
 
-    RESOLUTIONS = ((448, 256), (512, 288), (608, 352), (736, 416), (864, 480), (960, 544))
+    RESOLUTIONS = (
+        (448, 256),
+        (512, 288),
+        (608, 352),
+        (736, 416),
+        (864, 480),
+        (960, 544),
+        (1152, 640),
+        (1280, 736),
+        (1344, 768),
+    )
     SECONDS = (5, 10, 12, 15)
     LONG_SECONDS = (30, 60, 120, 180, 300, 600, 900, 1200, 1800)
     STEPS = (4, 8, 12)
@@ -2980,6 +3343,7 @@ class TelegramMenuBot(TelegramTurboBot):
         self.total_seconds = self.load_saved_total_seconds()
         self.prompt = self.load_saved_prompt()
         self.input_mode = self.load_saved_mode()
+        self.model_mode = self.load_saved_model_mode()
         self.image_path = self.load_saved_image_path()
         self.vram_mode = self.load_saved_vram_mode()
         self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
@@ -3033,6 +3397,15 @@ class TelegramMenuBot(TelegramTurboBot):
             return mode if mode in {"text", "image"} else "text"
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return "text"
+
+    @staticmethod
+    def load_saved_model_mode() -> str:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            return normalize_model_mode(saved.get("model_mode"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return MODEL_H3
 
     @staticmethod
     def load_saved_vram_mode() -> str:
@@ -3145,6 +3518,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     config=config,
                     total_seconds=total_seconds,
                     input_image_path=input_image_path,
+                    model_mode=normalize_model_mode(raw.get("model_mode")),
                     created_at=created_at,
                 )
             )
@@ -3173,6 +3547,7 @@ class TelegramMenuBot(TelegramTurboBot):
                         if item.input_image_path is not None
                         else ""
                     ),
+                    "model_mode": normalize_model_mode(item.model_mode),
                 }
                 for item in items
             ],
@@ -3200,6 +3575,9 @@ class TelegramMenuBot(TelegramTurboBot):
                     ),
                     "prompt": getattr(self, "prompt", ""),
                     "input_mode": getattr(self, "input_mode", "text"),
+                    "model_mode": normalize_model_mode(
+                        getattr(self, "model_mode", MODEL_H3)
+                    ),
                     "comfy_vram_mode": normalize_comfyui_vram_mode(
                         getattr(self, "vram_mode", DEFAULT_COMFYUI_VRAM_MODE)
                     ),
@@ -3321,6 +3699,7 @@ class TelegramMenuBot(TelegramTurboBot):
             "version": LONG_CHECKPOINT_VERSION,
             "checkpoint_id": self._checkpoint_id(job.checkpoint_path),
             "chat_id": str(job.chat_id),
+            "task_type": normalize_model_mode(job.task_type),
             "status": status,
             "last_error": error[-4000:] if error else "",
             "created_at": float(job.started_at),
@@ -3925,6 +4304,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 config=config,
                 total_seconds=total_seconds,
                 input_image_path=input_image_path,
+                model_mode=self.model_mode,
             )
             for prompt in prompts
         ]
@@ -3957,21 +4337,39 @@ class TelegramMenuBot(TelegramTurboBot):
             self.prompt = item.prompt
             self.settings = item.config
             self.total_seconds = item.total_seconds
+            self.model_mode = normalize_model_mode(item.model_mode)
             self.save_settings()
-            if item.total_seconds > MAX_SEGMENT_SECONDS:
+            if item.total_seconds > MAX_SEGMENT_SECONDS and self.model_mode == MODEL_LTX23:
                 started = self.start_long_generation(
                     chat_id,
                     item.config,
                     item.prompt,
                     item.total_seconds,
                     input_image_path=item.input_image_path,
+                    task_type=MODEL_LTX23,
                 )
+            elif item.total_seconds > MAX_SEGMENT_SECONDS:
+                if self.model_mode == MODEL_LTX23:
+                    self.send_safe(
+                        chat_id,
+                        "LTX 2.3 目前只支援單段 2-15 秒；這個排隊項目請切回 MiniMax H3 才能生成長片。",
+                    )
+                    started = False
+                else:
+                    started = self.start_long_generation(
+                        chat_id,
+                        item.config,
+                        item.prompt,
+                        item.total_seconds,
+                        input_image_path=item.input_image_path,
+                    )
             else:
                 started = self.start_generation(
                     chat_id,
                     item.config,
                     item.prompt,
                     input_image_path=item.input_image_path,
+                    task_type=self.model_mode,
                 )
         except Exception as exc:
             self.send_safe(chat_id, f"排隊故事啟動失敗：{exc}")
@@ -4051,6 +4449,18 @@ class TelegramMenuBot(TelegramTurboBot):
             {
                 "text": self.selected("🖼 图片生视频", self.input_mode == "image"),
                 "callback_data": "mode:image",
+            },
+        ]
+        model_row = [
+            {
+                "text": self.selected("🧠 MiniMax H3", self.model_mode == MODEL_H3),
+                "callback_data": "model:h3",
+            },
+            {
+                "text": self.selected(
+                    "🌸 LTX 2.3 PinkCherry", self.model_mode == MODEL_LTX23
+                ),
+                "callback_data": "model:ltx23",
             },
         ]
         resolution_row = [
@@ -4133,6 +4543,7 @@ class TelegramMenuBot(TelegramTurboBot):
         return {
             "inline_keyboard": [
                 [{"text": "🎬 生成模式（选择一种）", "callback_data": "noop"}],
+                model_row,
                 mode_row,
                 [{"text": "⏱ 總片長（短片）", "callback_data": "noop"}],
                 short_seconds_row,
@@ -4143,7 +4554,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 custom_seconds_row,
                 [{"text": "🖼 解析度／MP（按下選擇）", "callback_data": "noop"}],
                 resolution_row[:3],
-                resolution_row[3:],
+                resolution_row[3:6],
+                resolution_row[6:],
                 [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
                 steps_row,
                 [
@@ -4306,6 +4718,29 @@ class TelegramMenuBot(TelegramTurboBot):
             if self.input_mode == "image" and self.image_path and self.image_path.is_file()
             else None
         )
+        if self.model_mode == MODEL_LTX23:
+            if self.total_seconds > MAX_SEGMENT_SECONDS:
+                return self.start_long_generation(
+                    chat_id,
+                    config,
+                    prompt,
+                    self.total_seconds,
+                    input_image_path=input_image_path,
+                    task_type=MODEL_LTX23,
+                )
+            if self.total_seconds > MAX_SEGMENT_SECONDS:
+                self.send_safe(
+                    chat_id,
+                    "LTX 2.3 目前先支援單段 2-15 秒；要生成 30 秒以上長片，請切回 MiniMax H3。",
+                )
+                return False
+            return self.start_generation(
+                chat_id,
+                config,
+                prompt,
+                input_image_path=input_image_path,
+                task_type=MODEL_LTX23,
+            )
         if self.total_seconds > MAX_SEGMENT_SECONDS:
             return self.start_long_generation(
                 chat_id,
@@ -4360,6 +4795,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 config=config,
                 prompt=str(payload.get("prompt", "")),
                 started_at=time.time(),
+                task_type=normalize_model_mode(payload.get("task_type", MODEL_H3)),
                 output_prefix=str(payload["output_prefix"]),
                 long_base_prefix=str(payload["output_prefix"]),
                 checkpoint_path=path,
@@ -4525,6 +4961,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 config=config,
                 prompt=prompt,
                 started_at=time.time(),
+                task_type=normalize_model_mode(payload.get("task_type", MODEL_H3)),
                 output_prefix=extension_prefix,
                 long_base_prefix=extension_prefix,
                 base_config=config,
@@ -4579,6 +5016,7 @@ class TelegramMenuBot(TelegramTurboBot):
         prompt: str,
         total_seconds: float,
         input_image_path: Optional[Path] = None,
+        task_type: str = MODEL_H3,
     ) -> bool:
         prompt = prompt.strip()
         if not prompt:
@@ -4611,6 +5049,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 shot_plan=plan.shots,
                 story_global_text=plan.global_text,
                 input_image_path=input_image_path,
+                task_type=normalize_model_mode(task_type),
                 base_config=config,
                 long_base_prefix=batch_prefix,
                 checkpoint_path=LONG_CHECKPOINT_DIR
@@ -4696,7 +5135,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 job.progress_phase = "uploading"
                 job.progress_percent = 100.0
             caption = (
-                "MiniMax H3 Turbo 長片已提早中止，已合成部分結果\n"
+                f"{ltx_model_label() if job.task_type == MODEL_LTX23 else 'MiniMax H3 Turbo'} 長片已提早中止，已合成部分結果\n"
                 f"{completed_seconds:.2f} 秒 | {job.config.width}×{job.config.height} | "
                 f"{job.config.steps} steps | {completed_count}/{job.segment_total} 段"
             )
@@ -4750,7 +5189,12 @@ class TelegramMenuBot(TelegramTurboBot):
                     comfy_post("/free", {"unload_models": True, "free_memory": True})
                 except BotError as exc:
                     bot_log(f"ComfyUI memory release before long resume unavailable: {exc}")
-            if job.resume_motion_context is None:
+            if job.task_type == MODEL_LTX23:
+                # LTX continues by reusing the previous shot's last frame.
+                # H3 AV-latent Motion Context is not compatible with this
+                # isolated LTX author graph.
+                motion_context_enabled = False
+            elif job.resume_motion_context is None:
                 motion_context_enabled = (
                     LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
                     and motion_context_nodes_available()
@@ -4796,7 +5240,7 @@ class TelegramMenuBot(TelegramTurboBot):
                             job.chat_id,
                             "上一鏡沒有可用的 AV latent，這次改用尾幀＋音訊參考接續。",
                         )
-                if not motion_context_enabled:
+                if not motion_context_enabled and job.task_type != MODEL_LTX23:
                     job.audio_reference_name = upload_audio_to_comfy(
                         job.initial_context_video_path
                     )
@@ -4884,7 +5328,10 @@ class TelegramMenuBot(TelegramTurboBot):
                     else:
                         # Keep the immediate previous segment as the stable
                         # reference instead of always reusing segment 1.
-                        job.audio_reference_name = upload_audio_to_comfy(video_path)
+                        if job.task_type != MODEL_LTX23:
+                            job.audio_reference_name = upload_audio_to_comfy(video_path)
+                        else:
+                            job.audio_reference_name = None
                         previous_frame = job.continuation_image_path
                         continuation_path = (
                             CONTINUATION_DIR
@@ -4938,7 +5385,7 @@ class TelegramMenuBot(TelegramTurboBot):
             with job.progress_lock:
                 job.progress_phase = "uploading"
             caption = (
-                f"MiniMax H3 Turbo 長片完成\n{job.total_seconds:.0f} 秒 | "
+                f"{ltx_model_label() if job.task_type == MODEL_LTX23 else 'MiniMax H3 Turbo'} 長片完成\n{job.total_seconds:.0f} 秒 | "
                 f"{base_config.width}×{base_config.height} | {base_config.steps} steps | "
                 f"{job.segment_total} 鏡頭合併"
             )
@@ -4994,6 +5441,11 @@ class TelegramMenuBot(TelegramTurboBot):
         current = self.settings
         prompt_status = f"已輸入（{len(self.prompt)} 字）" if self.prompt else "尚未輸入"
         mode_text = "圖片生視頻" if self.input_mode == "image" else "文字生視頻"
+        model_text = (
+            ltx_model_label()
+            if self.model_mode == MODEL_LTX23
+            else "MiniMax H3 Turbo"
+        )
         image_status = "已收到" if self.image_path and self.image_path.is_file() else "未收到"
         prefix = f"{notice}\n\n" if notice else ""
         if self.total_seconds > MAX_SEGMENT_SECONDS:
@@ -5037,8 +5489,9 @@ class TelegramMenuBot(TelegramTurboBot):
         else:
             idle_shutdown_text = "已關閉"
         menu = (
-            f"{prefix}MiniMax H3 Turbo 控制面板\n\n"
-            f"模式：{mode_text}\n"
+            f"{prefix}{model_text} 控制面板\n\n"
+            f"模型：{model_text}\n"
+            f"輸入模式：{mode_text}\n"
             f"輸入圖片：{image_status}\n"
             f"解析度：{resolution_label(current.width, current.height)}\n"
             f"步數：{current.steps}\n"
@@ -5530,6 +5983,17 @@ class TelegramMenuBot(TelegramTurboBot):
             if data == "job_resume":
                 self.resume_current_job(chat_id, message_id)
                 return
+            if data.startswith("model:"):
+                selected_model = normalize_model_mode(data.removeprefix("model:"))
+                self.model_mode = selected_model
+                self.save_settings()
+                label = (
+                    ltx_model_label()
+                    if selected_model == MODEL_LTX23
+                    else "MiniMax H3 Turbo"
+                )
+                self.show_menu(chat_id, message_id, f"已切換模型：{label}")
+                return
             if data == "mode:text":
                 self.input_mode = "text"
                 self.save_settings()
@@ -5561,6 +6025,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.total_seconds = self.load_saved_total_seconds()
                 self.prompt = self.load_saved_prompt()
                 self.input_mode = self.load_saved_mode()
+                self.model_mode = self.load_saved_model_mode()
                 self.image_path = self.load_saved_image_path()
                 self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
                 self.show_menu(chat_id, message_id, "已讀取上次設定")
@@ -5674,6 +6139,25 @@ class TelegramMenuBot(TelegramTurboBot):
             return
         if command == "/prompt":
             self.request_prompt(chat_id)
+            return
+        if command in {"/model", "/h3", "/ltx23", "/ltx"}:
+            if command in {"/h3"}:
+                selected_model = MODEL_H3
+            elif command in {"/ltx23", "/ltx"}:
+                selected_model = MODEL_LTX23
+            elif len(parts) >= 2:
+                selected_model = normalize_model_mode(parts[1])
+            else:
+                self.show_menu(chat_id)
+                return
+            self.model_mode = selected_model
+            self.save_settings()
+            label = (
+                ltx_model_label()
+                if selected_model == MODEL_LTX23
+                else "MiniMax H3 Turbo"
+            )
+            self.show_menu(chat_id, notice=f"已切換模型：{label}")
             return
         if command == "/image":
             self.input_mode = "image"
@@ -5909,6 +6393,7 @@ class TelegramMenuBot(TelegramTurboBot):
             {"command": "menu", "description": "開啟控制面板"},
             {"command": "progress", "description": "查看生成進度"},
             {"command": "prompt", "description": "輸入提示詞"},
+            {"command": "model", "description": "選擇 MiniMax H3 或 LTX 2.3"},
             {"command": "image", "description": "切換圖生視頻"},
             {"command": "text", "description": "切換文生視頻"},
             {"command": "duration", "description": "設定秒數"},

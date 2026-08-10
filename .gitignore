@@ -15,3 +15,17 @@ input/
 comfyui-user/
 .venv/
 venv/
+
+# Local model weights and generated media are intentionally not published.
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.mp4
+*.mov
+*.webm
+models/
+runtime/
+temp/
