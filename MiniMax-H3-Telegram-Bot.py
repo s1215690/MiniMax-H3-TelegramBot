@@ -264,11 +264,6 @@ class GenerationConfig:
     steps: int
     requested_seconds: float
     length: int
-    # The existing `steps` setting is the audio step count for the MultiRate
-    # sampler.  Keep video_steps separate so the legacy 4-video/8-audio and
-    # 4-video/12-audio presets remain available while allowing real 8/10 video
-    # step experiments.
-    video_steps: int = 4
 
     @property
     def actual_seconds(self) -> float:
@@ -523,7 +518,7 @@ def valid_length(seconds: float) -> int:
     return 17 * n + 5
 
 
-def parse_config(parts: list[str], video_steps: int = 4) -> GenerationConfig:
+def parse_config(parts: list[str]) -> GenerationConfig:
     if len(parts) != 4:
         raise BotError("格式：/gen 寬度 高度 steps 秒數\n例如：/gen 864 480 12 15")
     try:
@@ -540,17 +535,9 @@ def parse_config(parts: list[str], video_steps: int = 4) -> GenerationConfig:
         raise BotError("解析度太高，先不要超過 1344×768。")
     if steps < 4 or steps > 20:
         raise BotError("steps 目前允許 4 至 20，建議 8 或 12。")
-    if video_steps < 4 or video_steps > 20:
-        raise BotError("影片 steps 目前允許 4 至 20。")
 
     length = valid_length(seconds)
-    return GenerationConfig(width, height, steps, seconds, length, video_steps)
-
-
-def step_label(config: GenerationConfig) -> str:
-    """Describe the actual video/audio step split shown to the user."""
-    audio_steps = max(config.steps, config.video_steps)
-    return f"影片 {config.video_steps} / 音訊 {audio_steps} steps"
+    return GenerationConfig(width, height, steps, seconds, length)
 
 
 def megapixel_label(width: int, height: int) -> str:
@@ -1195,8 +1182,8 @@ def build_workflow(
 
     sampler_inputs = workflow["7"]["inputs"]
     if workflow["7"].get("class_type") == "MiniMaxH3MultiRateSamplerEXPT8":
-        sampler_inputs["video_steps"] = config.video_steps
-        sampler_inputs["audio_steps"] = max(config.steps, config.video_steps)
+        sampler_inputs["video_steps"] = min(4, config.steps)
+        sampler_inputs["audio_steps"] = config.steps
     else:
         sampler_inputs["steps"] = config.steps
     sampler_inputs["shift_video"] = 12.0
@@ -2410,7 +2397,7 @@ class TelegramTurboBot:
                 self.send_safe(
                     chat_id,
                     f"生成中：{current}\n{job.config.width}×{job.config.height} | "
-                    f"{step_label(job.config)} | 約 {job.config.actual_seconds:.2f} 秒",
+                    f"{job.config.steps} steps | 約 {job.config.actual_seconds:.2f} 秒",
                 )
             else:
                 self.send_safe(chat_id, "目前沒有生成工作。")
@@ -2457,7 +2444,7 @@ class TelegramTurboBot:
             self.pending_config = config
         self.send_safe(
             chat_id,
-            f"設定已收取：{config.width}×{config.height} | {step_label(config)} | "
+            f"設定已收取：{config.width}×{config.height} | {config.steps} steps | "
             f"約 {config.actual_seconds:.2f} 秒。\n請下一則訊息貼上完整提示詞。",
         )
 
@@ -2567,7 +2554,7 @@ class TelegramTurboBot:
             self.send_safe(
                 job.chat_id,
                 f"已開始生成：{job.config.width}×{job.config.height} | "
-                f"{step_label(job.config)} | 約 {job.config.actual_seconds:.2f} 秒\n"
+                f"{job.config.steps} steps | 約 {job.config.actual_seconds:.2f} 秒\n"
                 f"Prompt ID: {prompt_id}",
             )
 
@@ -2615,7 +2602,7 @@ class TelegramTurboBot:
                 job.progress_phase = "uploading"
             caption = (
                 f"MiniMax H3 Turbo 完成\n{job.config.width}×{job.config.height} | "
-                f"{step_label(job.config)} | {job.config.actual_seconds:.2f} 秒"
+                f"{job.config.steps} steps | {job.config.actual_seconds:.2f} 秒"
             )
             self.telegram.send_video(job.chat_id, video_path, caption)
             self.send_safe(
@@ -2711,13 +2698,7 @@ class TelegramMenuBot(TelegramTurboBot):
     RESOLUTIONS = ((608, 352), (736, 416), (864, 480), (960, 544))
     SECONDS = (5, 10, 12, 15)
     LONG_SECONDS = (30, 60, 120, 180, 300, 600, 900, 1200, 1800)
-    STEP_PROFILES = (
-        ("turbo_4_4", "⚡ 4V / 4A", 4, 4),
-        ("turbo_4_8", "⚡ 4V / 8A", 4, 8),
-        ("turbo_4_12", "⚡ 4V / 12A", 4, 12),
-        ("real_8", "🧪 真 8 steps", 8, 8),
-        ("real_10", "🧪 真 10 steps", 10, 10),
-    )
+    STEPS = (4, 8, 12)
 
     def __init__(self, token: str, allowed_chat_id: str):
         super().__init__(token, allowed_chat_id)
@@ -2747,8 +2728,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     str(saved["height"]),
                     str(saved["steps"]),
                     str(saved["seconds"]),
-                ],
-                video_steps=int(saved.get("video_steps", 4)),
+                ]
             )
         except (OSError, ValueError, KeyError, TypeError, BotError, json.JSONDecodeError):
             return self.default_settings()
@@ -2835,7 +2815,6 @@ class TelegramMenuBot(TelegramTurboBot):
                     "width": self.settings.width,
                     "height": self.settings.height,
                     "steps": self.settings.steps,
-                    "video_steps": self.settings.video_steps,
                     "seconds": self.settings.requested_seconds,
                     "total_seconds": getattr(
                         self, "total_seconds", self.settings.requested_seconds
@@ -2867,7 +2846,6 @@ class TelegramMenuBot(TelegramTurboBot):
         height: Optional[int] = None,
         steps: Optional[int] = None,
         seconds: Optional[float] = None,
-        video_steps: Optional[int] = None,
     ) -> None:
         current = self.settings
         self.settings = parse_config(
@@ -2876,10 +2854,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 str(height if height is not None else current.height),
                 str(steps if steps is not None else current.steps),
                 str(seconds if seconds is not None else current.requested_seconds),
-            ],
-            video_steps=(
-                video_steps if video_steps is not None else current.video_steps
-            ),
+            ]
         )
         self.save_settings()
 
@@ -2936,17 +2911,13 @@ class TelegramMenuBot(TelegramTurboBot):
         custom_seconds_row = [
             {"text": "✏️ 自定義秒數", "callback_data": "sec_custom"}
         ]
-        step_buttons = [
+        steps_row = [
             {
-                "text": self.selected(
-                    label,
-                    (current.video_steps, current.steps) == (video_steps, audio_steps),
-                ),
-                "callback_data": f"step_profile:{profile_key}",
+                "text": self.selected(f"{steps} steps", current.steps == steps),
+                "callback_data": f"steps:{steps}",
             }
-            for profile_key, label, video_steps, audio_steps in self.STEP_PROFILES
+            for steps in self.STEPS
         ]
-        step_rows = [step_buttons[:3], step_buttons[3:]]
         with self.lock:
             active_job = self.job
         if active_job is not None and active_job.pause_requested.is_set():
@@ -2991,8 +2962,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 custom_seconds_row,
                 [{"text": "🖼 解析度／MP（按下選擇）", "callback_data": "noop"}],
                 resolution_row,
-                [{"text": "⚙️ 步數（V=影片／A=音訊）", "callback_data": "noop"}],
-                *step_rows,
+                [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
+                steps_row,
                 [
                     {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
                     {"text": "🧹 清除提示詞", "callback_data": "clear"},
@@ -3025,8 +2996,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 str(self.settings.height),
                 str(self.settings.steps),
                 str(segment_seconds),
-            ],
-            video_steps=self.settings.video_steps,
+            ]
         )
 
     def set_total_seconds(self, seconds: float) -> None:
@@ -3258,7 +3228,7 @@ class TelegramMenuBot(TelegramTurboBot):
             caption = (
                 "MiniMax H3 Turbo 長片已提早中止，已合成部分結果\n"
                 f"{completed_seconds:.2f} 秒 | {job.config.width}×{job.config.height} | "
-                f"{step_label(job.config)} | {completed_count}/{job.segment_total} 段"
+                f"{job.config.steps} steps | {completed_count}/{job.segment_total} 段"
             )
             self.telegram.send_video(job.chat_id, output_path, caption)
             self.send_safe(
@@ -3353,8 +3323,7 @@ class TelegramMenuBot(TelegramTurboBot):
                         str(base_config.height),
                         str(base_config.steps),
                         str(generation_seconds),
-                    ],
-                    video_steps=base_config.video_steps,
+                    ]
                 )
                 job.output_prefix = f"{base_prefix}/segment_{index:02d}"
                 self.send_safe(
@@ -3420,7 +3389,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 job.progress_phase = "uploading"
             caption = (
                 f"MiniMax H3 Turbo 長片完成\n{job.total_seconds:.0f} 秒 | "
-                f"{base_config.width}×{base_config.height} | {step_label(base_config)} | "
+                f"{base_config.width}×{base_config.height} | {base_config.steps} steps | "
                 f"{job.segment_total} 鏡頭合併"
             )
             self.telegram.send_video(job.chat_id, output_path, caption)
@@ -3497,7 +3466,7 @@ class TelegramMenuBot(TelegramTurboBot):
             f"模式：{mode_text}\n"
             f"輸入圖片：{image_status}\n"
             f"解析度：{resolution_label(current.width, current.height)}\n"
-            f"步數：{step_label(current)}\n"
+            f"步數：{current.steps}\n"
                 f"{duration_text}\n"
                 f"ComfyUI 顯存模式：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"
             f"{shutdown_text}\n"
@@ -3910,36 +3879,9 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.set_total_seconds(float(data.removeprefix("sec:")))
                 self.show_menu(chat_id, message_id, "總片長已更新；超過 15 秒會自動分段合併")
                 return
-            if data.startswith("step_profile:"):
-                profile_key = data.removeprefix("step_profile:")
-                profile = next(
-                    (
-                        item
-                        for item in self.STEP_PROFILES
-                        if item[0] == profile_key
-                    ),
-                    None,
-                )
-                if profile is None:
-                    self.show_menu(chat_id, message_id, "找不到這個步數模式")
-                    return
-                _, label, video_steps, audio_steps = profile
-                self.update_settings(
-                    steps=audio_steps,
-                    video_steps=video_steps,
-                )
-                self.show_menu(
-                    chat_id,
-                    message_id,
-                    f"已更新：影片 {video_steps} / 音訊 {audio_steps} steps",
-                )
-                return
             if data.startswith("steps:"):
-                # Compatibility with old menu messages: old numeric buttons
-                # always meant 4 video steps plus the selected audio count.
-                audio_steps = int(data.removeprefix("steps:"))
-                self.update_settings(steps=audio_steps, video_steps=4)
-                self.show_menu(chat_id, message_id, "已更新：影片 4 / 音訊步數已更新")
+                self.update_settings(steps=int(data.removeprefix("steps:")))
+                self.show_menu(chat_id, message_id, "steps 已更新")
                 return
             if data == "last":
                 self.settings = self.load_settings()

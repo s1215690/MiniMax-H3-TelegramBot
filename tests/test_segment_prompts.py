@@ -50,45 +50,6 @@ class SeedVR2WorkflowTests(unittest.TestCase):
         self.assertEqual(0, height % 32)
 
 
-class StepProfileTests(unittest.TestCase):
-    def make_config(self, audio_steps: int, video_steps: int = 4):
-        return BOT.GenerationConfig(
-            448,
-            256,
-            audio_steps,
-            15.0,
-            BOT.valid_length(15.0),
-            video_steps,
-        )
-
-    def test_legacy_multirate_profile_stays_four_video_steps(self):
-        workflow = BOT.build_workflow(
-            self.make_config(12),
-            "A short test scene with synchronized sound.",
-        )
-
-        self.assertEqual(4, workflow["7"]["inputs"]["video_steps"])
-        self.assertEqual(12, workflow["7"]["inputs"]["audio_steps"])
-
-    def test_true_eight_video_steps_are_sent_to_multirate_sampler(self):
-        workflow = BOT.build_workflow(
-            self.make_config(8, video_steps=8),
-            "A short test scene with synchronized sound.",
-        )
-
-        self.assertEqual(8, workflow["7"]["inputs"]["video_steps"])
-        self.assertEqual(8, workflow["7"]["inputs"]["audio_steps"])
-
-    def test_true_ten_video_steps_are_sent_to_multirate_sampler(self):
-        workflow = BOT.build_workflow(
-            self.make_config(10, video_steps=10),
-            "A short test scene with synchronized sound.",
-        )
-
-        self.assertEqual(10, workflow["7"]["inputs"]["video_steps"])
-        self.assertEqual(10, workflow["7"]["inputs"]["audio_steps"])
-
-
 class SegmentedPromptTests(unittest.TestCase):
     def test_resolution_label_includes_megapixels(self):
         self.assertEqual("0.3 MP · 736×416", BOT.resolution_label(736, 416))
