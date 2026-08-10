@@ -29,59 +29,69 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
-LOCAL_APP_DATA = Path(
-    os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
-)
-COMFY_ROOT = Path(
-    os.environ.get("MINIMAX_COMFY_ROOT", str(Path.home() / "ComfyUI"))
-)
-COMFYUI_BASE_DIR = Path(
-    os.environ.get("MINIMAX_COMFY_BASE_DIR", str(COMFY_ROOT / "ComfyUI"))
-)
-COMFYUI_DIR = Path(
-    os.environ.get("MINIMAX_COMFY_DIR", str(COMFY_ROOT / "ComfyUI-Turbo"))
-)
-COMFYUI_PYTHON = Path(
-    os.environ.get(
-        "MINIMAX_COMFY_PYTHON",
-        str(COMFYUI_BASE_DIR / ".venv" / "Scripts" / "python.exe"),
-    )
-)
 COMFY_URL = os.environ.get("MINIMAX_COMFY_URL", "http://127.0.0.1:8191").rstrip("/")
 OUTPUT_DIR = Path(
-    os.environ.get("MINIMAX_COMFY_OUTPUT", str(LOCAL_APP_DATA / "ComfyUI" / "output"))
+    os.environ.get(
+        "MINIMAX_COMFY_OUTPUT",
+        r"E:\MiniMax-H3-Telegram\output",
+    )
 )
-INPUT_DIR = Path(os.environ.get("MINIMAX_COMFY_INPUT", str(OUTPUT_DIR.parent / "input")))
+INPUT_DIR = Path(
+    os.environ.get(
+        "MINIMAX_COMFY_INPUT",
+        str(OUTPUT_DIR.parent / "input"),
+    )
+)
 T8_API_TEMPLATE = Path(
     os.environ.get(
         "MINIMAX_T8_API_TEMPLATE",
-        str(PROJECT_DIR / "workflow" / "dual_clock_multirate_api.json"),
+        str(Path(__file__).resolve().parent / "dual_clock_multirate_api.json"),
     )
 )
 SEEDVR2_API_TEMPLATE = Path(
     os.environ.get(
         "MINIMAX_SEEDVR2_API_TEMPLATE",
-        str(PROJECT_DIR / "workflow" / "seedvr2_3b_int8_upscale_video_api.json"),
+        str(Path(__file__).resolve().parent / "seedvr2_3b_int8_upscale_video_api.json"),
+    )
+)
+COMFYUI_DIR = Path(
+    os.environ.get("MINIMAX_COMFY_DIR", r"E:\Comfy\ComfyUI\ComfyUI-Turbo")
+)
+COMFYUI_BASE_DIR = Path(
+    os.environ.get("MINIMAX_COMFY_BASE_DIR", r"E:\Comfy\ComfyUI\ComfyUI")
+)
+COMFYUI_PYTHON = Path(
+    os.environ.get(
+        "MINIMAX_COMFY_PYTHON",
+        r"E:\Comfy\ComfyUI\ComfyUI\.venv\Scripts\python.exe",
     )
 )
 COMFYUI_PORT = int(os.environ.get("MINIMAX_COMFY_PORT", "8191"))
+try:
+    COMFY_IDLE_SHUTDOWN_SECONDS = max(
+        0.0,
+        float(os.environ.get("MINIMAX_COMFY_IDLE_SHUTDOWN_SECONDS", "300")),
+    )
+except ValueError:
+    COMFY_IDLE_SHUTDOWN_SECONDS = 300.0
+COMFY_IDLE_CHECK_INTERVAL_SECONDS = 15.0
 COMFYUI_LOG = Path(
     os.environ.get(
         "MINIMAX_COMFY_LOG",
-        str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MiniMax-H3-Telegram" / "comfyui.log"),
+        r"E:\MiniMax-H3-Telegram\runtime\bot\comfyui.log",
     )
 )
 COMFYUI_STATE_DIR = Path(
     os.environ.get(
         "MINIMAX_COMFY_STATE_DIR",
-        str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MiniMax-H3-Turbo-ComfyUI"),
+        r"E:\MiniMax-H3-Telegram\runtime\comfyui",
     )
 )
 COMFYUI_USER_DIR = COMFYUI_STATE_DIR / "user"
 COMFYUI_DATABASE = COMFYUI_STATE_DIR / "comfyui.db"
 DEFAULT_COMFYUI_VRAM_MODE = "lowvram"
 FFMPEG_PATH = os.environ.get("MINIMAX_FFMPEG", shutil.which("ffmpeg") or "ffmpeg")
+FFPROBE_PATH = os.environ.get("MINIMAX_FFPROBE", shutil.which("ffprobe") or "ffprobe")
 NVIDIA_SMI_PATH = os.environ.get(
     "MINIMAX_NVIDIA_SMI",
     shutil.which("nvidia-smi")
@@ -96,20 +106,16 @@ SAGE_ATTENTION_ENABLED = os.environ.get("MINIMAX_SAGE_ATTENTION", "1").strip().l
     "off",
 }
 
-VIDEO_VAE = os.environ.get("MINIMAX_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors")
-AUDIO_VAE = os.environ.get("MINIMAX_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors")
-CLIP_NAME = os.environ.get(
-    "MINIMAX_CLIP", "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
-)
-UNET_NAME = os.environ.get("MINIMAX_UNET", "minimax_h3_fl2va_int8_convrot.safetensors")
-LORA_NAME = os.environ.get(
-    "MINIMAX_LORA", "minimax_h3_turbo_v4_step600_comfyui_T8-convert.safetensors"
-)
+VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
+AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
+CLIP_NAME = "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
+UNET_NAME = "minimax_h3_fl2va_int8_convrot.safetensors"
+LORA_NAME = "minimax_h3_turbo_v4_step600_comfyui_T8-convert.safetensors"
 OUTPUT_PREFIX = "MiniMaxH3/Telegram_Turbo"
 STATE_PATH = Path(
     os.environ.get(
         "MINIMAX_TELEGRAM_STATE",
-        str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MiniMax-H3-Telegram" / "settings.json"),
+        r"E:\MiniMax-H3-Telegram\runtime\bot\settings.json",
     )
 )
 IMAGE_DIR = STATE_PATH.parent / "input_images"
@@ -125,6 +131,13 @@ TIMELINE_TOLERANCE_SECONDS = 0.25
 MIN_TOTAL_SECONDS = 2.0
 MAX_TOTAL_SECONDS = 30.0 * 60.0
 CONTINUATION_DIR = STATE_PATH.parent / "continuation_frames"
+LONG_CHECKPOINT_DIR = STATE_PATH.parent / "long_checkpoints"
+QUEUE_STATE_PATH = STATE_PATH.parent / "story_queue.json"
+LONG_CHECKPOINT_VERSION = 1
+QUEUE_STATE_VERSION = 1
+MAX_HISTORY_ITEMS = 30
+MAX_QUEUE_ITEMS = 30
+BOT_LOG = STATE_PATH.parent / "bot.log"
 LONG_CONTINUITY_MODE = os.environ.get(
     "MINIMAX_H3_LONG_CONTINUITY", "motion_context"
 ).strip().lower()
@@ -134,6 +147,19 @@ MOTION_CONTEXT_EXTRA_SECONDS = MOTION_CONTEXT_LENGTH / 24.0
 
 class BotError(RuntimeError):
     pass
+
+
+_log_lock = threading.Lock()
+
+
+def bot_log(message: str) -> None:
+    """Append a timestamped line to the bot's persistent log file."""
+    try:
+        with _log_lock:
+            with BOT_LOG.open("a", encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
 
 
 def http_error_detail(exc: HTTPError) -> str:
@@ -308,6 +334,16 @@ class JobState:
     upscale_source_path: Optional[Path] = None
     upscale_target_width: int = 0
     upscale_target_height: int = 0
+    # Long-video fields are persisted in LONG_CHECKPOINT_DIR after every shot.
+    # They let a new Bot process continue at the first unfinished shot.
+    base_config: Optional[GenerationConfig] = None
+    long_base_prefix: Optional[str] = None
+    checkpoint_path: Optional[Path] = None
+    resume_from_segment: int = 1
+    completed_video_paths: list[Path] = field(default_factory=list)
+    initial_context_video_path: Optional[Path] = None
+    initial_context_latent_path: Optional[str] = None
+    resume_motion_context: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +355,18 @@ class PendingUpscale:
     source_height: int
     duration_seconds: float
     shutdown_after_choice: bool = False
+
+
+@dataclass(frozen=True)
+class QueuedStory:
+    """A snapshot of one story waiting for sequential generation."""
+
+    item_id: str
+    prompt: str
+    config: GenerationConfig
+    total_seconds: float
+    input_image_path: Optional[Path] = None
+    created_at: float = field(default_factory=time.time)
 
 
 class ComfyProgressTracker:
@@ -518,6 +566,18 @@ def valid_length(seconds: float) -> int:
     return 17 * n + 5
 
 
+def split_story_queue_prompts(text: str) -> list[str]:
+    """Split a queue submission without breaking timeline text."""
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+    separator = re.compile(
+        r"(?im)^\s*(?:-{3,}|={3,}|(?:story|prompt|故事)\s*\d+\s*[:：]?)\s*$"
+    )
+    prompts = [part.strip() for part in separator.split(normalized)]
+    return [prompt for prompt in prompts if prompt]
+
+
 def parse_config(parts: list[str]) -> GenerationConfig:
     if len(parts) != 4:
         raise BotError("格式：/gen 寬度 高度 steps 秒數\n例如：/gen 864 480 12 15")
@@ -547,6 +607,47 @@ def megapixel_label(width: int, height: int) -> str:
 
 def resolution_label(width: int, height: int) -> str:
     return f"{megapixel_label(width, height)} · {width}×{height}"
+
+
+def probe_video_info(video_path: Path) -> tuple[float, int, int]:
+    """Read duration and dimensions for importing older generated videos."""
+    result = run_hidden_command(
+        [
+            FFPROBE_PATH,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=width,height",
+            "-select_streams",
+            "v:0",
+            "-of",
+            "csv=p=0:s=x",
+            str(video_path),
+        ],
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise BotError(f"無法讀取影片資訊：{video_path}")
+    values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    duration = 0.0
+    width = 0
+    height = 0
+    for value in values:
+        if "x" in value:
+            dimensions = value.split("x", 1)
+            try:
+                width = int(dimensions[0])
+                height = int(dimensions[1])
+            except (TypeError, ValueError):
+                pass
+        else:
+            try:
+                duration = float(value)
+            except (TypeError, ValueError):
+                pass
+    if duration <= 0 or width <= 0 or height <= 0:
+        raise BotError(f"影片資訊不完整：{video_path}")
+    return duration, width, height
 
 
 def extract_last_frame(video_path: Path, output_path: Path) -> Path:
@@ -1079,6 +1180,9 @@ def build_workflow(
             raise BotError(
                 "Motion Context 需要上一段影片和上一段 AV latent。"
             )
+        # The Motion Context node supplies the continuation keyframes and the
+        # previous AV latent. Do not also attach the old single-frame/reference
+        # inputs: that would turn this back into the stable reference path.
         conditioning["task_type"] = "T2VA"
         conditioning["audio_mode"] = "native"
         conditioning["add_source_as_reference"] = False
@@ -1402,6 +1506,11 @@ def upload_audio_to_comfy(audio_path: Path) -> str:
     return f"{subfolder}/{name}" if subfolder else name
 
 
+def upload_video_to_comfy(video_path: Path) -> str:
+    """Upload a previous MP4 so LoadVideo can expose its frame batch."""
+    return upload_audio_to_comfy(video_path)
+
+
 _comfy_start_lock = threading.Lock()
 _comfy_process: Optional[subprocess.Popen] = None
 
@@ -1426,6 +1535,17 @@ def comfyui_is_online() -> bool:
         return True
     except BotError:
         return False
+
+
+def comfyui_has_pending_work() -> bool:
+    """Return whether ComfyUI currently has a running or pending queue item."""
+    try:
+        queue = json_request(f"{COMFY_URL}/queue", timeout=4)
+    except BotError:
+        return False
+    if not isinstance(queue, dict):
+        return False
+    return bool(queue.get("queue_running") or queue.get("queue_pending"))
 
 
 def start_comfyui_process(vram_mode: Optional[str] = None) -> str:
@@ -1589,6 +1709,57 @@ def restart_comfyui_process(vram_mode: Optional[str] = None) -> str:
     stop_message = stop_comfyui_process()
     start_message = start_comfyui_process(vram_mode)
     return f"{stop_message}\n{start_message}"
+
+
+def restart_bot_process() -> None:
+    """Schedule a detached helper that stops this Bot and relaunches it hidden.
+
+    The current process keeps polling for a few more seconds so the "正在重啟"
+    confirmation can be delivered first; the helper then force-stops every
+    process whose command line references this Bot script and starts a fresh
+    copy through the same VBS launcher used by the Start/Restart .cmd files.
+    """
+    vbs_path = Path(__file__).resolve().parent / "Start-MiniMax-H3-Telegram.vbs"
+    if not vbs_path.is_file():
+        raise BotError(f"找不到 Bot 啟動器：{vbs_path}")
+    pattern = "MiniMax-H3-Telegram-Bot.py"
+    vbs_arg = str(vbs_path).replace("'", "''")
+    script = (
+        "Start-Sleep -Seconds 4; "
+        "$self=$PID; "
+        f"$targets=@(Get-CimInstance Win32_Process | Where-Object {{ "
+        f"$_.ProcessId -ne $self -and $_.CommandLine -like '*{pattern}*' }}); "
+        "if ($targets.Count -gt 0) { "
+        "foreach ($p in $targets) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } "
+        "Start-Sleep -Seconds 1 "
+        "}; "
+        f"wscript.exe '//nologo' '{vbs_arg}'"
+    )
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        script,
+    ]
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    subprocess.Popen(command, **kwargs)
 
 
 def multipart_request(url: str, fields: dict[str, str], file_field: str, file_path: Path) -> Any:
@@ -1869,11 +2040,6 @@ def merge_completed_segments(
     return concat_videos(video_paths, output_path, total_seconds, shot_plan=shot_plan)
 
 
-def upload_video_to_comfy(video_path: Path) -> str:
-    """Upload a previous MP4 so LoadVideo can expose its frame batch."""
-    return upload_audio_to_comfy(video_path)
-
-
 class TelegramClient:
     def __init__(self, token: str):
         self.base_url = f"https://api.telegram.org/bot{token}"
@@ -1957,7 +2123,7 @@ class TelegramClient:
         params: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_markup is not None:
             params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-        self.call("sendMessage", params, timeout=30)
+        return self.call("sendMessage", params, timeout=30)
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
         params: dict[str, Any] = {"callback_query_id": callback_query_id}
@@ -2016,6 +2182,51 @@ class TelegramTurboBot:
             daemon=True,
         )
         self.progress_refresh_thread.start()
+        self._comfy_idle_since = time.time()
+        self._comfy_idle_shutdown_stop = threading.Event()
+        self.comfy_idle_shutdown_thread = threading.Thread(
+            target=self._comfy_idle_shutdown_loop,
+            name="comfyui-idle-shutdown",
+            daemon=True,
+        )
+        self.comfy_idle_shutdown_thread.start()
+
+    def touch_comfy_activity(self) -> None:
+        """Reset the idle countdown after a Bot task or ComfyUI control action."""
+        self._comfy_idle_since = time.time()
+
+    def _comfy_idle_shutdown_loop(self) -> None:
+        if COMFY_IDLE_SHUTDOWN_SECONDS <= 0:
+            return
+        while not self._comfy_idle_shutdown_stop.wait(
+            COMFY_IDLE_CHECK_INTERVAL_SECONDS
+        ):
+            if not comfyui_is_online():
+                self.touch_comfy_activity()
+                continue
+            with self.lock:
+                active_job = self.job is not None
+            if active_job or comfyui_has_pending_work():
+                self.touch_comfy_activity()
+                continue
+            idle_seconds = time.time() - self._comfy_idle_since
+            if idle_seconds < COMFY_IDLE_SHUTDOWN_SECONDS:
+                continue
+            try:
+                result = stop_comfyui_process()
+            except Exception as exc:
+                bot_log(f"idle ComfyUI shutdown failed: {exc}")
+                self.touch_comfy_activity()
+                continue
+            self.touch_comfy_activity()
+            bot_log(
+                f"ComfyUI auto-stopped after {idle_seconds:.0f}s idle: {result}"
+            )
+            self.send_safe(
+                self.allowed_chat_id,
+                "ComfyUI 閒置超過 5 分鐘，已自動關閉以釋放顯存。"
+                "需要生成時按「▶️ 啟動 ComfyUI」或輸入 /comfy_start。",
+            )
 
     def help_text(self) -> str:
         return (
@@ -2029,10 +2240,19 @@ class TelegramTurboBot:
             "/progress 查看即時生成進度\n"
             "/pause 暫停長片（在目前鏡頭完成後）\n"
             "/resume 或 /play 繼續長片\n"
+             "/resume_long 從失敗檢查點繼續長片\n"
+             "/extend 秒數 [提示詞] 從上一條完整長片尾端延續\n"
+             "/history 查看歷史長片並選擇 ID\n"
+             "/queue 查看故事排隊\n"
+             "/queue_add 加入一個或多個故事\n"
+             "/queue_start 開始排隊\n"
+             "/queue_clear 清空等待中的故事\n"
             "/temperature 查看 GPU／CPU 溫度\n"
             "/cancel_shutdown 取消已排程的自動關機\n"
             "/comfy_restart 重啟 ComfyUI\n"
             "/comfy_stop 關閉 ComfyUI\n"
+            "/comfy_start 啟動 ComfyUI（閒置 5 分鐘會自動關閉）\n"
+            "/bot_restart 重啟 Telegram Bot\n"
             "/cancel 取消目前生成\n"
             "/help 查看說明"
         )
@@ -2115,7 +2335,7 @@ class TelegramTurboBot:
             try:
                 comfy_post("/free", {"unload_models": True, "free_memory": True})
             except BotError as exc:
-                print(f"ComfyUI memory release before SeedVR2 was unavailable: {exc}", flush=True)
+                bot_log(f"ComfyUI memory release before SeedVR2 was unavailable: {exc}")
             input_video_name = upload_video_to_comfy(source_path)
             target_long_edge = max(job.upscale_target_width, job.upscale_target_height)
             output_prefix = f"MiniMaxH3/Telegram_Turbo_Upscale/{uuid.uuid4().hex[:12]}"
@@ -2195,16 +2415,18 @@ class TelegramTurboBot:
                 f"{seedvr2_usage_report(target_long_edge)}",
             )
             self.finalize_upscale_choice(job.chat_id, pending)
-            print(f"seedvr2 upscale done: {output_path}", flush=True)
+            bot_log(f"seedvr2 upscale done {output_path}")
         except Exception as exc:
             if not job.cancel_event.is_set():
                 self.send_safe(job.chat_id, f"SeedVR2 放大失敗：{exc}")
-            print(f"seedvr2 upscale error: {exc}", flush=True)
+            bot_log(f"seedvr2 upscale error: {exc}")
             print(f"upscale error: {exc}", flush=True)
         finally:
+            self.touch_comfy_activity()
             with self.lock:
                 if self.job is job:
                     self.job = None
+            self.on_job_finished(job.chat_id)
 
     def _progress_refresh_loop(self) -> None:
         while True:
@@ -2245,6 +2467,21 @@ class TelegramTurboBot:
         bounded = max(0.0, min(100.0, percent))
         filled = min(10, int(bounded / 10.0))
         return "█" * filled + "░" * (10 - filled)
+
+    @staticmethod
+    def eta_text(overall: float, elapsed: int) -> str:
+        """Linear extrapolation of remaining time once real progress exists."""
+        if overall < 5.0 or overall >= 99.5:
+            return ""
+        remaining = elapsed * (100.0 - overall) / max(overall, 0.001)
+        if remaining < 90:
+            eta_human = f"{remaining:.0f} 秒"
+        elif remaining < 5400:
+            eta_human = f"{remaining / 60:.0f} 分鐘"
+        else:
+            eta_human = f"{remaining / 3600:.1f} 小時"
+        finish = time.strftime("%H:%M", time.localtime(time.time() + remaining))
+        return f"預計剩餘：{eta_human}（約 {finish} 完成）"
 
     def progress_text(self) -> str:
         with self.lock:
@@ -2333,6 +2570,9 @@ class TelegramTurboBot:
             f"狀態：{phase_text}",
             f"已用時間：{elapsed_text}",
         ]
+        eta_line = self.eta_text(overall, elapsed)
+        if eta_line:
+            lines.append(eta_line)
         if job.pause_requested.is_set():
             control_text = (
                 "已暫停，等待播放／繼續"
@@ -2454,15 +2694,15 @@ class TelegramTurboBot:
         config: GenerationConfig,
         prompt: str,
         input_image_path: Optional[Path] = None,
-    ) -> None:
+    ) -> bool:
         prompt = prompt.strip()
         if not prompt:
             self.send_safe(chat_id, "提示詞不可為空白。")
-            return
+            return False
         with self.lock:
             if self.job:
                 self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或使用 /cancel。")
-                return
+                return False
             job = JobState(
                 chat_id,
                 config,
@@ -2473,8 +2713,10 @@ class TelegramTurboBot:
             )
             job.resume_event.set()
             self.job = job
+        self.touch_comfy_activity()
         thread = threading.Thread(target=self.run_job, args=(job,), daemon=True)
         thread.start()
+        return True
 
     def ensure_comfyui_ready(self, job: JobState) -> None:
         """Hook for a subclass to start or wait for ComfyUI before queuing."""
@@ -2482,6 +2724,10 @@ class TelegramTurboBot:
 
     def comfyui_vram_mode(self) -> str:
         return DEFAULT_COMFYUI_VRAM_MODE
+
+    def on_job_finished(self, chat_id: str) -> None:
+        """Hook for menu bots that have work waiting behind the current job."""
+        return
 
     def cancel_job_for_comfy_control(self) -> bool:
         """Mark the active Telegram job cancelled before stopping ComfyUI."""
@@ -2491,6 +2737,26 @@ class TelegramTurboBot:
                 job.cancel_event.set()
                 job.resume_event.set()
         return job is not None
+
+    def restart_bot(self, chat_id: str) -> None:
+        """Cancel any running job, confirm, then schedule a detached self-restart."""
+        cancelled = self.cancel_job_for_comfy_control()
+        if cancelled:
+            try:
+                comfy_post("/interrupt", {})
+            except BotError:
+                pass
+        prefix = "目前生成已取消。\n" if cancelled else ""
+        self.send_safe(
+            chat_id,
+            prefix + "正在重啟 Bot… 幾秒後會重新啟動，之後請再按 /start 或 /menu 確認。",
+        )
+        try:
+            restart_bot_process()
+        except BotError as exc:
+            self.send_safe(chat_id, f"重啟 Bot 失敗：{exc}")
+            return
+        bot_log("Bot restart requested from Telegram")
 
     def run_segment(
         self,
@@ -2595,6 +2861,10 @@ class TelegramTurboBot:
                 job.progress_tracker = None
 
     def run_job(self, job: JobState) -> None:
+        bot_log(
+            f"job start {job.config.width}x{job.config.height} "
+            f"steps={job.config.steps} {job.config.actual_seconds:.2f}s"
+        )
         try:
             self.ensure_comfyui_ready(job)
             video_path = self.run_segment(job, announce=True)
@@ -2616,14 +2886,18 @@ class TelegramTurboBot:
                 job.config.height,
                 job.config.actual_seconds,
             )
+            bot_log(f"job done {video_path}")
         except Exception as exc:  # keep the long-polling bot alive after one job fails
             if not job.cancel_event.is_set():
                 self.send_safe(job.chat_id, f"生成失败：{exc}")
+            bot_log(f"job error: {exc}")
             print(f"generation error: {exc}", flush=True)
         finally:
+            self.touch_comfy_activity()
             with self.lock:
                 if self.job is job:
                     self.job = None
+            self.on_job_finished(job.chat_id)
 
     @staticmethod
     def execution_error(history: dict[str, Any]) -> str:
@@ -2695,7 +2969,7 @@ class TelegramTurboBot:
 class TelegramMenuBot(TelegramTurboBot):
     """Button-driven Telegram UI with persistent generation settings."""
 
-    RESOLUTIONS = ((608, 352), (736, 416), (864, 480), (960, 544))
+    RESOLUTIONS = ((448, 256), (512, 288), (608, 352), (736, 416), (864, 480), (960, 544))
     SECONDS = (5, 10, 12, 15)
     LONG_SECONDS = (30, 60, 120, 180, 300, 600, 900, 1200, 1800)
     STEPS = (4, 8, 12)
@@ -2712,6 +2986,13 @@ class TelegramMenuBot(TelegramTurboBot):
         self._shutdown_pending = False
         self.awaiting_prompt = False
         self.awaiting_duration = False
+        self.awaiting_extension_duration = False
+        self.awaiting_extension_prompt = False
+        self.awaiting_queue_prompt = False
+        self.extension_seconds: Optional[float] = None
+        self.extension_checkpoint_id: Optional[str] = None
+        self.story_queue: list[QueuedStory] = self.load_story_queue()
+        self._queue_starting = False
         self.menu_message_id: Optional[int] = None
 
     @staticmethod
@@ -2806,6 +3087,104 @@ class TelegramMenuBot(TelegramTurboBot):
             pass
         return float(self.settings.requested_seconds)
 
+    def load_story_queue(self) -> list[QueuedStory]:
+        try:
+            with QUEUE_STATE_PATH.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict) or int(payload.get("version", 0)) != QUEUE_STATE_VERSION:
+            return []
+        raw_items = payload.get("items", [])
+        if not isinstance(raw_items, list):
+            return []
+        items: list[QueuedStory] = []
+        seen_ids: set[str] = set()
+        for raw in raw_items[:MAX_QUEUE_ITEMS]:
+            if not isinstance(raw, dict):
+                continue
+            prompt = str(raw.get("prompt", "")).strip()
+            item_id = str(raw.get("item_id", "")).strip()
+            if not prompt or not re.fullmatch(r"q_[A-Za-z0-9]{6,24}", item_id):
+                continue
+            if item_id in seen_ids:
+                continue
+            try:
+                total_seconds = validate_total_seconds(float(raw["total_seconds"]))
+                raw_config = raw.get("config", {})
+                if not isinstance(raw_config, dict):
+                    continue
+                config = parse_config(
+                    [
+                        str(raw_config["width"]),
+                        str(raw_config["height"]),
+                        str(raw_config["steps"]),
+                        str(min(total_seconds, MAX_SEGMENT_SECONDS)),
+                    ]
+                )
+            except (BotError, KeyError, TypeError, ValueError):
+                continue
+            input_image_path: Optional[Path] = None
+            raw_image_path = str(raw.get("input_image_path", "")).strip()
+            if raw_image_path:
+                candidate = Path(raw_image_path)
+                try:
+                    candidate.resolve().relative_to(IMAGE_DIR.resolve())
+                except ValueError:
+                    candidate = None
+                if candidate is not None and candidate.is_file():
+                    input_image_path = candidate
+            try:
+                created_at = float(raw.get("created_at", time.time()))
+            except (TypeError, ValueError):
+                created_at = time.time()
+            items.append(
+                QueuedStory(
+                    item_id=item_id,
+                    prompt=prompt,
+                    config=config,
+                    total_seconds=total_seconds,
+                    input_image_path=input_image_path,
+                    created_at=created_at,
+                )
+            )
+            seen_ids.add(item_id)
+        return items
+
+    def save_story_queue(self) -> None:
+        with self.lock:
+            items = list(self.story_queue)
+        payload = {
+            "version": QUEUE_STATE_VERSION,
+            "updated_at": time.time(),
+            "items": [
+                {
+                    "item_id": item.item_id,
+                    "prompt": item.prompt,
+                    "total_seconds": item.total_seconds,
+                    "created_at": item.created_at,
+                    "config": {
+                        "width": item.config.width,
+                        "height": item.config.height,
+                        "steps": item.config.steps,
+                    },
+                    "input_image_path": (
+                        str(item.input_image_path)
+                        if item.input_image_path is not None
+                        else ""
+                    ),
+                }
+                for item in items
+            ],
+        }
+        QUEUE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = QUEUE_STATE_PATH.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(QUEUE_STATE_PATH)
+
     def save_settings(self) -> None:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = STATE_PATH.with_suffix(".tmp")
@@ -2839,6 +3218,800 @@ class TelegramMenuBot(TelegramTurboBot):
             encoding="utf-8",
         )
         temporary_path.replace(STATE_PATH)
+
+    @staticmethod
+    def _checkpoint_id(path: Path) -> str:
+        return path.stem
+
+    @staticmethod
+    def _write_checkpoint_payload(path: Path, payload: dict[str, Any]) -> None:
+        LONG_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+
+    @staticmethod
+    def _read_checkpoint_payload(path: Path) -> Optional[dict[str, Any]]:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if int(payload.get("version", 0)) != LONG_CHECKPOINT_VERSION:
+            return None
+        return payload
+
+    @staticmethod
+    def _checkpoint_config(payload: dict[str, Any]) -> GenerationConfig:
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            raise BotError("長片檢查點缺少生成配置。")
+        return parse_config(
+            [
+                str(config["width"]),
+                str(config["height"]),
+                str(config["steps"]),
+                str(config.get("requested_seconds", config.get("seconds", 15))),
+            ]
+        )
+
+    @staticmethod
+    def _checkpoint_shots(payload: dict[str, Any]) -> tuple[ShotSpec, ...]:
+        raw_shots = payload.get("shot_plan")
+        if not isinstance(raw_shots, list) or not raw_shots:
+            raise BotError("長片檢查點缺少鏡頭時間軸。")
+        shots: list[ShotSpec] = []
+        for raw in raw_shots:
+            if not isinstance(raw, dict):
+                raise BotError("長片檢查點的鏡頭資料無效。")
+            shots.append(
+                ShotSpec(
+                    float(raw["start_seconds"]),
+                    float(raw["end_seconds"]),
+                    str(raw.get("label", "鏡頭")),
+                    str(raw["action"]),
+                )
+            )
+        return tuple(shots)
+
+    @staticmethod
+    def _checkpoint_video_paths(payload: dict[str, Any]) -> list[Path]:
+        raw_paths = payload.get("completed_video_paths", [])
+        if not isinstance(raw_paths, list):
+            raise BotError("長片檢查點的影片清單無效。")
+        paths: list[Path] = []
+        for raw_path in raw_paths:
+            path = Path(str(raw_path))
+            if not path.is_absolute():
+                path = OUTPUT_DIR / path
+            paths.append(path)
+        return paths
+
+    def save_long_checkpoint(
+        self,
+        job: JobState,
+        video_paths: list[Path],
+        next_segment_index: int,
+        motion_context_enabled: bool,
+        latent_prefix: Optional[str],
+        context_latent_path: Optional[str],
+        status: str = "running",
+        error: str = "",
+    ) -> Path:
+        """Persist enough state to restart a failed long video without replaying shots."""
+        if job.checkpoint_path is None:
+            base_prefix = job.long_base_prefix or job.output_prefix
+            checkpoint_name = base_prefix.rsplit("/", 1)[-1]
+            job.checkpoint_path = LONG_CHECKPOINT_DIR / f"{checkpoint_name}.json"
+        base_config = job.base_config or job.config
+        job.completed_video_paths = list(video_paths)
+        job.resume_from_segment = int(next_segment_index)
+        completed_count = len(video_paths)
+        completed_seconds = 0.0
+        if job.shot_plan:
+            completed_seconds = sum(
+                shot.duration for shot in job.shot_plan[:completed_count]
+            )
+        payload = {
+            "version": LONG_CHECKPOINT_VERSION,
+            "checkpoint_id": self._checkpoint_id(job.checkpoint_path),
+            "chat_id": str(job.chat_id),
+            "status": status,
+            "last_error": error[-4000:] if error else "",
+            "created_at": float(job.started_at),
+            "updated_at": time.time(),
+            "prompt": job.prompt,
+            "config": {
+                "width": base_config.width,
+                "height": base_config.height,
+                "steps": base_config.steps,
+                "requested_seconds": base_config.requested_seconds,
+                "length": base_config.length,
+            },
+            "output_prefix": job.long_base_prefix or job.output_prefix,
+            "total_seconds": float(job.total_seconds),
+            "segment_total": int(job.segment_total),
+            "next_segment_index": int(next_segment_index),
+            "completed_seconds": round(completed_seconds, 3),
+            "shot_plan": [
+                {
+                    "start_seconds": shot.start_seconds,
+                    "end_seconds": shot.end_seconds,
+                    "label": shot.label,
+                    "action": shot.action,
+                }
+                for shot in job.shot_plan
+            ],
+            "story_global_text": job.story_global_text,
+            "input_image_path": str(job.input_image_path or ""),
+            "completed_video_paths": [
+                str(path.resolve()) for path in video_paths if path.is_file()
+            ],
+            "motion_context_enabled": bool(motion_context_enabled),
+            "latent_prefix": latent_prefix or "",
+            "last_context_latent_path": context_latent_path or "",
+        }
+        self._write_checkpoint_payload(job.checkpoint_path, payload)
+        return job.checkpoint_path
+
+    def mark_long_checkpoint(
+        self, job: JobState, status: str, error: str = ""
+    ) -> None:
+        """Change only the lifecycle state after a checkpoint was saved."""
+        path = job.checkpoint_path
+        if path is None or not path.is_file():
+            return
+        payload = self._read_checkpoint_payload(path)
+        if payload is None:
+            return
+        payload["status"] = status
+        payload["last_error"] = error[-4000:] if error else ""
+        payload["updated_at"] = time.time()
+        try:
+            self._write_checkpoint_payload(path, payload)
+        except OSError as exc:
+            bot_log(f"checkpoint status update failed: {exc}")
+
+    def checkpoint_for_id(self, checkpoint_id: str) -> Optional[tuple[Path, dict[str, Any]]]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", checkpoint_id):
+            return None
+        path = LONG_CHECKPOINT_DIR / f"{checkpoint_id}.json"
+        payload = self._read_checkpoint_payload(path)
+        if payload is None or str(payload.get("chat_id", "")) != self.allowed_chat_id:
+            return None
+        return path, payload
+
+    def discover_legacy_checkpoint(self) -> Optional[Path]:
+        """Create a one-time checkpoint for an older run that predates persistence."""
+        if self.total_seconds <= MAX_SEGMENT_SECONDS or not self.prompt:
+            return None
+        try:
+            plan = build_long_video_plan(self.prompt, self.total_seconds)
+        except BotError:
+            return None
+        root = OUTPUT_DIR / OUTPUT_PREFIX
+        if not root.is_dir():
+            return None
+        candidates: list[tuple[float, Path, dict[int, Path]]] = []
+        for directory in root.glob("long_*"):
+            if not directory.is_dir():
+                continue
+            segment_paths: dict[int, Path] = {}
+            for path in directory.glob("segment_*_00001.mp4"):
+                match = re.fullmatch(r"segment_(\d+)_00001\.mp4", path.name)
+                if match:
+                    segment_paths[int(match.group(1))] = path
+            contiguous: dict[int, Path] = {}
+            index = 1
+            while index in segment_paths:
+                contiguous[index] = segment_paths[index]
+                index += 1
+            if not contiguous or len(contiguous) >= len(plan.shots):
+                continue
+            newest = max(path.stat().st_mtime for path in contiguous.values())
+            candidates.append((newest, directory, contiguous))
+        if not candidates:
+            return None
+        _, directory, contiguous = max(candidates, key=lambda item: item[0])
+        checkpoint_path = LONG_CHECKPOINT_DIR / f"{directory.name}.json"
+        if checkpoint_path.is_file():
+            return checkpoint_path
+        base_prefix = directory.relative_to(OUTPUT_DIR).as_posix()
+        completed_paths = [contiguous[index] for index in sorted(contiguous)]
+        last_index = len(completed_paths)
+        latent_relative = (
+            f"{base_prefix}/motion_context/latent_{last_index:05d}.safetensors"
+        )
+        latent_path = OUTPUT_DIR / Path(*latent_relative.split("/"))
+        payload = {
+            "version": LONG_CHECKPOINT_VERSION,
+            "checkpoint_id": directory.name,
+            "chat_id": self.allowed_chat_id,
+            "status": "failed",
+            "last_error": "由既有輸出影片建立的恢復檢查點；上一次執行沒有保存檢查點。",
+            "created_at": min(path.stat().st_mtime for path in completed_paths),
+            "updated_at": time.time(),
+            "prompt": self.prompt,
+            "config": {
+                "width": self.settings.width,
+                "height": self.settings.height,
+                "steps": self.settings.steps,
+                "requested_seconds": self.settings.requested_seconds,
+                "length": self.settings.length,
+            },
+            "output_prefix": base_prefix,
+            "total_seconds": float(self.total_seconds),
+            "segment_total": len(plan.shots),
+            "next_segment_index": last_index + 1,
+            "completed_seconds": round(
+                sum(shot.duration for shot in plan.shots[:last_index]), 3
+            ),
+            "shot_plan": [
+                {
+                    "start_seconds": shot.start_seconds,
+                    "end_seconds": shot.end_seconds,
+                    "label": shot.label,
+                    "action": shot.action,
+                }
+                for shot in plan.shots
+            ],
+            "story_global_text": plan.global_text,
+            "input_image_path": "",
+            "completed_video_paths": [str(path.resolve()) for path in completed_paths],
+            "motion_context_enabled": latent_path.is_file(),
+            "latent_prefix": f"{base_prefix}/motion_context/latent",
+            "last_context_latent_path": (
+                latent_relative if latent_path.is_file() else ""
+            ),
+        }
+        try:
+            self._write_checkpoint_payload(checkpoint_path, payload)
+        except OSError as exc:
+            bot_log(f"legacy checkpoint creation failed: {exc}")
+            return None
+        bot_log(f"legacy checkpoint discovered {checkpoint_path}")
+        return checkpoint_path
+
+    def discover_legacy_history(self) -> None:
+        """Register completed older output folders as extendable history items."""
+        if getattr(self, "_legacy_history_discovered", False):
+            return
+        self._legacy_history_discovered = True
+        root = OUTPUT_DIR / OUTPUT_PREFIX
+        if not root.is_dir():
+            return
+        for directory in root.glob("long_*"):
+            if not directory.is_dir():
+                continue
+            checkpoint_path = LONG_CHECKPOINT_DIR / f"{directory.name}.json"
+            if checkpoint_path.is_file():
+                continue
+            full_video = directory / f"{directory.name}.mp4"
+            segment_paths: list[Path] = []
+            for path in directory.glob("segment_*_00001.mp4"):
+                if re.fullmatch(r"segment_\d+_00001\.mp4", path.name):
+                    segment_paths.append(path)
+            segment_paths.sort(key=lambda path: int(re.search(r"segment_(\d+)_", path.name).group(1)))
+            if not full_video.is_file() or not segment_paths:
+                continue
+            try:
+                total_seconds, width, height = probe_video_info(full_video)
+                if not MIN_TOTAL_SECONDS <= total_seconds <= MAX_TOTAL_SECONDS:
+                    continue
+                segment_durations: list[float] = []
+                for path in segment_paths:
+                    try:
+                        duration, _, _ = probe_video_info(path)
+                    except BotError:
+                        duration = total_seconds / len(segment_paths)
+                    segment_durations.append(max(0.1, duration))
+                duration_sum = sum(segment_durations)
+                if duration_sum <= 0:
+                    continue
+                config_seconds = min(MAX_SEGMENT_SECONDS, max(MIN_TOTAL_SECONDS, total_seconds))
+                config = parse_config(
+                    [str(width), str(height), str(self.settings.steps), str(config_seconds)]
+                )
+            except (BotError, OSError, ValueError):
+                continue
+
+            shots: list[dict[str, Any]] = []
+            cursor = 0.0
+            for index, duration in enumerate(segment_durations, start=1):
+                end = min(total_seconds, cursor + duration)
+                shots.append(
+                    {
+                        "start_seconds": round(cursor, 3),
+                        "end_seconds": round(end, 3),
+                        "label": f"HISTORICAL {index}",
+                        "action": (
+                            "Previously generated historical shot. Preserve its character, "
+                            "location, lighting and camera language before continuing."
+                        ),
+                    }
+                )
+                cursor = end
+            if shots:
+                shots[-1]["end_seconds"] = round(total_seconds, 3)
+
+            latent_candidates = [
+                path
+                for path in directory.rglob("latent_*.safetensors")
+                if re.fullmatch(r"latent_\d+\.safetensors", path.name)
+            ]
+            latent_candidates.sort(
+                key=lambda path: int(re.search(r"latent_(\d+)", path.name).group(1))
+            )
+            last_latent = latent_candidates[-1] if latent_candidates else None
+            base_prefix = directory.relative_to(OUTPUT_DIR).as_posix()
+            try:
+                relative_latent = (
+                    last_latent.relative_to(OUTPUT_DIR).as_posix()
+                    if last_latent is not None
+                    else ""
+                )
+            except ValueError:
+                relative_latent = ""
+            try:
+                created_at = min(path.stat().st_mtime for path in segment_paths)
+                updated_at = full_video.stat().st_mtime
+            except OSError:
+                created_at = time.time()
+                updated_at = created_at
+            payload = {
+                "version": LONG_CHECKPOINT_VERSION,
+                "checkpoint_id": directory.name,
+                "chat_id": self.allowed_chat_id,
+                "status": "completed",
+                "last_error": "",
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "prompt": "",
+                "config": {
+                    "width": config.width,
+                    "height": config.height,
+                    "steps": config.steps,
+                    "requested_seconds": config.requested_seconds,
+                    "length": config.length,
+                },
+                "output_prefix": base_prefix,
+                "total_seconds": round(total_seconds, 3),
+                "segment_total": len(segment_paths),
+                "next_segment_index": len(segment_paths) + 1,
+                "completed_seconds": round(total_seconds, 3),
+                "shot_plan": shots,
+                "story_global_text": (
+                    "This is a completed historical video imported from the local output folder. "
+                    "Use the supplied previous video and AV latent as the continuity source; "
+                    "preserve the same subject, setting, lighting and camera language."
+                ),
+                "input_image_path": "",
+                "completed_video_paths": [str(path.resolve()) for path in segment_paths],
+                "motion_context_enabled": bool(relative_latent),
+                "latent_prefix": (
+                    f"{base_prefix}/motion_context/latent" if relative_latent else ""
+                ),
+                "last_context_latent_path": relative_latent,
+            }
+            try:
+                self._write_checkpoint_payload(checkpoint_path, payload)
+            except OSError as exc:
+                bot_log(f"legacy history import failed {directory.name}: {exc}")
+                continue
+            bot_log(f"legacy history imported {checkpoint_path}")
+
+    def long_checkpoint_records(self) -> list[tuple[Path, dict[str, Any]]]:
+        self.discover_legacy_history()
+        records: list[tuple[float, Path, dict[str, Any]]] = []
+        if LONG_CHECKPOINT_DIR.is_dir():
+            for path in LONG_CHECKPOINT_DIR.glob("*.json"):
+                payload = self._read_checkpoint_payload(path)
+                if payload is None or str(payload.get("chat_id", "")) != self.allowed_chat_id:
+                    continue
+                try:
+                    updated = float(payload.get("updated_at", path.stat().st_mtime))
+                except (OSError, TypeError, ValueError):
+                    updated = path.stat().st_mtime
+                records.append((updated, path, payload))
+        if not records:
+            legacy_path = self.discover_legacy_checkpoint()
+            if legacy_path is not None:
+                payload = self._read_checkpoint_payload(legacy_path)
+                if payload is not None:
+                    records.append((float(payload.get("updated_at", time.time())), legacy_path, payload))
+        records.sort(key=lambda item: item[0], reverse=True)
+        return [(path, payload) for _, path, payload in records]
+
+    def latest_long_checkpoint(self) -> Optional[tuple[Path, dict[str, Any]]]:
+        records = self.long_checkpoint_records()
+        return records[0] if records else None
+
+    @staticmethod
+    def checkpoint_status_text(payload: dict[str, Any]) -> str:
+        status = str(payload.get("status", "unknown"))
+        next_index = int(payload.get("next_segment_index", 1))
+        total = int(payload.get("segment_total", 0))
+        if next_index > total:
+            return "已完成" if status == "completed" else status
+        return f"{status}，下次第 {next_index}/{total} 段"
+
+    def history_text(self, records: list[tuple[Path, dict[str, Any]]]) -> str:
+        lines = [
+            "📚 歷史長片列表",
+            "選擇一個 ID 後，可以延續已完成影片，或恢復未完成的影片。",
+            "",
+        ]
+        if not records:
+            lines.append("目前沒有可用的歷史長片 checkpoint。")
+            return "\n".join(lines)
+        for index, (path, payload) in enumerate(records[:MAX_HISTORY_ITEMS], start=1):
+            checkpoint_id = self._checkpoint_id(path)
+            total = float(payload.get("total_seconds", 0.0))
+            status = self.checkpoint_status_text(payload)
+            lines.append(f"{index}. {checkpoint_id} | {total:g} 秒 | {status}")
+        if len(records) > MAX_HISTORY_ITEMS:
+            lines.append(f"\n只顯示最近 {MAX_HISTORY_ITEMS} 項。")
+        return "\n".join(lines)
+
+    def history_markup(self, records: list[tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
+        rows: list[list[dict[str, str]]] = []
+        for path, payload in records[:MAX_HISTORY_ITEMS]:
+            checkpoint_id = self._checkpoint_id(path)
+            total = float(payload.get("total_seconds", 0.0))
+            status = self.checkpoint_status_text(payload)
+            icon = "📼" if int(payload.get("next_segment_index", 1)) > int(
+                payload.get("segment_total", 0)
+            ) else "🔁"
+            rows.append(
+                [
+                    {
+                        "text": f"{icon} {checkpoint_id} · {total:g}s",
+                        "callback_data": f"history_select:{checkpoint_id}",
+                    }
+                ]
+            )
+        rows.append([{"text": "↩️ 返回控制面板", "callback_data": "history_back"}])
+        return {"inline_keyboard": rows}
+
+    def show_history(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        records = self.long_checkpoint_records()
+        text = self.history_text(records)
+        markup = self.history_markup(records)
+        if message_id is not None:
+            try:
+                self.telegram.edit_message_text(chat_id, message_id, text, reply_markup=markup)
+                self.menu_message_id = int(message_id)
+                return
+            except BotError:
+                self.menu_message_id = None
+        try:
+            result = self.telegram.send_message(chat_id, text, reply_markup=markup)
+            if isinstance(result, dict) and result.get("message_id"):
+                self.menu_message_id = int(result["message_id"])
+        except BotError as exc:
+            self.send_safe(chat_id, f"歷史長片列表更新失敗：{exc}")
+
+    def show_checkpoint_detail(
+        self, chat_id: str, checkpoint_id: str, message_id: Optional[int] = None
+    ) -> None:
+        record = self.checkpoint_for_id(checkpoint_id)
+        if record is None:
+            self.send_safe(chat_id, "找不到這個歷史長片 ID，請重新開啟 /history。")
+            return
+        path, payload = record
+        next_index = int(payload.get("next_segment_index", 1))
+        total_segments = int(payload.get("segment_total", 0))
+        total_seconds = float(payload.get("total_seconds", 0.0))
+        video_paths = self._checkpoint_video_paths(payload)
+        config_payload = payload.get("config")
+        if not isinstance(config_payload, dict):
+            config_payload = {}
+        lines = [
+            "📼 歷史長片詳情",
+            f"ID：{self._checkpoint_id(path)}",
+            f"片長：{total_seconds:g} 秒",
+            f"分段：{max(0, next_index - 1)}/{total_segments}",
+            f"解析度：{config_payload.get('width', '?')}×{config_payload.get('height', '?')}",
+            f"目前狀態：{self.checkpoint_status_text(payload)}",
+            f"可用影片分段：{len(video_paths)}",
+        ]
+        if payload.get("last_context_latent_path"):
+            lines.append("連貫資料：影片尾端 + Motion Context latent")
+        else:
+            lines.append("連貫資料：影片尾幀／音訊參考")
+        rows: list[list[dict[str, str]]] = []
+        if next_index <= total_segments:
+            rows.append(
+                [
+                    {
+                        "text": f"🔁 從第 {next_index} 段繼續",
+                        "callback_data": f"long_resume:{checkpoint_id}",
+                    }
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    {
+                        "text": "📼 從這條影片延續新故事",
+                        "callback_data": f"long_extend:{checkpoint_id}",
+                    }
+                ]
+            )
+        rows.append([{"text": "↩️ 返回歷史列表", "callback_data": "history"}])
+        markup = {"inline_keyboard": rows}
+        text = "\n".join(lines)
+        if message_id is not None:
+            try:
+                self.telegram.edit_message_text(chat_id, message_id, text, reply_markup=markup)
+                self.menu_message_id = int(message_id)
+                return
+            except BotError:
+                self.menu_message_id = None
+        try:
+            result = self.telegram.send_message(chat_id, text, reply_markup=markup)
+            if isinstance(result, dict) and result.get("message_id"):
+                self.menu_message_id = int(result["message_id"])
+        except BotError as exc:
+            self.send_safe(chat_id, f"歷史長片詳情更新失敗：{exc}")
+
+    def checkpoint_markup(self, path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+        checkpoint_id = self._checkpoint_id(path)
+        next_index = int(payload.get("next_segment_index", 1))
+        total = int(payload.get("segment_total", 0))
+        status = str(payload.get("status", "failed"))
+        rows: list[list[dict[str, str]]] = []
+        if next_index <= total:
+            rows.append(
+                [
+                    {
+                        "text": f"🔁 從第 {next_index} 鏡繼續",
+                        "callback_data": f"long_resume:{checkpoint_id}",
+                    }
+                ]
+            )
+        if next_index > total and status in {
+            "completed",
+            "failed",
+            "running",
+            "cancelled",
+        }:
+            rows.append(
+                [
+                    {
+                        "text": "📼 延續上一條長片",
+                        "callback_data": f"long_extend:{checkpoint_id}",
+                    }
+                ]
+            )
+        return {"inline_keyboard": rows}
+
+    def send_checkpoint_actions(
+        self, chat_id: str, path: Path, payload: dict[str, Any], notice: str = ""
+    ) -> None:
+        next_index = int(payload.get("next_segment_index", 1))
+        total = int(payload.get("segment_total", 0))
+        completed = max(0, next_index - 1)
+        if next_index <= total:
+            action_text = (
+                f"{notice}\n已保留長片前 {completed}/{total} 鏡。"
+                f"可以從第 {next_index} 鏡繼續，不會重做前面的鏡頭。"
+            ).strip()
+        else:
+            action_text = f"{notice}\n這條長片已完成，可以從尾部繼續新增內容。".strip()
+        try:
+            self.telegram.send_message(
+                chat_id,
+                action_text,
+                reply_markup=self.checkpoint_markup(path, payload),
+            )
+        except BotError as exc:
+            bot_log(f"checkpoint action message failed: {exc}")
+
+    def queue_text(self) -> str:
+        with self.lock:
+            items = list(self.story_queue)
+            active_job = self.job
+            pending_upscale = self.pending_upscale
+        lines = [
+            "🧾 故事生成排隊",
+            f"等待中的故事：{len(items)}/{MAX_QUEUE_ITEMS}",
+        ]
+        if active_job is not None:
+            lines.append("目前有一個故事正在生成，完成後會自動開始下一個。")
+        elif pending_upscale is not None:
+            lines.append("目前正在等你選擇上一條影片是否放大；選擇後才會開始下一個。")
+        elif items:
+            lines.append("按「▶️ 開始排隊」即可開始第一個故事。")
+        else:
+            lines.append("排隊是空的。可以一次貼上多個故事，使用獨立一行的 --- 分隔。")
+        for index, item in enumerate(items, start=1):
+            preview = " ".join(item.prompt.split()).replace("---", "-")
+            if len(preview) > 90:
+                preview = preview[:87] + "..."
+            lines.append(
+                f"{index}. {item.item_id} | {item.total_seconds:g}s | "
+                f"{item.config.width}×{item.config.height} | {preview}"
+            )
+        return "\n".join(lines)
+
+    def queue_markup(self) -> dict[str, Any]:
+        with self.lock:
+            items = list(self.story_queue)
+        rows: list[list[dict[str, str]]] = []
+        for index, item in enumerate(items, start=1):
+            rows.append(
+                [
+                    {
+                        "text": f"❌ 移除第 {index} 個 ({item.item_id})",
+                        "callback_data": f"queue_remove:{item.item_id}",
+                    }
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    {"text": "➕ 加入故事", "callback_data": "queue_add"},
+                    {"text": "▶️ 開始排隊", "callback_data": "queue_start"},
+                ],
+                [
+                    {"text": "🗑 清空排隊", "callback_data": "queue_clear"},
+                    {"text": "↩️ 返回控制面板", "callback_data": "history_back"},
+                ],
+            ]
+        )
+        return {"inline_keyboard": rows}
+
+    def show_queue(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        text = self.queue_text()
+        markup = self.queue_markup()
+        if message_id is not None:
+            try:
+                self.telegram.edit_message_text(chat_id, message_id, text, reply_markup=markup)
+                self.menu_message_id = int(message_id)
+                return
+            except BotError:
+                self.menu_message_id = None
+        try:
+            result = self.telegram.send_message(chat_id, text, reply_markup=markup)
+            if isinstance(result, dict) and result.get("message_id"):
+                self.menu_message_id = int(result["message_id"])
+        except BotError as exc:
+            self.send_safe(chat_id, f"排隊列表更新失敗：{exc}")
+
+    def request_queue_prompt(self, chat_id: str) -> None:
+        self.awaiting_queue_prompt = True
+        self.awaiting_prompt = False
+        self.awaiting_duration = False
+        self.awaiting_extension_duration = False
+        self.awaiting_extension_prompt = False
+        self.telegram.send_message(
+            chat_id,
+            "請貼上要排隊的故事提示詞。\n"
+            "一次輸入多個故事時，請用獨立一行的 --- 分隔；每個故事會使用目前的解析度、steps 和片長設定。",
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "故事 1...\n---\n故事 2...",
+            },
+        )
+
+    def enqueue_story_prompts(self, chat_id: str, text: str) -> None:
+        prompts = split_story_queue_prompts(text)
+        if not prompts:
+            self.send_safe(chat_id, "提示詞不可為空白。")
+            return
+        with self.lock:
+            available = max(0, MAX_QUEUE_ITEMS - len(self.story_queue))
+        if available <= 0:
+            self.send_safe(chat_id, f"排隊已達上限 {MAX_QUEUE_ITEMS} 個，請先移除或清空。")
+            return
+        prompts = prompts[:available]
+        config = self.effective_config()
+        total_seconds = self.total_seconds
+        input_image_path = (
+            self.image_path
+            if self.input_mode == "image" and self.image_path and self.image_path.is_file()
+            else None
+        )
+        new_items = [
+            QueuedStory(
+                item_id=f"q_{secrets.token_hex(4)}",
+                prompt=prompt,
+                config=config,
+                total_seconds=total_seconds,
+                input_image_path=input_image_path,
+            )
+            for prompt in prompts
+        ]
+        with self.lock:
+            self.story_queue.extend(new_items)
+        self.save_story_queue()
+        self.send_safe(
+            chat_id,
+            f"已加入 {len(new_items)} 個故事；目前排隊 {len(self.story_queue)} 個。"
+            + (f"（最多只能再加入 {available} 個，本次已截取前 {available} 個。）" if len(split_story_queue_prompts(text)) > available else ""),
+        )
+        self.awaiting_queue_prompt = False
+        self.start_next_queued_story(chat_id)
+        self.show_queue(chat_id)
+
+    def start_next_queued_story(self, chat_id: str) -> bool:
+        with self.lock:
+            if (
+                self.job is not None
+                or self.pending_upscale is not None
+                or self._queue_starting
+                or not self.story_queue
+            ):
+                return False
+            item = self.story_queue.pop(0)
+            self._queue_starting = True
+        self.save_story_queue()
+        started = False
+        try:
+            self.prompt = item.prompt
+            self.settings = item.config
+            self.total_seconds = item.total_seconds
+            self.save_settings()
+            if item.total_seconds > MAX_SEGMENT_SECONDS:
+                started = self.start_long_generation(
+                    chat_id,
+                    item.config,
+                    item.prompt,
+                    item.total_seconds,
+                    input_image_path=item.input_image_path,
+                )
+            else:
+                started = self.start_generation(
+                    chat_id,
+                    item.config,
+                    item.prompt,
+                    input_image_path=item.input_image_path,
+                )
+        except Exception as exc:
+            self.send_safe(chat_id, f"排隊故事啟動失敗：{exc}")
+        finally:
+            with self.lock:
+                self._queue_starting = False
+        if not started:
+            with self.lock:
+                self.story_queue.insert(0, item)
+            self.save_story_queue()
+            return False
+        with self.lock:
+            remaining = len(self.story_queue)
+        self.send_safe(
+            chat_id,
+            f"▶️ 排隊故事 {item.item_id} 已開始。剩餘 {remaining} 個，完成後自動接續。",
+        )
+        return True
+
+    def clear_story_queue(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        with self.lock:
+            removed = len(self.story_queue)
+            self.story_queue.clear()
+        self.save_story_queue()
+        self.show_queue(chat_id, message_id)
+        self.send_safe(chat_id, f"已清空排隊，移除 {removed} 個等待中的故事。")
+
+    def remove_queued_story(
+        self, chat_id: str, item_id: str, message_id: Optional[int] = None
+    ) -> None:
+        with self.lock:
+            before = len(self.story_queue)
+            self.story_queue = [item for item in self.story_queue if item.item_id != item_id]
+            removed = before - len(self.story_queue)
+        self.save_story_queue()
+        self.show_queue(chat_id, message_id)
+        self.send_safe(chat_id, f"已移除 {item_id}。" if removed else "找不到這個排隊項目。")
+
+    def on_job_finished(self, chat_id: str) -> None:
+        self.start_next_queued_story(chat_id)
 
     def update_settings(
         self,
@@ -2920,6 +4093,14 @@ class TelegramMenuBot(TelegramTurboBot):
         ]
         with self.lock:
             active_job = self.job
+        checkpoint_rows: list[list[dict[str, str]]] = []
+        if active_job is None:
+            checkpoint_record = self.latest_long_checkpoint()
+            if checkpoint_record is not None:
+                checkpoint_path, checkpoint_payload = checkpoint_record
+                checkpoint_rows = self.checkpoint_markup(
+                    checkpoint_path, checkpoint_payload
+                ).get("inline_keyboard", [])
         if active_job is not None and active_job.pause_requested.is_set():
             pause_button = {"text": "⏸ 暫停中", "callback_data": "job_pause"}
         else:
@@ -2961,7 +4142,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 long_seconds_row[8:],
                 custom_seconds_row,
                 [{"text": "🖼 解析度／MP（按下選擇）", "callback_data": "noop"}],
-                resolution_row,
+                resolution_row[:3],
+                resolution_row[3:],
                 [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
                 steps_row,
                 [
@@ -2972,6 +4154,11 @@ class TelegramMenuBot(TelegramTurboBot):
                 [
                     {"text": "🚀 生成影片", "callback_data": "generate"},
                     {"text": "♻️ 讀取上次設定", "callback_data": "last"},
+                ],
+                *checkpoint_rows,
+                [
+                    {"text": "📚 歷史長片", "callback_data": "history"},
+                    {"text": "🧾 故事排隊", "callback_data": "queue_view"},
                 ],
                 job_control_row,
                 shutdown_row,
@@ -2984,6 +4171,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "🔄 重啟 ComfyUI", "callback_data": "comfy_restart"},
                     {"text": "⏹ 關閉 ComfyUI", "callback_data": "comfy_stop"},
                 ],
+                [{"text": "🔄 重啟 Bot", "callback_data": "bot_restart"}],
                 [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
             ]
         }
@@ -3089,7 +4277,19 @@ class TelegramMenuBot(TelegramTurboBot):
             else:
                 was_paused = False
         if job is None:
-            self.show_menu(chat_id, message_id, "目前沒有生成中的任務")
+            record = self.latest_long_checkpoint()
+            if record is not None:
+                checkpoint_path, checkpoint_payload = record
+                if int(checkpoint_payload.get("next_segment_index", 1)) <= int(
+                    checkpoint_payload.get("segment_total", 0)
+                ):
+                    self.resume_long_checkpoint(
+                        chat_id,
+                        self._checkpoint_id(checkpoint_path),
+                        message_id,
+                    )
+                    return
+            self.show_menu(chat_id, message_id, "目前沒有可繼續的生成任務")
             return
         if job.segment_total <= 1:
             self.send_safe(chat_id, "單段影片沒有暫停狀態。")
@@ -3099,7 +4299,7 @@ class TelegramMenuBot(TelegramTurboBot):
             self.send_safe(chat_id, "目前任務沒有暫停，會繼續生成。")
         self.show_menu(chat_id, message_id)
 
-    def start_selected_generation(self, chat_id: str, prompt: str) -> None:
+    def start_selected_generation(self, chat_id: str, prompt: str) -> bool:
         config = self.effective_config()
         input_image_path = (
             self.image_path
@@ -3107,7 +4307,7 @@ class TelegramMenuBot(TelegramTurboBot):
             else None
         )
         if self.total_seconds > MAX_SEGMENT_SECONDS:
-            self.start_long_generation(
+            return self.start_long_generation(
                 chat_id,
                 config,
                 prompt,
@@ -3115,7 +4315,262 @@ class TelegramMenuBot(TelegramTurboBot):
                 input_image_path=input_image_path,
             )
         else:
-            self.start_generation(chat_id, config, prompt, input_image_path=input_image_path)
+            return self.start_generation(chat_id, config, prompt, input_image_path=input_image_path)
+
+    def resume_long_checkpoint(
+        self,
+        chat_id: str,
+        checkpoint_id: Optional[str] = None,
+        message_id: Optional[int] = None,
+    ) -> None:
+        """Resume the first unfinished shot from a persistent long-job checkpoint."""
+        record = (
+            self.checkpoint_for_id(checkpoint_id)
+            if checkpoint_id
+            else self.latest_long_checkpoint()
+        )
+        if record is None:
+            self.send_safe(chat_id, "目前找不到可恢復的長片檢查點。")
+            self.show_menu(chat_id, message_id)
+            return
+        path, payload = record
+        next_index = int(payload.get("next_segment_index", 1))
+        total = int(payload.get("segment_total", 0))
+        if next_index > total:
+            self.send_safe(chat_id, "這條長片已完成；請使用「📼 延續上一條長片」新增內容。")
+            self.show_menu(chat_id, message_id)
+            return
+        with self.lock:
+            if self.job is not None:
+                self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或按「⛔ 中止」。")
+                return
+        try:
+            config = self._checkpoint_config(payload)
+            shots = self._checkpoint_shots(payload)
+            video_paths = self._checkpoint_video_paths(payload)
+            if len(video_paths) != next_index - 1 or not video_paths:
+                raise BotError("檢查點的已完成鏡頭數量不一致。")
+            missing = [str(video_path) for video_path in video_paths if not video_path.is_file()]
+            if missing:
+                raise BotError(f"找不到已完成鏡頭：{missing[-1]}")
+            last_latent = str(payload.get("last_context_latent_path", "")).strip() or None
+            motion_context = bool(payload.get("motion_context_enabled")) and bool(last_latent)
+            job = JobState(
+                chat_id=chat_id,
+                config=config,
+                prompt=str(payload.get("prompt", "")),
+                started_at=time.time(),
+                output_prefix=str(payload["output_prefix"]),
+                long_base_prefix=str(payload["output_prefix"]),
+                checkpoint_path=path,
+                base_config=config,
+                segment_total=len(shots),
+                total_seconds=float(payload["total_seconds"]),
+                shot_plan=shots,
+                story_global_text=str(payload.get("story_global_text", "")),
+                resume_from_segment=next_index,
+                completed_video_paths=list(video_paths),
+                initial_context_video_path=video_paths[-1],
+                initial_context_latent_path=last_latent if motion_context else None,
+                resume_motion_context=motion_context,
+            )
+            job.resume_event.set()
+        except (BotError, KeyError, TypeError, ValueError) as exc:
+            self.send_safe(chat_id, f"無法恢復長片：{exc}")
+            self.show_menu(chat_id, message_id)
+            return
+        with self.lock:
+            self.job = job
+        self.touch_comfy_activity()
+        self.send_safe(
+            chat_id,
+            f"已恢復長片檢查點：保留前 {next_index - 1}/{total} 鏡，"
+            f"接下來從第 {next_index} 鏡繼續。\n"
+            "會先要求 ComfyUI 釋放暫存顯存，再重新上傳上一鏡作為接續來源。",
+        )
+        thread = threading.Thread(
+            target=self.run_long_job,
+            args=(job,),
+            name="minimax-long-resume",
+            daemon=True,
+        )
+        thread.start()
+        self.show_menu(chat_id, message_id, "已送出長片恢復工作")
+
+    def request_extension_duration(
+        self,
+        chat_id: str,
+        checkpoint_id: Optional[str] = None,
+        message_id: Optional[int] = None,
+    ) -> None:
+        record = (
+            self.checkpoint_for_id(checkpoint_id)
+            if checkpoint_id
+            else self.latest_long_checkpoint()
+        )
+        if record is None:
+            self.send_safe(chat_id, "目前找不到可以延續的完整長片。")
+            return
+        path, payload = record
+        if str(payload.get("status", "")) != "completed" and int(
+            payload.get("next_segment_index", 1)
+        ) <= int(payload.get("segment_total", 0)):
+            self.send_checkpoint_actions(chat_id, path, payload, "這條長片還未全部完成")
+            return
+        self.extension_checkpoint_id = self._checkpoint_id(path)
+        self.awaiting_extension_duration = True
+        self.awaiting_extension_prompt = False
+        self.awaiting_duration = False
+        self.awaiting_prompt = False
+        self.telegram.send_message(
+            chat_id,
+            "請輸入要在原片尾端新增的秒數（2 至 1800），例如 15、30 或 60。",
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "例如 30",
+            },
+        )
+        self.show_menu(chat_id, message_id)
+
+    def request_extension_prompt(self, chat_id: str) -> None:
+        if self.extension_seconds is None or not self.extension_checkpoint_id:
+            self.request_extension_duration(chat_id, self.extension_checkpoint_id)
+            return
+        self.awaiting_extension_duration = False
+        self.awaiting_extension_prompt = True
+        self.awaiting_prompt = False
+        self.awaiting_duration = False
+        self.telegram.send_message(
+            chat_id,
+            "請貼上尾端延續的提示詞。若新增超過 15 秒，請用時間軸或 SEGMENT 1／SEGMENT 2 分段。",
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "例如：她走出門口，鏡頭繼續向前推進",
+            },
+        )
+
+    def start_extension_generation(
+        self,
+        chat_id: str,
+        checkpoint_id: str,
+        extra_seconds: float,
+        prompt: str,
+    ) -> None:
+        record = self.checkpoint_for_id(checkpoint_id)
+        if record is None:
+            self.send_safe(chat_id, "找不到原長片檢查點，請重新按 /extend。")
+            return
+        path, payload = record
+        if str(payload.get("status", "")) != "completed" and int(
+            payload.get("next_segment_index", 1)
+        ) <= int(payload.get("segment_total", 0)):
+            self.send_checkpoint_actions(chat_id, path, payload, "原長片尚未完成")
+            return
+        try:
+            extra_seconds = validate_total_seconds(extra_seconds)
+            old_total = float(payload["total_seconds"])
+            total_seconds = old_total + extra_seconds
+            if total_seconds > MAX_TOTAL_SECONDS:
+                raise BotError(f"延續後總片長不可超過 {MAX_TOTAL_SECONDS:g} 秒。")
+            old_shots = self._checkpoint_shots(payload)
+            old_paths = self._checkpoint_video_paths(payload)
+            if len(old_paths) != len(old_shots):
+                raise BotError("原長片的鏡頭檔案不完整，不能直接延續。")
+            missing = [str(video_path) for video_path in old_paths if not video_path.is_file()]
+            if missing:
+                raise BotError(f"找不到原長片影片：{missing[-1]}")
+            prompt = prompt.strip()
+            if not prompt:
+                raise BotError("延續提示詞不可為空白。")
+            try:
+                extension_plan = build_long_video_plan(prompt, extra_seconds)
+            except BotError:
+                if extra_seconds > MAX_SEGMENT_SECONDS:
+                    raise
+                extension_plan = LongVideoPlan(
+                    "",
+                    tuple(
+                        split_scene_into_shots(
+                            TimelineScene(0.0, extra_seconds, "延續", prompt)
+                        )
+                    ),
+                    "extension",
+                )
+            offset_shots = tuple(
+                ShotSpec(
+                    round(shot.start_seconds + old_total, 3),
+                    round(shot.end_seconds + old_total, 3),
+                    shot.label,
+                    shot.action,
+                )
+                for shot in extension_plan.shots
+            )
+            combined_shots = old_shots + offset_shots
+            combined_global = "\n\n".join(
+                part
+                for part in (
+                    str(payload.get("story_global_text", "")).strip(),
+                    extension_plan.global_text.strip(),
+                )
+                if part
+            )
+            config = self._checkpoint_config(payload)
+            last_latent = str(payload.get("last_context_latent_path", "")).strip() or None
+            motion_context = bool(payload.get("motion_context_enabled")) and bool(last_latent)
+            extension_prefix = (
+                f"{payload['output_prefix']}/extension_{uuid.uuid4().hex[:12]}"
+            )
+            job = JobState(
+                chat_id=chat_id,
+                config=config,
+                prompt=prompt,
+                started_at=time.time(),
+                output_prefix=extension_prefix,
+                long_base_prefix=extension_prefix,
+                base_config=config,
+                checkpoint_path=LONG_CHECKPOINT_DIR / f"{Path(extension_prefix).name}.json",
+                segment_total=len(combined_shots),
+                total_seconds=total_seconds,
+                shot_plan=combined_shots,
+                story_global_text=combined_global,
+                resume_from_segment=len(old_paths) + 1,
+                completed_video_paths=list(old_paths),
+                initial_context_video_path=old_paths[-1],
+                initial_context_latent_path=last_latent if motion_context else None,
+                resume_motion_context=motion_context,
+            )
+            job.resume_event.set()
+            self.save_long_checkpoint(
+                job,
+                old_paths,
+                len(old_paths) + 1,
+                motion_context,
+                f"{extension_prefix}/motion_context/latent" if motion_context else None,
+                last_latent,
+                status="running",
+            )
+        except (BotError, KeyError, TypeError, ValueError) as exc:
+            self.send_safe(chat_id, f"無法延續長片：{exc}")
+            return
+        with self.lock:
+            if self.job is not None:
+                self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或按「⛔ 中止」。")
+                return
+            self.job = job
+        self.touch_comfy_activity()
+        self.send_safe(
+            chat_id,
+            f"已從原片尾端延續 {extra_seconds:g} 秒；原片 {old_total:g} 秒會保留，"
+            f"完成後回傳合併的新影片（總長約 {total_seconds:g} 秒）。",
+        )
+        thread = threading.Thread(
+            target=self.run_long_job,
+            args=(job,),
+            name="minimax-long-extension",
+            daemon=True,
+        )
+        thread.start()
+        self.show_menu(chat_id, notice="已送出長片延續工作")
 
     def start_long_generation(
         self,
@@ -3124,26 +4579,26 @@ class TelegramMenuBot(TelegramTurboBot):
         prompt: str,
         total_seconds: float,
         input_image_path: Optional[Path] = None,
-    ) -> None:
+    ) -> bool:
         prompt = prompt.strip()
         if not prompt:
             self.send_safe(chat_id, "提示詞不可為空白。")
-            return
+            return False
         total_seconds = validate_total_seconds(total_seconds)
         try:
             plan = build_long_video_plan(prompt, total_seconds)
         except BotError as exc:
             self.send_safe(chat_id, f"長片時間軸格式錯誤：{exc}")
-            return
+            return False
         segment_total = len(plan.shots)
         if segment_total < 2:
             self.send_safe(chat_id, "長片時間軸至少需要兩個鏡頭。")
-            return
+            return False
         batch_prefix = f"{OUTPUT_PREFIX}/long_{uuid.uuid4().hex[:12]}"
         with self.lock:
             if self.job:
                 self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或使用 /cancel。")
-                return
+                return False
             job = JobState(
                 chat_id,
                 config,
@@ -3156,9 +4611,23 @@ class TelegramMenuBot(TelegramTurboBot):
                 shot_plan=plan.shots,
                 story_global_text=plan.global_text,
                 input_image_path=input_image_path,
+                base_config=config,
+                long_base_prefix=batch_prefix,
+                checkpoint_path=LONG_CHECKPOINT_DIR
+                / f"{Path(batch_prefix).name}.json",
             )
             job.resume_event.set()
             self.job = job
+        self.touch_comfy_activity()
+        self.save_long_checkpoint(
+            job,
+            [],
+            1,
+            False,
+            None,
+            None,
+            status="running",
+        )
         format_text = "自然時間軸" if plan.source_format == "timeline" else "SEGMENT 分段"
         self.send_safe(
             chat_id,
@@ -3168,6 +4637,7 @@ class TelegramMenuBot(TelegramTurboBot):
         )
         thread = threading.Thread(target=self.run_long_job, args=(job,), daemon=True)
         thread.start()
+        return True
 
     def send_partial_long_result(
         self,
@@ -3247,32 +4717,48 @@ class TelegramMenuBot(TelegramTurboBot):
                 job.config.height,
                 completed_seconds,
             )
-            print(f"partial long job sent: {output_path}", flush=True)
+            bot_log(f"partial long job sent {output_path}")
             return output_path
         except Exception as exc:
-            print(f"partial long job merge error: {exc}", flush=True)
+            bot_log(f"partial long job merge error: {exc}")
             self.send_safe(job.chat_id, f"已中止，但部分影片合成失敗：{exc}")
             return None
 
     def run_long_job(self, job: JobState) -> None:
+        bot_log(
+            f"long job start {job.total_seconds:.0f}s "
+            f"{job.segment_total} segments {job.config.width}x{job.config.height} "
+            f"steps={job.config.steps}"
+        )
         partial_reported = False
-        video_paths: list[Path] = []
-        base_prefix = job.output_prefix
+        video_paths: list[Path] = list(job.completed_video_paths)
+        base_prefix = job.long_base_prefix or job.output_prefix
 
         def report_partial() -> None:
             nonlocal partial_reported
             if partial_reported:
                 return
             partial_reported = True
+            self.mark_long_checkpoint(job, "cancelled")
             self.send_partial_long_result(job, video_paths, base_prefix)
 
         try:
             self.ensure_comfyui_ready(job)
-            base_config = job.config
-            motion_context_enabled = (
-                LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
-                and motion_context_nodes_available()
-            )
+            base_config = job.base_config or job.config
+            if job.resume_from_segment > 1 or job.initial_context_video_path is not None:
+                try:
+                    comfy_post("/free", {"unload_models": True, "free_memory": True})
+                except BotError as exc:
+                    bot_log(f"ComfyUI memory release before long resume unavailable: {exc}")
+            if job.resume_motion_context is None:
+                motion_context_enabled = (
+                    LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
+                    and motion_context_nodes_available()
+                )
+            else:
+                motion_context_enabled = bool(job.resume_motion_context)
+                if motion_context_enabled and not motion_context_nodes_available():
+                    motion_context_enabled = False
             if LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}:
                 if motion_context_enabled:
                     self.send_safe(
@@ -3292,12 +4778,42 @@ class TelegramMenuBot(TelegramTurboBot):
                 if motion_context_enabled
                 else None
             )
+            if job.initial_context_video_path is not None:
+                if not job.initial_context_video_path.is_file():
+                    raise BotError(
+                        f"找不到接續來源影片：{job.initial_context_video_path}"
+                    )
+                if motion_context_enabled:
+                    context_video_name = upload_video_to_comfy(
+                        job.initial_context_video_path
+                    )
+                    context_latent_path = job.initial_context_latent_path
+                    if not context_latent_path:
+                        motion_context_enabled = False
+                        latent_prefix = None
+                        context_video_name = None
+                        self.send_safe(
+                            job.chat_id,
+                            "上一鏡沒有可用的 AV latent，這次改用尾幀＋音訊參考接續。",
+                        )
+                if not motion_context_enabled:
+                    job.audio_reference_name = upload_audio_to_comfy(
+                        job.initial_context_video_path
+                    )
+                    continuation_path = (
+                        CONTINUATION_DIR
+                        / f"{uuid.uuid4().hex}_resume_segment.png"
+                    )
+                    job.continuation_image_path = extract_last_frame(
+                        job.initial_context_video_path, continuation_path
+                    )
             if job.input_image_path is not None:
                 self.send_safe(
                     job.chat_id,
                     "圖片長片會把圖片用作第一鏡首幀，後續鏡頭使用上一鏡尾幀接續。",
                 )
-            for index in range(1, job.segment_total + 1):
+            start_index = max(1, int(job.resume_from_segment))
+            for index in range(start_index, job.segment_total + 1):
                 if not self.wait_for_resume(job):
                     report_partial()
                     return
@@ -3311,7 +4827,9 @@ class TelegramMenuBot(TelegramTurboBot):
                 generation_seconds = shot.duration
                 if index < job.segment_total:
                     generation_seconds += SHOT_TRANSITION_SECONDS
-                use_motion_context = motion_context_enabled and index > 1
+                use_motion_context = motion_context_enabled and (
+                    index > 1 or job.initial_context_video_path is not None
+                )
                 if use_motion_context:
                     # Motion Context pins a 22-frame head which is trimmed from
                     # the decoded result. Generate that head plus the requested
@@ -3342,14 +4860,27 @@ class TelegramMenuBot(TelegramTurboBot):
                     save_latent_clip_index=index if latent_prefix else None,
                 )
                 video_paths.append(video_path)
+                job.completed_video_paths = list(video_paths)
+                next_context_latent_path = (
+                    f"{latent_prefix}_{index:05d}.safetensors"
+                    if latent_prefix
+                    else None
+                )
                 if index < job.segment_total:
                     if motion_context_enabled:
-                        # The next graph reads the previous MP4 and loads this
-                        # segment's paired AV latent.
-                        context_video_name = upload_video_to_comfy(video_path)
-                        context_latent_path = (
-                            f"{latent_prefix}_{index:05d}.safetensors"
+                        # Persist before uploading the next context. If upload
+                        # or the next sample fails, the MP4 and latent are still
+                        # enough to restart from this exact boundary.
+                        context_latent_path = next_context_latent_path
+                        self.save_long_checkpoint(
+                            job,
+                            video_paths,
+                            index + 1,
+                            motion_context_enabled,
+                            latent_prefix,
+                            context_latent_path,
                         )
+                        context_video_name = upload_video_to_comfy(video_path)
                     else:
                         # Keep the immediate previous segment as the stable
                         # reference instead of always reusing segment 1.
@@ -3367,7 +4898,25 @@ class TelegramMenuBot(TelegramTurboBot):
                                 previous_frame.unlink()
                             except OSError:
                                 pass
+                        self.save_long_checkpoint(
+                            job,
+                            video_paths,
+                            index + 1,
+                            motion_context_enabled,
+                            latent_prefix,
+                            None,
+                        )
+                else:
+                    self.save_long_checkpoint(
+                        job,
+                        video_paths,
+                        index + 1,
+                        motion_context_enabled,
+                        latent_prefix,
+                        next_context_latent_path,
+                    )
                 self.send_safe(job.chat_id, f"長片鏡頭 {index}/{job.segment_total} 完成。")
+                bot_log(f"segment {index}/{job.segment_total} done {video_path}")
 
             if job.cancel_event.is_set():
                 report_partial()
@@ -3385,6 +4934,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 job.total_seconds,
                 shot_plan=job.shot_plan,
             )
+            self.mark_long_checkpoint(job, "completed")
             with job.progress_lock:
                 job.progress_phase = "uploading"
             caption = (
@@ -3410,13 +4960,26 @@ class TelegramMenuBot(TelegramTurboBot):
                 job.total_seconds,
                 shutdown_after_choice=True,
             )
+            bot_log(f"long job done {output_path}")
         except Exception as exc:
             if job.cancel_event.is_set():
                 report_partial()
             else:
                 self.send_safe(job.chat_id, f"長片生成失敗：{exc}")
+                self.mark_long_checkpoint(job, "failed", str(exc))
+                if job.checkpoint_path:
+                    payload = self._read_checkpoint_payload(job.checkpoint_path)
+                    if payload is not None:
+                        self.send_checkpoint_actions(
+                            job.chat_id,
+                            job.checkpoint_path,
+                            payload,
+                            "已保存恢復檢查點",
+                        )
+            bot_log(f"long job error: {exc}")
             print(f"long generation error: {exc}", flush=True)
         finally:
+            self.touch_comfy_activity()
             if job.continuation_image_path:
                 try:
                     job.continuation_image_path.unlink()
@@ -3425,6 +4988,7 @@ class TelegramMenuBot(TelegramTurboBot):
             with self.lock:
                 if self.job is job:
                     self.job = None
+            self.on_job_finished(job.chat_id)
 
     def menu_text(self, notice: str = "") -> str:
         current = self.settings
@@ -3450,6 +5014,8 @@ class TelegramMenuBot(TelegramTurboBot):
             shutdown_text = "完成後關機：關閉"
         with self.lock:
             active_job = self.job
+            queue_count = len(self.story_queue)
+            pending_upscale = self.pending_upscale is not None
         if active_job is None:
             job_text = "當前任務：無"
         elif active_job.pause_requested.is_set():
@@ -3461,6 +5027,15 @@ class TelegramMenuBot(TelegramTurboBot):
             )
         else:
             job_text = "當前任務：生成中"
+        queue_text = f"故事排隊：{queue_count} 個等待中"
+        if pending_upscale and queue_count:
+            queue_text += "（等待放大選擇後接續）"
+        if COMFY_IDLE_SHUTDOWN_SECONDS > 0:
+            idle_shutdown_text = (
+                f"{COMFY_IDLE_SHUTDOWN_SECONDS / 60:g} 分鐘無任務自動關閉"
+            )
+        else:
+            idle_shutdown_text = "已關閉"
         menu = (
             f"{prefix}MiniMax H3 Turbo 控制面板\n\n"
             f"模式：{mode_text}\n"
@@ -3469,8 +5044,10 @@ class TelegramMenuBot(TelegramTurboBot):
             f"步數：{current.steps}\n"
                 f"{duration_text}\n"
                 f"ComfyUI 顯存模式：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"
+            f"ComfyUI 閒置關閉：{idle_shutdown_text}\n"
             f"{shutdown_text}\n"
             f"{job_text}\n"
+            f"{queue_text}\n"
             f"提示詞：{prompt_status}\n\n"
             "圖片模式：先發圖片，再輸入提示詞；文字模式：直接輸入提示詞。\n"
             "最後按「生成影片」。\n"
@@ -3482,6 +5059,14 @@ class TelegramMenuBot(TelegramTurboBot):
         self, chat_id: str, pending: PendingUpscale
     ) -> None:
         if not pending.shutdown_after_choice or not self.shutdown_after_generation:
+            return
+        with self.lock:
+            queued_count = len(self.story_queue)
+        if queued_count:
+            self.send_safe(
+                chat_id,
+                f"排隊還有 {queued_count} 個故事，已跳過這次自動關機；全部完成後再自行關閉 ComfyUI。",
+            )
             return
         with self.lock:
             if self._shutdown_pending:
@@ -3612,6 +5197,7 @@ class TelegramMenuBot(TelegramTurboBot):
     def request_duration(self, chat_id: str) -> None:
         self.awaiting_duration = True
         self.awaiting_prompt = False
+        self.awaiting_queue_prompt = False
         self.telegram.send_message(
             chat_id,
             "請輸入總片長秒數（2 至 1800），例如 37、180、600 或 1800。",
@@ -3624,6 +5210,7 @@ class TelegramMenuBot(TelegramTurboBot):
     def request_prompt(self, chat_id: str) -> None:
         self.awaiting_duration = False
         self.awaiting_prompt = True
+        self.awaiting_queue_prompt = False
         self.telegram.send_message(
             chat_id,
             "請下一則訊息貼上提示詞，可以是多行文字。完成後回到面板按「生成影片」。",
@@ -3642,13 +5229,16 @@ class TelegramMenuBot(TelegramTurboBot):
 
     def ensure_comfyui_ready(self, job: JobState) -> None:
         if comfyui_is_online():
+            self.touch_comfy_activity()
             return
         self.send_safe(job.chat_id, start_comfyui_process(self.comfyui_vram_mode()))
+        self.touch_comfy_activity()
         deadline = time.time() + 180
         while time.time() < deadline:
             if job.cancel_event.is_set():
                 return
             if comfyui_is_online():
+                self.touch_comfy_activity()
                 self.send_safe(job.chat_id, "ComfyUI 已就緒，開始送出影片工作。")
                 return
             time.sleep(3)
@@ -3717,6 +5307,39 @@ class TelegramMenuBot(TelegramTurboBot):
         text = str(message.get("text", "")).strip()
         if not text:
             return
+        if self.awaiting_extension_duration and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            try:
+                self.extension_seconds = validate_total_seconds(float(text))
+                self.request_extension_prompt(chat_id)
+            except (BotError, ValueError) as exc:
+                self.send_safe(chat_id, str(exc))
+            return
+        if self.awaiting_extension_prompt and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            checkpoint_id = self.extension_checkpoint_id
+            extension_seconds = self.extension_seconds
+            self.awaiting_extension_prompt = False
+            if checkpoint_id and extension_seconds is not None:
+                self.start_extension_generation(
+                    chat_id,
+                    checkpoint_id,
+                    extension_seconds,
+                    text,
+                )
+            else:
+                self.send_safe(chat_id, "延續設定已過期，請重新按 /extend。")
+            return
+        if self.awaiting_queue_prompt and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            self.enqueue_story_prompts(chat_id, text)
+            return
         if self.awaiting_duration and text.lower() != "/cancel":
             if text.startswith("/"):
                 self.handle_command(chat_id, text)
@@ -3769,6 +5392,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.pending_upscale = None
             self.send_safe(chat_id, "已保留原片，不進行放大。")
             self.finalize_upscale_choice(chat_id, pending)
+            self.start_next_queued_story(chat_id)
             self.show_menu(chat_id, message_id)
             return
         if choice == "1080":
@@ -3847,6 +5471,55 @@ class TelegramMenuBot(TelegramTurboBot):
                 return
             if data == "progress":
                 self.show_progress(chat_id, message_id)
+                return
+            if data.startswith("long_resume:"):
+                self.resume_long_checkpoint(
+                    chat_id,
+                    data.removeprefix("long_resume:"),
+                    message_id,
+                )
+                return
+            if data.startswith("long_extend:"):
+                self.request_extension_duration(
+                    chat_id,
+                    data.removeprefix("long_extend:"),
+                    message_id,
+                )
+                return
+            if data == "history":
+                self.show_history(chat_id, message_id)
+                return
+            if data == "history_back":
+                self.show_menu(chat_id, message_id)
+                return
+            if data.startswith("history_select:"):
+                self.show_checkpoint_detail(
+                    chat_id,
+                    data.removeprefix("history_select:"),
+                    message_id,
+                )
+                return
+            if data == "queue_view":
+                self.show_queue(chat_id, message_id)
+                return
+            if data == "queue_add":
+                self.request_queue_prompt(chat_id)
+                return
+            if data == "queue_start":
+                started = self.start_next_queued_story(chat_id)
+                if not started:
+                    self.send_safe(chat_id, "目前有任務、放大選擇，或排隊是空的；請稍後再試。")
+                self.show_queue(chat_id, message_id)
+                return
+            if data == "queue_clear":
+                self.clear_story_queue(chat_id, message_id)
+                return
+            if data.startswith("queue_remove:"):
+                self.remove_queued_story(
+                    chat_id,
+                    data.removeprefix("queue_remove:"),
+                    message_id,
+                )
                 return
             if data == "job_abort":
                 self.abort_current_job(chat_id, message_id)
@@ -3939,6 +5612,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.save_settings()
                 cancelled = self.cancel_job_for_comfy_control()
                 result = restart_comfyui_process(mode)
+                self.touch_comfy_activity()
                 prefix = "已取消目前生成工作。\n" if cancelled else ""
                 self.send_safe(
                     chat_id,
@@ -3949,7 +5623,9 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.show_menu(chat_id, message_id)
                 return
             if data == "comfy_start":
-                self.send_safe(chat_id, start_comfyui_process(self.comfyui_vram_mode()))
+                result = start_comfyui_process(self.comfyui_vram_mode())
+                self.touch_comfy_activity()
+                self.send_safe(chat_id, result)
                 return
             if data == "comfy_status":
                 self.send_safe(chat_id, self.comfy_status_text())
@@ -3957,6 +5633,7 @@ class TelegramMenuBot(TelegramTurboBot):
             if data == "comfy_restart":
                 cancelled = self.cancel_job_for_comfy_control()
                 result = restart_comfyui_process(self.comfyui_vram_mode())
+                self.touch_comfy_activity()
                 prefix = "目前生成已取消。\n" if cancelled else ""
                 self.send_safe(chat_id, prefix + result)
                 return
@@ -3965,6 +5642,9 @@ class TelegramMenuBot(TelegramTurboBot):
                 result = stop_comfyui_process()
                 prefix = "目前生成已取消。\n" if cancelled else ""
                 self.send_safe(chat_id, prefix + result)
+                return
+            if data == "bot_restart":
+                self.restart_bot(chat_id)
                 return
             if data == "generate":
                 if self.awaiting_duration:
@@ -3987,7 +5667,10 @@ class TelegramMenuBot(TelegramTurboBot):
         command = parts[0].split("@", 1)[0].lower()
 
         if command in {"/start", "/menu", "/help"}:
-            self.show_menu(chat_id, force_new=True)
+            try:
+                self.show_menu(chat_id, force_new=True)
+            except (BotError, ValueError) as exc:
+                self.send_safe(chat_id, str(exc))
             return
         if command == "/prompt":
             self.request_prompt(chat_id)
@@ -4007,7 +5690,9 @@ class TelegramMenuBot(TelegramTurboBot):
             return
         if command == "/comfy_start":
             try:
-                self.send_safe(chat_id, start_comfyui_process(self.comfyui_vram_mode()))
+                result = start_comfyui_process(self.comfyui_vram_mode())
+                self.touch_comfy_activity()
+                self.send_safe(chat_id, result)
             except BotError as exc:
                 self.send_safe(chat_id, str(exc))
             return
@@ -4015,6 +5700,7 @@ class TelegramMenuBot(TelegramTurboBot):
             try:
                 cancelled = self.cancel_job_for_comfy_control()
                 result = restart_comfyui_process(self.comfyui_vram_mode())
+                self.touch_comfy_activity()
                 prefix = "目前生成已取消。\n" if cancelled else ""
                 self.send_safe(chat_id, prefix + result)
             except BotError as exc:
@@ -4029,8 +5715,88 @@ class TelegramMenuBot(TelegramTurboBot):
             except BotError as exc:
                 self.send_safe(chat_id, str(exc))
             return
+        if command == "/bot_restart":
+            try:
+                self.restart_bot(chat_id)
+            except BotError as exc:
+                self.send_safe(chat_id, str(exc))
+            return
         if command == "/progress":
-            self.send_safe(chat_id, self.progress_text())
+            self.show_progress(chat_id)
+            return
+        if command == "/history":
+            self.show_history(chat_id)
+            return
+        if command in {"/queue", "/queue_view"}:
+            inline_prompt = " ".join(parts[1:]).strip()
+            if len(lines) > 1:
+                inline_prompt = (inline_prompt + "\n" + "\n".join(lines[1:])).strip()
+            if inline_prompt:
+                self.enqueue_story_prompts(chat_id, inline_prompt)
+            else:
+                self.show_queue(chat_id)
+            return
+        if command in {"/queue_add", "/add_story"}:
+            inline_prompt = " ".join(parts[1:]).strip()
+            if len(lines) > 1:
+                inline_prompt = (inline_prompt + "\n" + "\n".join(lines[1:])).strip()
+            if inline_prompt:
+                self.enqueue_story_prompts(chat_id, inline_prompt)
+            else:
+                self.request_queue_prompt(chat_id)
+            return
+        if command == "/queue_start":
+            started = self.start_next_queued_story(chat_id)
+            if not started:
+                self.send_safe(chat_id, "目前有任務、放大選擇，或排隊是空的；請稍後再試。")
+            self.show_queue(chat_id)
+            return
+        if command == "/queue_clear":
+            self.clear_story_queue(chat_id)
+            return
+        if command in {"/resume_long", "/resume_checkpoint"}:
+            checkpoint_id = parts[1] if len(parts) > 1 else None
+            self.resume_long_checkpoint(chat_id, checkpoint_id)
+            return
+        if command == "/extend":
+            if len(parts) < 2:
+                self.request_extension_duration(chat_id)
+                return
+            checkpoint_id: Optional[str] = None
+            seconds_index = 1
+            if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", parts[1]):
+                checkpoint_id = parts[1]
+                seconds_index = 2
+                if len(parts) < 3:
+                    self.request_extension_duration(chat_id, checkpoint_id)
+                    return
+            try:
+                extra_seconds = validate_total_seconds(float(parts[seconds_index]))
+            except (BotError, ValueError) as exc:
+                self.send_safe(chat_id, str(exc))
+                return
+            record = (
+                self.checkpoint_for_id(checkpoint_id)
+                if checkpoint_id
+                else self.latest_long_checkpoint()
+            )
+            if record is None:
+                self.send_safe(chat_id, "目前找不到可以延續的完整長片。")
+                return
+            self.extension_checkpoint_id = self._checkpoint_id(record[0])
+            self.extension_seconds = extra_seconds
+            inline_prompt = " ".join(parts[seconds_index + 1 :]).strip()
+            if len(lines) > 1:
+                inline_prompt = (inline_prompt + "\n" + "\n".join(lines[1:])).strip()
+            if inline_prompt:
+                self.start_extension_generation(
+                    chat_id,
+                    self.extension_checkpoint_id,
+                    extra_seconds,
+                    inline_prompt,
+                )
+            else:
+                self.request_extension_prompt(chat_id)
             return
         if command == "/pause":
             self.pause_current_job(chat_id)
@@ -4047,16 +5813,26 @@ class TelegramMenuBot(TelegramTurboBot):
         if command == "/status":
             with self.lock:
                 job = self.job
+                queue_count = len(self.story_queue)
             if job:
                 self.send_safe(chat_id, self.progress_text())
+            elif self.awaiting_queue_prompt:
+                self.send_safe(chat_id, "等待你貼上要排隊的故事提示詞。")
             elif self.awaiting_prompt:
                 self.send_safe(chat_id, "等待你貼上提示詞。")
+            elif queue_count:
+                self.show_queue(chat_id)
             else:
                 self.show_menu(chat_id)
             return
         if command == "/cancel":
             self.awaiting_prompt = False
             self.awaiting_duration = False
+            self.awaiting_extension_duration = False
+            self.awaiting_extension_prompt = False
+            self.awaiting_queue_prompt = False
+            self.extension_seconds = None
+            self.extension_checkpoint_id = None
             with self.lock:
                 has_job = self.job is not None
             if has_job:
@@ -4140,6 +5916,13 @@ class TelegramMenuBot(TelegramTurboBot):
             {"command": "cancel", "description": "中止目前生成"},
             {"command": "pause", "description": "暫停長片"},
             {"command": "resume", "description": "繼續長片"},
+            {"command": "resume_long", "description": "從檢查點續做長片"},
+            {"command": "extend", "description": "延續上一條長片"},
+            {"command": "history", "description": "查看歷史長片 ID"},
+            {"command": "queue", "description": "查看故事排隊"},
+            {"command": "queue_add", "description": "加入一個或多個故事"},
+            {"command": "queue_start", "description": "開始故事排隊"},
+            {"command": "queue_clear", "description": "清空故事排隊"},
             {"command": "temperature", "description": "查看電腦溫度"},
             {"command": "comfy_status", "description": "查看 ComfyUI 狀態"},
             {"command": "comfy_start", "description": "啟動 ComfyUI"},
@@ -4152,11 +5935,14 @@ class TelegramMenuBot(TelegramTurboBot):
             self.telegram.set_my_commands(commands)
             self.telegram.set_chat_menu_button(self.allowed_chat_id)
         except BotError as exc:
+            bot_log(f"Telegram menu setup failed: {exc}")
             print(f"Telegram menu setup failed: {exc}", flush=True)
 
     def run(self) -> None:
         self.configure_telegram_menu()
         self.show_menu(self.allowed_chat_id, notice="Turbo Telegram 控制器已啟動")
+        bot_log(f"bot started pid={os.getpid()}")
+        last_heartbeat = 0.0
         while True:
             try:
                 updates = self.telegram.get_updates(self.offset)
@@ -4166,9 +5952,21 @@ class TelegramMenuBot(TelegramTurboBot):
                         self.handle_callback(update["callback_query"])
                     elif update.get("message"):
                         self.handle_message(update["message"])
+                now = time.time()
+                if now - last_heartbeat >= 60.0:
+                    last_heartbeat = now
+                    with self.lock:
+                        job = self.job
+                    job_desc = (
+                        f"seg {job.segment_index}/{job.segment_total} {job.prompt_id}"
+                        if job is not None
+                        else "idle"
+                    )
+                    bot_log(f"heartbeat ok pid={os.getpid()} job={job_desc}")
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
+                bot_log(f"polling error: {exc}")
                 print(f"polling error: {exc}", flush=True)
                 time.sleep(5)
 

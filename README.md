@@ -1,139 +1,63 @@
-# MiniMax H3 Telegram Bot
+# MiniMax H3 Turbo Telegram 控制器
 
-這是一個在 Windows 上控制本機 ComfyUI MiniMax H3 Turbo 工作流的 Telegram Bot。
-它可以從 Telegram 設定文字生視頻、圖片生視頻、片長、解析度、steps 和提示詞，生成完成後把 MP4 傳回 Telegram。
+## 安裝一次
 
-本專案只包含 Bot 和啟動腳本，不包含模型、VAE、ComfyUI、個人輸入圖片、輸出影片或 Telegram Token。
+1. 到 Telegram 的 `@BotFather` 撤銷曾經外洩的舊 Token，再產生新 Token。
+2. 雙擊 `Configure-MiniMax-H3-Telegram.cmd`，輸入新 Token 和自己的 Chat ID；不用直接開 `.ps1`。
+3. 雙擊 `Start-MiniMax-H3-Telegram.cmd`，Bot 會先啟動；ComfyUI 可以先關閉。
+4. Telegram 發 `/start` 或 `/menu`，按鈕可選文字生視頻或圖片生視頻；再選短片 5/10/12/15 秒、長片 30/60/120 秒、解析度和 steps。
+5. 如要登入 Windows 後自動啟動 Bot，雙擊 `Install-MiniMax-H3-Telegram-Autostart.cmd`。
 
-## 功能
+Token 只會存放在 Windows 使用者環境變數，不會寫入這個資料夾。
 
-- 文字生視頻（T2VA）和首幀圖片生視頻（I2VA）
-- 5、10、12、15 秒短片，以及自訂總片長
-- 長片自動解析時間軸、拆成 5–8 秒鏡頭、尾幀接力並用 FFmpeg 轉場合併
-- 解析度、steps 和提示詞按鈕
-- GPU 溫度、使用率和 VRAM 查詢按鈕
-- 長片完成並傳回 Telegram 後自動關機，可在倒數期間取消
-- ComfyUI 啟動、停止、重啟和生成進度查詢
-- 長片生成中的中止、鏡頭間暫停和播放／繼續按鈕
-- H3 原片先回傳，再用 Telegram 按鈕選擇 SeedVR2 1080p、2K 或保留原片
-- SeedVR2 放大保留原片音訊；超過約 8 秒會自動啟用 temporal chunk，降低長片顯存壓力
-- Turbo 工作流（固定使用 `--lowvram` 顯存管理）
-- Windows 登入後自動啟動 Bot
-- Token 只從 Windows 使用者環境變數讀取
+Bot 只接受設定好的 Chat ID。生成時如果 ComfyUI 未運行，Bot 會以目前 10GB 顯存設定自動啟動：
+`127.0.0.1:8191`、Turbo 工作流和 `--lowvram`，並等待 API 就緒後才送出工作。
 
-## 先決條件
+Bot 本身會保持運行；ComfyUI 連續 5 分鐘沒有 Bot 任務、而且 ComfyUI 佇列為空時會自動關閉，以釋放顯存。之後按面板的「▶️ 啟動 ComfyUI」或輸入 `/comfy_start` 即可重新啟動。可用環境變數 `MINIMAX_COMFY_IDLE_SHUTDOWN_SECONDS` 調整秒數，設為 `0` 可停用。
 
-1. Windows 10/11、Python 3.10 或更新版本，以及可執行的 FFmpeg。
-2. 已安裝 ComfyUI 和 MiniMax H3 T8 自訂節點：
-   `MiniMaxH3AudioConditioningT8`、`MiniMaxH3DualClockSamplerT8` 等。
-3. 已準備相容的 H3 模型、Qwen3-VL CLIP、Video VAE、Audio VAE 和 Turbo LoRA。
-4. BotFather 建立的 Telegram Bot，以及自己的 Chat ID。
+為避免佔用 C 槽，MiniMax 的輸入、輸出、設定、續接圖片、日誌和 ComfyUI 狀態固定放在 `E:\MiniMax-H3-Telegram`。
 
-模型檔案名稱可以透過環境變數覆寫；請不要把模型檔案提交到這個 Repository。
+## Telegram 用法
 
-## 安裝
+## 按鈕模式
 
-```powershell
-git clone https://github.com/s1215690/MiniMax-H3-TelegramBot.git
-cd MiniMax-H3-TelegramBot
-py -3 -m pip install -r requirements.txt
-```
+輸入 `/start` 或 `/menu` 後，直接按面板上的模式、片長、解析度和 steps。設定會保存到 Windows 使用者資料夾，下次啟動會讀回；提示詞和最近一張圖片也可以保留。
 
-先設定 ComfyUI 路徑。最少需要設定以下變數；路徑請換成自己的安裝位置：
+圖片生視頻：按「🖼 圖片生視頻」，直接發一張圖片，再貼提示詞，最後按「生成影片」。也可以給圖片加 caption，caption 會直接當作提示詞。Bot 會把圖片上傳到 ComfyUI，使用 H3 Turbo 的 I2VA 首幀工作流。
 
-```powershell
-[Environment]::SetEnvironmentVariable('MINIMAX_COMFY_DIR', 'D:\ComfyUI\ComfyUI-Turbo', 'User')
-[Environment]::SetEnvironmentVariable('MINIMAX_COMFY_BASE_DIR', 'D:\ComfyUI\ComfyUI', 'User')
-[Environment]::SetEnvironmentVariable('MINIMAX_COMFY_PYTHON', 'D:\ComfyUI\ComfyUI\.venv\Scripts\python.exe', 'User')
-```
+文字生視頻：按「📝 文字生視頻」，直接輸入提示詞即可。
 
-然後雙擊 `Configure-MiniMax-H3-Telegram.cmd`，輸入新的 Bot Token 和 Chat ID。
-Token 輸入框會隱藏內容，Token 會保存到 Windows 使用者環境變數，不會寫入 Repository。
+面板上的「🌡 查看電腦溫度」會讀取 NVIDIA GPU 溫度、GPU 使用率和 VRAM；CPU 溫度只有在 Windows/主機板提供感測器時才會顯示。選擇超過 15 秒的長片後，可以開啟「🔌 長片完成後關機」；影片合併並成功傳回 Telegram 後，系統會在 60 秒後關機。倒數期間可以按「🛑 取消即將關機」，或輸入 `/cancel_shutdown`。
 
-設定後請開一個新的終端機，再雙擊 `Start-MiniMax-H3-Telegram.cmd`。
+長片會先解析提示詞時間軸，再將場景拆成最多 8 秒的短鏡頭，而不是固定把整篇提示詞重複送進四個 15 秒任務。每鏡完成後，Bot 會擷取最後畫面作為下一鏡的 I2VA 首幀；第二鏡開始也會把第一鏡音訊作為 `<Audio 1>` 參考，使用 `reference_only` 延續音樂風格、節奏和環境聲。最後 FFmpeg 會加入 0.12 秒音畫轉場並維持原定總片長。
 
-## 環境變數
-
-| 變數 | 用途 |
-|---|---|
-| `MINIMAX_TELEGRAM_BOT_TOKEN` | Telegram Bot Token，必須只放在本機環境變數 |
-| `MINIMAX_TELEGRAM_CHAT_ID` | 允許使用 Bot 的 Chat ID |
-| `MINIMAX_COMFY_DIR` | ComfyUI Turbo 執行目錄，內含 `main.py` |
-| `MINIMAX_COMFY_BASE_DIR` | ComfyUI 模型和 custom nodes 的 base directory |
-| `MINIMAX_COMFY_PYTHON` | 執行 ComfyUI 的 Python |
-| `MINIMAX_T8_API_TEMPLATE` | T8 API 工作流 JSON；預設使用 `workflow/dual_clock_4step_api.json` |
-| `MINIMAX_SEEDVR2_API_TEMPLATE` | SeedVR2 放大工作流 JSON；預設使用 `workflow/seedvr2_3b_int8_upscale_video_api.json` |
-| `MINIMAX_COMFY_OUTPUT` | ComfyUI output 目錄 |
-| `MINIMAX_COMFY_INPUT` | ComfyUI input 目錄 |
-| `MINIMAX_COMFY_PORT` | ComfyUI API Port，預設 `8191` |
-| `MINIMAX_FFMPEG` | FFmpeg 可執行檔路徑；不設定時使用 PATH 中的 `ffmpeg` |
-| `MINIMAX_NVIDIA_SMI` | `nvidia-smi` 路徑；不設定時自動尋找 NVIDIA 標準安裝位置 |
-
-模型檔名也可以覆寫：
+建議使用自然時間軸，並由 0 秒連續寫到選擇的總片長：
 
 ```text
-MINIMAX_VIDEO_VAE
-MINIMAX_AUDIO_VAE
-MINIMAX_CLIP
-MINIMAX_UNET
-MINIMAX_LORA
-```
-
-## Telegram 指令
-
-```text
-/start 或 /menu       開啟按鈕控制面板
-/prompt                輸入提示詞
-/image                 切換到圖片生視頻
-/text                  切換到文字生視頻
-/progress              查看生成進度
-/pause                 暫停長片（目前分段完成後生效）
-/resume 或 /play       繼續長片生成
-/status                查看 Bot 狀態
-/temperature           查看 GPU／CPU 溫度
-/cancel_shutdown       取消已排程的自動關機
-/comfy_status          查看 ComfyUI 狀態
-/comfy_start           啟動 ComfyUI
-/comfy_restart         重啟 ComfyUI
-/comfy_stop            關閉 ComfyUI
-/cancel                取消目前生成
-```
-
-也可以使用指令直接設定一段短片：
-
-```text
-/gen 736 416 8 10
-cinematic bright daylight scene with smooth camera movement and clear synchronized sound
-```
-
-總片長超過 15 秒時，Bot 不會再把整份長提示詞重複送給每次生成。它會先解析自然時間軸或 `SEGMENT N`，再把較長場景拆成最多 8 秒的短鏡頭。上一鏡最後畫面會成為下一鏡首幀；第二鏡開始也會把第一鏡音訊作為 `<Audio 1>` 參考，以 `reference_only` 延續音樂風格、節奏和環境聲。最後 FFmpeg 會加入 0.12 秒音畫交叉轉場並維持原定總片長。
-
-建議直接使用自然時間軸。時間必須從 0 秒連續覆蓋到目前選擇的總片長；有缺口、重疊或只寫到 50 秒卻選擇 60 秒時，Bot 會在生成前指出錯誤：
-
-```text
-【60秒反詐騙短片】
+【60秒短片】
 
 開頭（0-5秒）：
-黑底警示標題，沉重低音音樂開始。
+描述開場。
 
 第一幕（5-15秒）：
-同一名女生在家看到可疑招聘廣告。
-她猶豫後按下應聘按鈕。
+描述下一個動作。
 
 第二幕（15-25秒）：
-她拖着行李抵達機場，畫面逐漸轉為灰暗。
+描述延續動作。
 
 第三幕（25-40秒）：
-接頭人收走護照和手機，鐵閘關上。
+描述劇情轉折。
 
 第四幕（40-50秒）：
-她被迫坐在電腦前輸入詐騙訊息。
+描述結果。
 
 結尾（50-60秒）：
-畫面轉黑，出現反詐騙警示。
+描述收尾。
 ```
 
-原有 `GLOBAL`／`SEGMENT N` 格式仍然支援；每個最多 15 秒的 `SEGMENT` 也會再拆成短鏡頭：
+如果時間軸有缺口、重疊，或只寫到 50 秒卻選了 60 秒，Bot 會在生成前指出。純粹貼一段沒有時間軸的長提示詞會被拒絕，避免每個鏡頭重新演繹開頭。
+
+原有 `GLOBAL`／`SEGMENT N` 格式仍然支援，每個 `SEGMENT` 也會再拆成最多 8 秒鏡頭：
 
 ```text
 GLOBAL:
@@ -146,51 +70,69 @@ SEGMENT 2:
 只描述第 2 段最多 15 秒的延續動作。
 ```
 
-純粹貼上一段沒有時間軸的長提示詞會被拒絕，避免模型把開頭重演多次。首幀和音訊參考仍屬模型條件而非硬性鎖定，因此長片仍可能有輕微人物或音樂漂移。現有 FL2VA INT8 模型不會強行套用 Ref2VA 人物參考，以免使用錯誤模型和增加 10GB 顯存負擔。
+目前安裝的是 FL2VA INT8，不會強行加入需要 Ref2VA 模型的人物參考輸入；人物主要依靠全局描述和上一鏡尾幀接力保持。首幀和音訊參考仍屬模型條件而非硬性鎖定，因此可能有輕微漂移。
 
 生成中的面板提供「⛔ 中止」「⏸ 暫停」和「▶️ 播放／繼續」。中止會打斷目前 ComfyUI 工作；暫停會在目前短鏡頭完成後生效，播放／繼續會生成下一鏡。因為 ComfyUI 不保存採樣中的中間狀態，單段短片不能安全地在採樣中途暫停。
 
+長片現在會在 E 槽的 `E:\MiniMax-H3-Telegram\runtime\bot\long_checkpoints` 保存檢查點。每完成一鏡就會記錄已完成 MP4、下一鏡編號和 Motion Context latent；如果第 3 鏡因顯存不足失敗，按失敗訊息的「🔁 從第 3 鏡繼續」，或輸入 `/resume_long`，只會重試第 3 鏡，不會重做第 1、2 鏡。恢復前 Bot 會先要求 ComfyUI 釋放暫存顯存。
+
+完整長片完成後也可以按面板的「📼 延續上一條長片」，輸入要新增的秒數和尾端提示詞。新鏡頭會使用原片最後一鏡的影片和 AV latent 接續，再把原片與新增部分合併回傳；也可以使用 `/extend 30`，再貼上延續提示詞。只有由這個 Bot 保存過檢查點的完整長片能使用精確 Motion Context 延續；沒有檢查點的外部 MP4 不會被假裝成同樣的 latent 接續。
+
+面板的「📚 歷史長片」會列出所有可用 checkpoint。選擇某個 ID 後可以查看詳情，再按「從這條影片延續新故事」；也可以使用 `/extend <ID> 30` 指定歷史長片。舊的完整 `long_<ID>` 輸出資料夾會在首次開啟歷史列表時自動匯入，會讀取原片的分辨率、分段、尾端影片和可用的 Motion Context latent。沒有完整合併片的舊資料夾不會被列入可延續列表。
+
+面板的「🧾 故事排隊」可以一次加入多個獨立故事。按「加入故事」後貼上多段提示詞，用獨立一行的 `---` 分隔；Bot 會保存每個故事當時的片長、解析度、steps 和圖片輸入，前一個完成後自動開始下一個。可用 `/queue` 查看、`/queue_add` 加入、`/queue_start` 開始、`/queue_clear` 清空。排隊資料保存於 E 槽，Bot 重啟後仍會保留；如果上一條影片正在等待 SeedVR2 放大選擇，先按「保留原片」或完成放大，隊列才會接續。
+
 生成期間按「📊 查看／刷新生成進度」，進度會直接顯示在同一個控制面板文字最底部；面板會原地更新，不會另外建立一條進度訊息。
 
-面板上的「🌡 查看電腦溫度」會讀取 NVIDIA GPU 溫度、GPU 使用率和 VRAM；CPU 溫度只有在 Windows/主機板提供感測器時才會顯示。選擇超過 15 秒的長片後，可以開啟「🔌 長片完成後關機」；影片合併並成功傳回 Telegram 後，系統會在 60 秒後關機。倒數期間可以按「🛑 取消即將關機」，或輸入 `/cancel_shutdown`。
+面板上的「🔄 重啟 Bot」會先取消目前的生成（有的話），送出確認訊息後，Bot 會在幾秒內自動結束並重新啟動，不需要重新登入 Windows；重新啟動後請再按一次 `/start` 或 `/menu`。
 
-## 長片連貫與音訊接續
+## 指令模式（備用）
 
-長片預設會嘗試使用 `ComfyUI-H3-Motion-Context`。它會把上一段的影片、尾端影像 context，以及上一段儲存的配對 AV latent 一起交給下一段，並裁走用來接續的 22 個影格；因此不只是重複提交同一條 prompt，也不只是把上一段音訊當作聲音參考。
-
-請先在 ComfyUI 的 `custom_nodes` 安裝 [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)，然後重啟 ComfyUI。Bot 會透過 `/object_info` 自動檢查節點；節點不存在時會自動回退到穩定的「上一段尾幀＋音訊參考」模式。
-
-如果要手動回退穩定模式，設定環境變數後重啟 Bot：
-
-```powershell
-[Environment]::SetEnvironmentVariable('MINIMAX_H3_LONG_CONTINUITY', 'stable', 'User')
-```
-
-長片中按「中止」時，Bot 會停止目前 ComfyUI 任務，並把已完成的分段先合併成 `_partial.mp4` 傳回 Telegram；未完成的分段不會被假裝成已完成。由於 H3 每個分段仍是獨立採樣，Motion Context 只能改善接續，不能保證跨很多段後人物、音樂和音效完全不漂移。
-
-## 可選 SeedVR2 放大
-
-H3 影片完成後會先把原片傳回 Telegram，接著顯示三個按鈕：`放大到 1080p`、`放大到 2K` 和 `保留原片`。只有按下放大按鈕才會提交另一個 ComfyUI 任務；原片不會被刪除。SeedVR2 工作流會從原片讀取影格、FPS 和音訊，再輸出 H.264 MP4。
-
-這個功能使用 ComfyUI 0.31 或更新版本內建的 SeedVR2 節點，不需要另外安裝 SeedVR2 custom node。請把以下模型放到 ComfyUI 對應目錄：
+先發參數，再發提示詞：
 
 ```text
-models/diffusion_models/seedvr2_3b_int8_convrot.safetensors
-models/vae/seedvr2_ema_vae_fp16.safetensors
+/gen 864 480 12 15
 ```
 
-10GB 顯存建議先選 1080p；2K 需要更多顯存和時間，失敗時保留原片並重新選 1080p。放大期間可以用「中止」或 `/cancel` 打斷目前任務。
+長片也可以用指令：
 
-## 顯存配置
+```text
+/long 864 480 12 60
+```
 
-本專案固定使用 Turbo 工作流和 `--lowvram`。這只是 ComfyUI 的顯存管理方式，不會切換成其他模型；Telegram 面板不再提供極限顯存模式。
+Bot 回覆等待提示詞後，直接貼一段或多段文字即可。也可以一則訊息完成：
 
-## 安全提醒
+```text
+/gen 864 480 12 15
+Bright photorealistic Japanese restaurant scene with two adult women eating dinner.
+```
 
-- 不要把 Bot Token、Chat ID、`.env`、日誌、資料庫、輸入圖片或輸出影片提交到 Git。
-- 如果 Token 曾經貼到聊天、截圖或公開網站，請立即在 `@BotFather` 撤銷並重新建立。
-- Bot 只接受設定的 Chat ID，ComfyUI 預設只監聽 `127.0.0.1`。
+其他指令：
 
-## 授權
+```text
+/status
+/cancel
+/pause
+/resume
+/resume_long
+/extend 30
+/history
+/extend long_5d8276f01375 30
+/queue
+/queue_add
+/queue_start
+/queue_clear
+/image
+/text
+/long 864 480 12 60
+/comfy_status
+/comfy_start
+/comfy_restart
+/comfy_stop
+/bot_restart
+/temperature
+/cancel_shutdown
+/help
+```
 
-本專案採用 MIT License。MiniMax H3 模型、ComfyUI 和自訂節點各自遵循其原作者授權條款。
+秒數會自動轉成 H3 的有效影格數；15 秒會使用 362 frames。完成後 Bot 會優先傳送含聲音的 `-audio.mp4`。

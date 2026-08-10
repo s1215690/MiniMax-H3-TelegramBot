@@ -1,0 +1,231 @@
+{
+  "1": {
+    "inputs": {
+      "file": "__INPUT_VIDEO__"
+    },
+    "class_type": "LoadVideo",
+    "_meta": {
+      "title": "SeedVR2 input video"
+    }
+  },
+  "2": {
+    "inputs": {
+      "video": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "GetVideoComponents",
+    "_meta": {
+      "title": "Extract video frames and audio"
+    }
+  },
+  "3": {
+    "inputs": {
+      "input": [
+        "2",
+        0
+      ],
+      "resize_type": "scale longer dimension",
+      "resize_type.longer_size": 1920,
+      "scale_method": "lanczos"
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Resize to target output"
+    }
+  },
+  "4": {
+    "inputs": {
+      "resized_images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SeedVR2Preprocess",
+    "_meta": {
+      "title": "SeedVR2 preprocess"
+    }
+  },
+  "5": {
+    "inputs": {
+      "vae_name": "seedvr2_ema_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "SeedVR2 VAE"
+    }
+  },
+  "6": {
+    "inputs": {
+      "pixels": [
+        "4",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ],
+      "tile_size": 512,
+      "overlap": 128,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEEncodeTiled",
+    "_meta": {
+      "title": "SeedVR2 tiled encode"
+    }
+  },
+  "7": {
+    "inputs": {
+      "unet_name": "seedvr2_3b_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "SeedVR2 3B INT8"
+    }
+  },
+  "8": {
+    "inputs": {
+      "model": [
+        "7",
+        0
+      ],
+      "vae_conditioning": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "SeedVR2Conditioning",
+    "_meta": {
+      "title": "SeedVR2 conditioning"
+    }
+  },
+  "9": {
+    "inputs": {
+      "latent": [
+        "6",
+        0
+      ],
+      "temporal_overlap": 0,
+      "chunking_mode": "auto"
+    },
+    "class_type": "SeedVR2TemporalChunk",
+    "_meta": {
+      "title": "Automatic temporal chunking"
+    }
+  },
+  "10": {
+    "inputs": {
+      "model": [
+        "7",
+        0
+      ],
+      "seed": 959948902156062,
+      "steps": 1,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "8",
+        0
+      ],
+      "negative": [
+        "8",
+        1
+      ],
+      "latent_image": [
+        "9",
+        0
+      ],
+      "denoise": 1.0
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "SeedVR2 one-step sampler"
+    }
+  },
+  "11": {
+    "inputs": {
+      "latents": [
+        "10",
+        0
+      ],
+      "temporal_overlap": [
+        "9",
+        1
+      ]
+    },
+    "class_type": "SeedVR2TemporalMerge",
+    "_meta": {
+      "title": "Merge temporal chunks"
+    }
+  },
+  "12": {
+    "inputs": {
+      "samples": [
+        "11",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ],
+      "tile_size": 512,
+      "overlap": 128,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "SeedVR2 tiled decode"
+    }
+  },
+  "13": {
+    "inputs": {
+      "images": [
+        "12",
+        0
+      ],
+      "original_resized_images": [
+        "3",
+        0
+      ],
+      "color_correction_method": "none"
+    },
+    "class_type": "SeedVR2PostProcessing",
+    "_meta": {
+      "title": "SeedVR2 postprocessing"
+    }
+  },
+  "14": {
+    "inputs": {
+      "images": [
+        "13",
+        0
+      ],
+      "frame_rate": [
+        "2",
+        2
+      ],
+      "loop_count": 0,
+      "filename_prefix": "MiniMaxH3/Telegram_Turbo_Upscale",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "audio": [
+        "2",
+        1
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Save upscaled video"
+    }
+  }
+}

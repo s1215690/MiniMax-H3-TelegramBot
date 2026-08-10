@@ -1,16 +1,12 @@
 $ErrorActionPreference = 'Stop'
 
 $taskName = 'MiniMax H3 Telegram Bot'
-$pythonPath = [Environment]::GetEnvironmentVariable('MINIMAX_COMFY_PYTHON', 'User')
-if ([string]::IsNullOrWhiteSpace($pythonPath)) {
-    $pythonCommand = Get-Command py.exe -ErrorAction SilentlyContinue
-    $pythonPath = if ($pythonCommand) { $pythonCommand.Source } else { '' }
-}
+$pythonPath = 'E:\Comfy\ComfyUI\ComfyUI\.venv\Scripts\python.exe'
 $botPath = Join-Path $PSScriptRoot 'MiniMax-H3-Telegram-Bot.py'
 $launcherPath = Join-Path $PSScriptRoot 'Start-MiniMax-H3-Telegram.vbs'
 $wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
 
-if ([string]::IsNullOrWhiteSpace($pythonPath) -or -not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     throw "找不到 Python：$pythonPath"
 }
 if (-not (Test-Path -LiteralPath $botPath -PathType Leaf)) {
