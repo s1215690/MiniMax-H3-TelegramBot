@@ -28,7 +28,7 @@
   },
   "5": {
     "inputs": {
-      "lora_name": "minimax_h3_turbo_4step_comfyui.safetensors",
+      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
       "strength_model": 1.0,
       "model": ["4", 0]
     },

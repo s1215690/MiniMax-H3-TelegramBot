@@ -28,7 +28,7 @@
   },
   "5": {
     "inputs": {
-      "lora_name": "minimax_h3_turbo_4step_comfyui.safetensors",
+      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
       "strength_model": 1.0,
       "model": ["4", 0]
     },
@@ -57,16 +57,9 @@
     "_meta": {"title": "Native H3 text-to-video-and-audio"}
   },
   "7": {
-    "inputs": {
-      "video_steps": 4,
-      "audio_steps": 8,
-      "shift_video": 12.0,
-      "shift_audio": 3.0,
-      "model": ["5", 0],
-      "av_latent": ["6", 1]
-    },
-    "class_type": "MiniMaxH3MultiRateSamplerEXPT8",
-    "_meta": {"title": "EXP: H3 MultiRate 4-video / 8-audio setup"}
+    "inputs": {},
+    "class_type": "MiniMaxH3TurboSampler",
+    "_meta": {"title": "Author H3 Turbo Sampler"}
   },
   "8": {
     "inputs": {"noise_seed": 123456789},
@@ -74,7 +67,7 @@
     "_meta": {"title": "Noise"}
   },
   "9": {
-    "inputs": {"model": ["7", 0], "conditioning": ["6", 0]},
+    "inputs": {"model": ["5", 0], "conditioning": ["6", 0]},
     "class_type": "BasicGuider",
     "_meta": {"title": "Basic guider"}
   },
@@ -82,12 +75,22 @@
     "inputs": {
       "noise": ["8", 0],
       "guider": ["9", 0],
-      "sampler": ["7", 1],
-      "sigmas": ["7", 2],
+      "sampler": ["7", 0],
+      "sigmas": ["13", 0],
       "latent_image": ["6", 1]
     },
     "class_type": "SamplerCustomAdvanced",
     "_meta": {"title": "EXP sample: H3 MultiRate"}
+  },
+  "13": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 4,
+      "denoise": 1.0,
+      "model": ["5", 0]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {"title": "Author Turbo scheduler (simple)"}
   },
   "11": {
     "inputs": {

@@ -48,27 +48,6 @@ T8_API_TEMPLATE = Path(
         str(Path(__file__).resolve().parent / "dual_clock_multirate_api.json"),
     )
 )
-LTX_T2V_API_TEMPLATE = Path(
-    os.environ.get(
-        "MINIMAX_LTX_T2V_API_TEMPLATE",
-        str(Path(__file__).resolve().parent / "ltx23_t2v_api.json"),
-    )
-)
-LTX_I2V_API_TEMPLATE = Path(
-    os.environ.get(
-        "MINIMAX_LTX_I2V_API_TEMPLATE",
-        str(Path(__file__).resolve().parent / "ltx23_i2v_api.json"),
-    )
-)
-LTX_AUTHOR_MODEL_NAME = os.environ.get(
-    "MINIMAX_LTX_AUTHOR_MODEL",
-    "PinkCherry_FineTune_int8_v1_8_LTX23.safetensors",
-)
-LTX_AUTHOR_LORA_NAME = os.environ.get(
-    "MINIMAX_LTX_AUTHOR_LORA",
-    r"LTX-2.3\ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
-)
-LTX_AUTHOR_MODEL_SIZE = 27_637_268_630
 SEEDVR2_API_TEMPLATE = Path(
     os.environ.get(
         "MINIMAX_SEEDVR2_API_TEMPLATE",
@@ -138,7 +117,7 @@ VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 CLIP_NAME = "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
 UNET_NAME = "minimax_h3_fl2va_int8_convrot.safetensors"
-LORA_NAME = "minimax_h3_turbo_v4_step600_comfyui_T8-convert.safetensors"
+LORA_NAME = "minimax_h3_turbo_v4_step600_ema.safetensors"
 OUTPUT_PREFIX = "MiniMaxH3/Telegram_Turbo"
 STATE_PATH = Path(
     os.environ.get(
@@ -172,34 +151,11 @@ LONG_CONTINUITY_MODE = os.environ.get(
 MOTION_CONTEXT_LENGTH = 22
 MOTION_CONTEXT_EXTRA_SECONDS = MOTION_CONTEXT_LENGTH / 24.0
 MODEL_H3 = "h3"
-MODEL_LTX23 = "ltx23"
 
 
 def normalize_model_mode(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    if text in {MODEL_LTX23, "ltx", "ltx2.3", "pinkcherry", "pinkcherry_ltx23"}:
-        return MODEL_LTX23
+    # Only the MiniMax H3 Turbo workflow is installed.
     return MODEL_H3
-
-
-def ltx_author_model_ready() -> bool:
-    """Return true only after the separate author INT8 checkpoint is complete."""
-    for comfy_root in (COMFYUI_BASE_DIR, COMFYUI_DIR):
-        model_path = comfy_root / "models" / "checkpoints" / LTX_AUTHOR_MODEL_NAME
-        try:
-            if model_path.is_file() and model_path.stat().st_size >= LTX_AUTHOR_MODEL_SIZE:
-                return True
-        except OSError:
-            continue
-    return False
-
-
-def ltx_model_label() -> str:
-    return (
-        "LTX 2.3 PinkCherry INT8 作者 v1.8"
-        if ltx_author_model_ready()
-        else "LTX 2.3 PinkCherry Q5（備用）"
-    )
 
 
 class BotError(RuntimeError):
@@ -1182,6 +1138,11 @@ def workflow_usage_report(workflow: dict[str, Any], vram_mode: str) -> str:
             f"影片 {_workflow_node_input(workflow, '7', 'video_steps')} / "
             f"音訊 {_workflow_node_input(workflow, '7', 'audio_steps')}"
         )
+    elif sampler_type == "MiniMaxH3TurboSampler":
+        steps = (
+            f"{_workflow_node_input(workflow, '13', 'steps')} steps / "
+            f"scheduler {_workflow_node_input(workflow, '13', 'scheduler', 'simple')}"
+        )
     else:
         steps = str(_workflow_node_input(workflow, "7", "steps", "未設定"))
 
@@ -1202,6 +1163,8 @@ def workflow_usage_report(workflow: dict[str, Any], vram_mode: str) -> str:
         acceleration.append("Turbo LoRA")
     if sampler_type == "MiniMaxH3MultiRateSamplerEXPT8":
         acceleration.append("MultiRate EXPT8")
+    elif sampler_type == "MiniMaxH3TurboSampler":
+        acceleration.append("Author Turbo Sampler")
     for class_type, label in acceleration_labels.items():
         if class_type in class_types and label not in acceleration:
             acceleration.append(label)
@@ -1408,13 +1371,21 @@ def build_workflow(
         }
 
     sampler_inputs = workflow["7"]["inputs"]
-    if workflow["7"].get("class_type") == "MiniMaxH3MultiRateSamplerEXPT8":
+    sampler_type = workflow["7"].get("class_type")
+    if sampler_type == "MiniMaxH3MultiRateSamplerEXPT8":
         sampler_inputs["video_steps"] = min(4, config.steps)
         sampler_inputs["audio_steps"] = config.steps
+    elif sampler_type == "MiniMaxH3TurboSampler":
+        scheduler_inputs = workflow.setdefault("13", {}).setdefault("inputs", {})
+        scheduler_inputs["scheduler"] = "simple"
+        scheduler_inputs["steps"] = config.steps
+        scheduler_inputs["denoise"] = 1.0
     else:
         sampler_inputs["steps"] = config.steps
-    sampler_inputs["shift_video"] = 12.0
-    sampler_inputs["shift_audio"] = 3.0
+    if "shift_video" in sampler_inputs:
+        sampler_inputs["shift_video"] = 12.0
+    if "shift_audio" in sampler_inputs:
+        sampler_inputs["shift_audio"] = 3.0
     workflow["8"]["inputs"]["noise_seed"] = secrets.randbits(63)
     workflow["12"]["inputs"]["filename_prefix"] = output_prefix
     return workflow
@@ -3525,31 +3496,19 @@ class TelegramTurboBot:
             and job.continuation_image_path is not None
         ):
             image_name = upload_image_to_comfy(job.continuation_image_path)
-        if job.task_type == MODEL_LTX23:
-            if motion_context or context_video_name or context_latent_path:
-                raise BotError("LTX 2.3 暫不使用 H3 Motion Context；請切回 MiniMax H3 做長片續接。")
-            unload_comfy_models()
-            workflow = build_ltx_workflow(
-                job.config,
-                segment_prompt(job),
-                job.output_prefix,
-                image_name=image_name,
-            )
-            usage_report = ltx_workflow_usage_report(self.comfyui_vram_mode())
-        else:
-            workflow = build_workflow(
-                job.config,
-                segment_prompt(job),
-                job.output_prefix,
-                image_name=image_name,
-                audio_reference_name=(None if motion_context else job.audio_reference_name),
-                motion_context=motion_context,
-                context_video_name=context_video_name,
-                context_latent_path=context_latent_path,
-                save_latent_prefix=save_latent_prefix,
-                save_latent_clip_index=save_latent_clip_index,
-            )
-            usage_report = workflow_usage_report(workflow, self.comfyui_vram_mode())
+        workflow = build_workflow(
+            job.config,
+            segment_prompt(job),
+            job.output_prefix,
+            image_name=image_name,
+            audio_reference_name=(None if motion_context else job.audio_reference_name),
+            motion_context=motion_context,
+            context_video_name=context_video_name,
+            context_latent_path=context_latent_path,
+            save_latent_prefix=save_latent_prefix,
+            save_latent_clip_index=save_latent_clip_index,
+        )
+        usage_report = workflow_usage_report(workflow, self.comfyui_vram_mode())
         if usage_report not in job.workflow_reports:
             job.workflow_reports.append(usage_report)
         response = comfy_post(
@@ -3574,11 +3533,7 @@ class TelegramTurboBot:
         job.progress_tracker = progress_tracker
         progress_tracker.start()
         if announce:
-            step_label = (
-                "LTX native distill"
-                if job.task_type == MODEL_LTX23
-                else f"{job.config.steps} steps"
-            )
+            step_label = f"{job.config.steps} steps"
             self.send_safe(
                 job.chat_id,
                 f"已開始生成：{job.config.width}×{job.config.height} | "
@@ -3632,11 +3587,7 @@ class TelegramTurboBot:
             video_path = self.run_segment(job, announce=True)
             with job.progress_lock:
                 job.progress_phase = "uploading"
-            model_label = (
-                f"{ltx_model_label()} 完成"
-                if job.task_type == MODEL_LTX23
-                else "MiniMax H3 Turbo 完成"
-            )
+            model_label = "MiniMax H3 Turbo 完成"
             caption = (
                 f"{model_label}\n{job.config.width}×{job.config.height} | "
                 f"{job.config.steps} steps | {job.config.actual_seconds:.2f} 秒"
@@ -4780,37 +4731,20 @@ class TelegramMenuBot(TelegramTurboBot):
             self.total_seconds = item.total_seconds
             self.model_mode = normalize_model_mode(item.model_mode)
             self.save_settings()
-            if item.total_seconds > MAX_SEGMENT_SECONDS and self.model_mode == MODEL_LTX23:
+            if item.total_seconds > MAX_SEGMENT_SECONDS:
                 started = self.start_long_generation(
                     chat_id,
                     item.config,
                     item.prompt,
                     item.total_seconds,
                     input_image_path=item.input_image_path,
-                    task_type=MODEL_LTX23,
                 )
-            elif item.total_seconds > MAX_SEGMENT_SECONDS:
-                if self.model_mode == MODEL_LTX23:
-                    self.send_safe(
-                        chat_id,
-                        "LTX 2.3 目前只支援單段 2-15 秒；這個排隊項目請切回 MiniMax H3 才能生成長片。",
-                    )
-                    started = False
-                else:
-                    started = self.start_long_generation(
-                        chat_id,
-                        item.config,
-                        item.prompt,
-                        item.total_seconds,
-                        input_image_path=item.input_image_path,
-                    )
             else:
                 started = self.start_generation(
                     chat_id,
                     item.config,
                     item.prompt,
                     input_image_path=item.input_image_path,
-                    task_type=self.model_mode,
                 )
         except Exception as exc:
             self.send_safe(chat_id, f"排隊故事啟動失敗：{exc}")
@@ -4894,15 +4828,9 @@ class TelegramMenuBot(TelegramTurboBot):
         ]
         model_row = [
             {
-                "text": self.selected("🧠 MiniMax H3", self.model_mode == MODEL_H3),
+                "text": self.selected("🧠 MiniMax H3 Turbo", True),
                 "callback_data": "model:h3",
-            },
-            {
-                "text": self.selected(
-                    "🌸 LTX 2.3 PinkCherry", self.model_mode == MODEL_LTX23
-                ),
-                "callback_data": "model:ltx23",
-            },
+            }
         ]
         resolution_row = [
             {
@@ -5159,29 +5087,6 @@ class TelegramMenuBot(TelegramTurboBot):
             if self.input_mode == "image" and self.image_path and self.image_path.is_file()
             else None
         )
-        if self.model_mode == MODEL_LTX23:
-            if self.total_seconds > MAX_SEGMENT_SECONDS:
-                return self.start_long_generation(
-                    chat_id,
-                    config,
-                    prompt,
-                    self.total_seconds,
-                    input_image_path=input_image_path,
-                    task_type=MODEL_LTX23,
-                )
-            if self.total_seconds > MAX_SEGMENT_SECONDS:
-                self.send_safe(
-                    chat_id,
-                    "LTX 2.3 目前先支援單段 2-15 秒；要生成 30 秒以上長片，請切回 MiniMax H3。",
-                )
-                return False
-            return self.start_generation(
-                chat_id,
-                config,
-                prompt,
-                input_image_path=input_image_path,
-                task_type=MODEL_LTX23,
-            )
         if self.total_seconds > MAX_SEGMENT_SECONDS:
             return self.start_long_generation(
                 chat_id,
@@ -5190,8 +5095,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.total_seconds,
                 input_image_path=input_image_path,
             )
-        else:
-            return self.start_generation(chat_id, config, prompt, input_image_path=input_image_path)
+        return self.start_generation(chat_id, config, prompt, input_image_path=input_image_path)
 
     def resume_long_checkpoint(
         self,
@@ -5587,7 +5491,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 job.progress_phase = "uploading"
                 job.progress_percent = 100.0
             caption = (
-                f"{ltx_model_label() if job.task_type == MODEL_LTX23 else 'MiniMax H3 Turbo'} 長片已提早中止，已合成部分結果\n"
+                "MiniMax H3 Turbo 長片已提早中止，已合成部分結果\n"
                 f"{completed_seconds:.2f} 秒 | {job.config.width}×{job.config.height} | "
                 f"{job.config.steps} steps | {completed_count}/{job.segment_total} 段"
             )
@@ -5641,12 +5545,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     comfy_post("/free", {"unload_models": True, "free_memory": True})
                 except BotError as exc:
                     bot_log(f"ComfyUI memory release before long resume unavailable: {exc}")
-            if job.task_type == MODEL_LTX23:
-                # LTX continues by reusing the previous shot's last frame.
-                # H3 AV-latent Motion Context is not compatible with this
-                # isolated LTX author graph.
-                motion_context_enabled = False
-            elif job.resume_motion_context is None:
+            if job.resume_motion_context is None:
                 motion_context_enabled = (
                     LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
                     and motion_context_nodes_available()
@@ -5692,7 +5591,7 @@ class TelegramMenuBot(TelegramTurboBot):
                             job.chat_id,
                             "上一鏡沒有可用的 AV latent，這次改用尾幀＋音訊參考接續。",
                         )
-                if not motion_context_enabled and job.task_type != MODEL_LTX23:
+                if not motion_context_enabled:
                     job.audio_reference_name = upload_audio_to_comfy(
                         job.initial_context_video_path
                     )
@@ -5843,10 +5742,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     else:
                         # Keep the immediate previous segment as the stable
                         # reference instead of always reusing segment 1.
-                        if job.task_type != MODEL_LTX23:
-                            job.audio_reference_name = upload_audio_to_comfy(video_path)
-                        else:
-                            job.audio_reference_name = None
+                        job.audio_reference_name = upload_audio_to_comfy(video_path)
                         previous_frame = job.continuation_image_path
                         continuation_path = (
                             CONTINUATION_DIR
@@ -5901,7 +5797,7 @@ class TelegramMenuBot(TelegramTurboBot):
             with job.progress_lock:
                 job.progress_phase = "uploading"
             caption = (
-                f"{ltx_model_label() if job.task_type == MODEL_LTX23 else 'MiniMax H3 Turbo'} 長片完成\n{job.total_seconds:.0f} 秒 | "
+                f"MiniMax H3 Turbo 長片完成\n{job.total_seconds:.0f} 秒 | "
                 f"{base_config.width}×{base_config.height} | {base_config.steps} steps | "
                 f"{job.segment_total} 鏡頭合併"
             )
@@ -5957,11 +5853,7 @@ class TelegramMenuBot(TelegramTurboBot):
         current = self.settings
         prompt_status = f"已輸入（{len(self.prompt)} 字）" if self.prompt else "尚未輸入"
         mode_text = "圖片生視頻" if self.input_mode == "image" else "文字生視頻"
-        model_text = (
-            ltx_model_label()
-            if self.model_mode == MODEL_LTX23
-            else "MiniMax H3 Turbo"
-        )
+        model_text = "MiniMax H3 Turbo"
         image_status = "已收到" if self.image_path and self.image_path.is_file() else "未收到"
         prefix = f"{notice}\n\n" if notice else ""
         if self.total_seconds > MAX_SEGMENT_SECONDS:
@@ -6584,12 +6476,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 selected_model = normalize_model_mode(data.removeprefix("model:"))
                 self.model_mode = selected_model
                 self.save_settings()
-                label = (
-                    ltx_model_label()
-                    if selected_model == MODEL_LTX23
-                    else "MiniMax H3 Turbo"
-                )
-                self.show_menu(chat_id, message_id, f"已切換模型：{label}")
+                self.show_menu(chat_id, message_id, "目前使用：MiniMax H3 Turbo")
                 return
             if data == "mode:text":
                 self.input_mode = "text"
@@ -6737,11 +6624,9 @@ class TelegramMenuBot(TelegramTurboBot):
         if command == "/prompt":
             self.request_prompt(chat_id)
             return
-        if command in {"/model", "/h3", "/ltx23", "/ltx"}:
+        if command in {"/model", "/h3"}:
             if command in {"/h3"}:
                 selected_model = MODEL_H3
-            elif command in {"/ltx23", "/ltx"}:
-                selected_model = MODEL_LTX23
             elif len(parts) >= 2:
                 selected_model = normalize_model_mode(parts[1])
             else:
@@ -6749,12 +6634,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 return
             self.model_mode = selected_model
             self.save_settings()
-            label = (
-                ltx_model_label()
-                if selected_model == MODEL_LTX23
-                else "MiniMax H3 Turbo"
-            )
-            self.show_menu(chat_id, notice=f"已切換模型：{label}")
+            self.show_menu(chat_id, notice="目前使用：MiniMax H3 Turbo")
             return
         if command == "/image":
             self.input_mode = "image"
@@ -6990,7 +6870,7 @@ class TelegramMenuBot(TelegramTurboBot):
             {"command": "menu", "description": "開啟控制面板"},
             {"command": "progress", "description": "查看生成進度"},
             {"command": "prompt", "description": "輸入提示詞或上傳 TXT"},
-            {"command": "model", "description": "選擇 MiniMax H3 或 LTX 2.3"},
+            {"command": "model", "description": "查看目前使用的 MiniMax H3 Turbo"},
             {"command": "image", "description": "切換圖生視頻"},
             {"command": "text", "description": "切換文生視頻"},
             {"command": "duration", "description": "設定秒數"},
@@ -7063,10 +6943,16 @@ def check_installation() -> None:
     print(f"output={OUTPUT_DIR}")
     print(f"length={workflow['6']['inputs']['length']} frames ({config.actual_seconds:.2f}s)")
     sampler_inputs = workflow["7"]["inputs"]
-    if workflow["7"].get("class_type") == "MiniMaxH3MultiRateSamplerEXPT8":
+    sampler_type = workflow["7"].get("class_type")
+    if sampler_type == "MiniMaxH3MultiRateSamplerEXPT8":
         print(
             f"steps={sampler_inputs['video_steps']} video / "
             f"{sampler_inputs['audio_steps']} audio"
+        )
+    elif sampler_type == "MiniMaxH3TurboSampler":
+        print(
+            f"steps={workflow['13']['inputs']['steps']} "
+            f"scheduler={workflow['13']['inputs']['scheduler']}"
         )
     else:
         print(f"steps={sampler_inputs['steps']}")

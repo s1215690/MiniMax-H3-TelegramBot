@@ -1,8 +1,8 @@
 {
   "id": "d42d6f0e-7e73-4e86-bc76-044ec9024404",
   "revision": 0,
-  "last_node_id": 12,
-  "last_link_id": 18,
+  "last_node_id": 13,
+  "last_link_id": 20,
   "nodes": [
     {
       "id": 1,
@@ -33,9 +33,9 @@
         {"name": "lora_name", "type": "COMBO", "widget": {"name": "lora_name"}, "link": null},
         {"name": "strength_model", "type": "FLOAT", "widget": {"name": "strength_model"}, "link": null}
       ],
-      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [2]}],
+      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [19, 20]}],
       "properties": {"Node name for S&R": "LoraLoaderBypassModelOnly"},
-      "widgets_values": ["minimax_h3_turbo_v4_step600_comfyui_T8-convert.safetensors", 1.0]
+      "widgets_values": ["minimax_h3_turbo_v4_step600_ema.safetensors", 1.0]
     },
     {
       "id": 3,
@@ -111,7 +111,7 @@
       ],
       "outputs": [
         {"name": "positive", "type": "CONDITIONING", "links": [8]},
-        {"name": "av_latent", "type": "LATENT", "links": [6, 13]},
+        {"name": "av_latent", "type": "LATENT", "links": [13]},
         {"name": "mux_audio", "type": "AUDIO", "links": []},
         {"name": "conditioned_prompt", "type": "STRING", "links": []},
         {"name": "media_map_json", "type": "STRING", "links": []},
@@ -125,28 +125,31 @@
     },
     {
       "id": 7,
-      "type": "MiniMaxH3MultiRateSamplerEXPT8",
-      "title": "EXP MultiRate 4 video / 8 audio",
+      "type": "MiniMaxH3TurboSampler",
+      "title": "Author H3 Turbo Sampler",
       "pos": [880, 0],
-      "size": [390, 190],
+      "size": [280, 30],
       "flags": {},
       "order": 6,
       "mode": 0,
-      "inputs": [
-        {"name": "model", "type": "MODEL", "link": 2},
-        {"name": "av_latent", "type": "LATENT", "link": 6},
-        {"name": "video_steps", "type": "INT", "widget": {"name": "video_steps"}, "link": null},
-        {"name": "audio_steps", "type": "INT", "widget": {"name": "audio_steps"}, "link": null},
-        {"name": "shift_video", "type": "FLOAT", "widget": {"name": "shift_video"}, "link": null},
-        {"name": "shift_audio", "type": "FLOAT", "widget": {"name": "shift_audio"}, "link": null}
-      ],
-      "outputs": [
-        {"name": "model", "type": "MODEL", "links": [7]},
-        {"name": "sampler", "type": "SAMPLER", "links": [11]},
-        {"name": "sigmas", "type": "SIGMAS", "links": [12]}
-      ],
-      "properties": {"Node name for S&R": "MiniMaxH3MultiRateSamplerEXPT8"},
-      "widgets_values": [4, 8, 12.0, 3.0]
+      "inputs": [],
+      "outputs": [{"name": "SAMPLER", "type": "SAMPLER", "links": [11]}],
+      "properties": {"Node name for S&R": "MiniMaxH3TurboSampler"},
+      "widgets_values": []
+    },
+    {
+      "id": 13,
+      "type": "BasicScheduler",
+      "title": "Author Turbo scheduler (simple)",
+      "pos": [880, 80],
+      "size": [350, 130],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [{"name": "model", "type": "MODEL", "link": 20}],
+      "outputs": [{"name": "SIGMAS", "type": "SIGMAS", "links": [12]}],
+      "properties": {"Node name for S&R": "BasicScheduler"},
+      "widgets_values": ["simple", 4, 1]
     },
     {
       "id": 8,
@@ -154,10 +157,10 @@
       "pos": [1320, 30],
       "size": [230, 70],
       "flags": {},
-      "order": 7,
+      "order": 8,
       "mode": 0,
       "inputs": [
-        {"name": "model", "type": "MODEL", "link": 7},
+        {"name": "model", "type": "MODEL", "link": 19},
         {"name": "conditioning", "type": "CONDITIONING", "link": 8}
       ],
       "outputs": [{"name": "GUIDER", "type": "GUIDER", "links": [10]}],
@@ -170,7 +173,7 @@
       "pos": [1320, 160],
       "size": [230, 82],
       "flags": {},
-      "order": 8,
+      "order": 9,
       "mode": 0,
       "inputs": [{"name": "noise_seed", "type": "INT", "widget": {"name": "noise_seed"}, "link": null}],
       "outputs": [{"name": "NOISE", "type": "NOISE", "links": [9]}],
@@ -183,7 +186,7 @@
       "pos": [1600, 30],
       "size": [290, 170],
       "flags": {},
-      "order": 9,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {"name": "noise", "type": "NOISE", "link": 9},
@@ -205,7 +208,7 @@
       "pos": [1940, 30],
       "size": [280, 120],
       "flags": {},
-      "order": 10,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {"name": "av_latent", "type": "LATENT", "link": 14},
@@ -227,7 +230,7 @@
       "pos": [2280, 0],
       "size": [430, 500],
       "flags": {},
-      "order": 11,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {"name": "images", "type": "IMAGE", "link": 17},
@@ -253,11 +256,11 @@
   ],
   "links": [
     [1, 1, 0, 2, 0, "MODEL"],
-    [2, 2, 0, 7, 0, "MODEL"],
+    [19, 2, 0, 8, 0, "MODEL"],
+    [20, 2, 0, 13, 0, "MODEL"],
     [3, 3, 0, 6, 0, "CLIP"],
     [4, 4, 0, 6, 1, "VAE"],
     [5, 5, 0, 6, 2, "VAE"],
-    [6, 6, 1, 7, 1, "LATENT"],
     [7, 7, 0, 8, 0, "MODEL"],
     [8, 6, 0, 8, 1, "CONDITIONING"],
     [9, 9, 0, 10, 0, "NOISE"],
