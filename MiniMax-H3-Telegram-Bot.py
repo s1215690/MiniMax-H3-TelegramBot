@@ -120,6 +120,11 @@ NVIDIA_SMI_PATH = os.environ.get(
 )
 SHUTDOWN_DELAY_SECONDS = 60
 MAX_TELEGRAM_IMAGE_BYTES = 20 * 1024 * 1024
+# Telegram Bot API currently accepts at most 50 MB for a bot-uploaded video.
+# Keep a margin for multipart/form-data headers and the request boundary.
+TELEGRAM_MAX_VIDEO_BYTES = 50_000_000
+TELEGRAM_SAFE_VIDEO_BYTES = 48_000_000
+TELEGRAM_AUDIO_BITRATE_KBPS = 128
 MAX_TELEGRAM_PROMPT_BYTES = 512 * 1024
 PROMPT_FILE_EXTENSIONS = {".txt", ".text"}
 SAGE_ATTENTION_ENABLED = os.environ.get("MINIMAX_SAGE_ATTENTION", "1").strip().lower() not in {
@@ -2200,6 +2205,171 @@ def multipart_request(url: str, fields: dict[str, str], file_field: str, file_pa
     return result
 
 
+def telegram_caption_with_note(caption: str, note: str) -> str:
+    """Append a delivery note without exceeding Telegram's caption limit."""
+    suffix = f"\n\n{note.strip()}" if note.strip() else ""
+    text = str(caption or "").strip()
+    combined = f"{text}{suffix}" if text else note.strip()
+    if len(combined) <= 1024:
+        return combined
+    return combined[:1021].rstrip() + "..."
+
+
+def telegram_video_target_bitrate(duration: float, factor: float = 1.0) -> int:
+    """Return a conservative video bitrate in kbit/s for Telegram delivery."""
+    safe_total_kbps = (
+        TELEGRAM_SAFE_VIDEO_BYTES * 8 * 0.92 / max(float(duration), 1.0) / 1000.0
+    )
+    video_kbps = int(safe_total_kbps * float(factor)) - TELEGRAM_AUDIO_BITRATE_KBPS
+    return max(256, video_kbps)
+
+
+def _telegram_temp_video_path(source_path: Path, suffix: str) -> Path:
+    return source_path.with_name(
+        f".{source_path.stem}.telegram-{suffix}-{uuid.uuid4().hex[:8]}.mp4"
+    )
+
+
+def compress_video_for_telegram(video_path: Path) -> Optional[Path]:
+    """Encode an oversized MP4 below Telegram's upload limit.
+
+    The original generated file is never replaced.  The caller owns the
+    returned temporary file and must remove it after sending.
+    """
+    duration, _, _ = probe_video_info(video_path)
+    last_detail = ""
+    for attempt, factor in enumerate((1.0, 0.84, 0.68, 0.54), start=1):
+        output_path = _telegram_temp_video_path(video_path, f"compress{attempt}")
+        video_kbps = telegram_video_target_bitrate(duration, factor)
+        command = [
+            FFMPEG_PATH,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-b:v",
+            f"{video_kbps}k",
+            "-maxrate",
+            f"{video_kbps}k",
+            "-bufsize",
+            f"{video_kbps * 2}k",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{TELEGRAM_AUDIO_BITRATE_KBPS}k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        try:
+            result = run_hidden_command(command, timeout=max(600.0, duration * 4.0))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_detail = str(exc)
+            result = None
+        if result is not None and result.returncode == 0 and output_path.is_file():
+            output_size = output_path.stat().st_size
+            if output_size <= TELEGRAM_SAFE_VIDEO_BYTES:
+                return output_path
+            last_detail = f"attempt {attempt}: {output_size} bytes"
+        elif result is not None:
+            last_detail = (result.stderr or result.stdout or "ffmpeg failed").strip()
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    bot_log(f"Telegram video compression did not fit: {video_path} ({last_detail[-500:]})")
+    return None
+
+
+def split_video_for_telegram(video_path: Path) -> list[Path]:
+    """Split an oversized video into uploadable MP4 parts as a last resort."""
+    duration, _, _ = probe_video_info(video_path)
+    source_size = max(video_path.stat().st_size, 1)
+    chunk_seconds = max(
+        5.0,
+        duration * TELEGRAM_SAFE_VIDEO_BYTES / source_size * 0.82,
+    )
+    parts: list[Path] = []
+    start = 0.0
+    part_number = 1
+    try:
+        while start < duration - 0.05:
+            remaining = duration - start
+            attempt_seconds = min(chunk_seconds, remaining)
+            output_path: Optional[Path] = None
+            for _ in range(7):
+                candidate = _telegram_temp_video_path(video_path, f"part{part_number:03d}")
+                command = [
+                    FFMPEG_PATH,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    f"{start:.3f}",
+                    "-i",
+                    str(video_path),
+                    "-t",
+                    f"{attempt_seconds:.3f}",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
+                    "-c",
+                    "copy",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    "-movflags",
+                    "+faststart",
+                    str(candidate),
+                ]
+                try:
+                    result = run_hidden_command(
+                        command,
+                        timeout=max(180.0, attempt_seconds * 3.0),
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    result = None
+                if result is not None and result.returncode == 0 and candidate.is_file():
+                    if candidate.stat().st_size <= TELEGRAM_SAFE_VIDEO_BYTES:
+                        output_path = candidate
+                        break
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                attempt_seconds = max(2.0, attempt_seconds * 0.68)
+            if output_path is None:
+                raise BotError(f"無法把影片分段至 Telegram 上傳大小：第 {part_number} 段")
+            parts.append(output_path)
+            start += attempt_seconds
+            part_number += 1
+    except Exception:
+        for part in parts:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    return parts
+
+
 def build_transition_filter(
     shots: list[ShotSpec] | tuple[ShotSpec, ...],
     transition_seconds: float = SHOT_TRANSITION_SECONDS,
@@ -2659,12 +2829,80 @@ class TelegramClient:
         )
 
     def send_video(self, chat_id: str, video_path: Path, caption: str) -> None:
-        multipart_request(
-            f"{self.base_url}/sendVideo",
-            {"chat_id": chat_id, "caption": caption, "supports_streaming": "true"},
-            "video",
-            video_path,
-        )
+        if not video_path.is_file():
+            raise BotError(f"找不到要傳送的影片：{video_path}")
+
+        original_size = video_path.stat().st_size
+        temporary_paths: list[Path] = []
+        upload_url = f"{self.base_url}/sendVideo"
+        fields = {
+            "chat_id": chat_id,
+            "supports_streaming": "true",
+        }
+        try:
+            if original_size <= TELEGRAM_SAFE_VIDEO_BYTES:
+                multipart_request(
+                    upload_url,
+                    {**fields, "caption": caption},
+                    "video",
+                    video_path,
+                )
+                return
+
+            try:
+                self.send_message(
+                    chat_id,
+                    "影片超過 Telegram 50 MB 上傳限制，正在自動壓縮；原片會保留在電腦。",
+                )
+            except BotError:
+                pass
+
+            compressed_path = compress_video_for_telegram(video_path)
+            if compressed_path is not None:
+                temporary_paths.append(compressed_path)
+                compressed_size = compressed_path.stat().st_size
+                note = (
+                    "原片約 "
+                    f"{original_size / 1_000_000:.1f} MB，已自動壓縮至 "
+                    f"{compressed_size / 1_000_000:.1f} MB。"
+                )
+                multipart_request(
+                    upload_url,
+                    {
+                        **fields,
+                        "caption": telegram_caption_with_note(caption, note),
+                    },
+                    "video",
+                    compressed_path,
+                )
+                return
+
+            parts = split_video_for_telegram(video_path)
+            temporary_paths.extend(parts)
+            try:
+                self.send_message(
+                    chat_id,
+                    f"影片仍然太大，將自動分成 {len(parts)} 段傳送。",
+                )
+            except BotError:
+                pass
+            for index, part_path in enumerate(parts, start=1):
+                part_caption = telegram_caption_with_note(
+                    caption,
+                    f"檔案過大，已分段傳送：第 {index}/{len(parts)} 段。",
+                )
+                multipart_request(
+                    upload_url,
+                    {**fields, "caption": part_caption},
+                    "video",
+                    part_path,
+                )
+        finally:
+            for temporary_path in temporary_paths:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 class TelegramTurboBot:
