@@ -162,6 +162,26 @@ INPUT_MODES = {
     INPUT_MODE_FL2VA,
     INPUT_MODE_REF2VA,
 }
+MENU_MAIN = "main"
+MENU_INPUT = "input"
+MENU_SETTINGS = "settings"
+MENU_MODE = "mode"
+MENU_DURATION = "duration"
+MENU_QUALITY = "quality"
+MENU_JOB = "job"
+MENU_SYSTEM = "system"
+MENU_HISTORY = "history"
+MENU_SECTIONS = {
+    MENU_MAIN,
+    MENU_INPUT,
+    MENU_SETTINGS,
+    MENU_MODE,
+    MENU_DURATION,
+    MENU_QUALITY,
+    MENU_JOB,
+    MENU_SYSTEM,
+    MENU_HISTORY,
+}
 REF2VA_UNET_NAME = os.environ.get(
     "MINIMAX_H3_REF2VA_MODEL",
     "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
@@ -179,6 +199,11 @@ def normalize_model_mode(value: Any) -> str:
 def normalize_input_mode(value: Any) -> str:
     mode = str(value or INPUT_MODE_TEXT).strip().lower()
     return mode if mode in INPUT_MODES else INPUT_MODE_TEXT
+
+
+def normalize_menu_section(value: Any) -> str:
+    section = str(value or MENU_MAIN).strip().lower()
+    return section if section in MENU_SECTIONS else MENU_MAIN
 
 
 class BotError(RuntimeError):
@@ -3988,6 +4013,7 @@ class TelegramMenuBot(TelegramTurboBot):
         self.story_queue: list[QueuedStory] = self.load_story_queue()
         self._queue_starting = False
         self.menu_message_id: Optional[int] = None
+        self.menu_section = MENU_MAIN
 
     @staticmethod
     def default_settings() -> GenerationConfig:
@@ -5220,15 +5246,24 @@ class TelegramMenuBot(TelegramTurboBot):
             return f"{int(seconds // 60)} 分鐘"
         return f"{seconds:g} 秒"
 
-    def menu_markup(self) -> dict[str, Any]:
+    def menu_markup(self, section: Optional[str] = None) -> dict[str, Any]:
+        """Build a compact, sectioned inline menu.
+
+        The old menu rendered every control at once.  Keeping the callbacks but
+        grouping them here makes the main panel usable on a phone while leaving
+        all existing generation and system actions available one level down.
+        """
+        section = normalize_menu_section(
+            section or getattr(self, "menu_section", MENU_MAIN)
+        )
         current = self.settings
         mode_row = [
             {
-                "text": self.selected("📝 文字生视频", self.input_mode == "text"),
+                "text": self.selected("📝 T2VA 文字", self.input_mode == INPUT_MODE_TEXT),
                 "callback_data": "mode:text",
             },
             {
-                "text": self.selected("🖼 图片生视频", self.input_mode == "image"),
+                "text": self.selected("🖼 I2VA 圖片", self.input_mode == INPUT_MODE_IMAGE),
                 "callback_data": "mode:image",
             },
         ]
@@ -5241,16 +5276,10 @@ class TelegramMenuBot(TelegramTurboBot):
             },
             {
                 "text": self.selected(
-                    "📚 Ref2VA 參考素材", self.input_mode == INPUT_MODE_REF2VA
+                    "📚 Ref2VA 參考", self.input_mode == INPUT_MODE_REF2VA
                 ),
                 "callback_data": "mode:ref2va",
             },
-        ]
-        model_row = [
-            {
-                "text": self.selected("🧠 MiniMax H3 Turbo", True),
-                "callback_data": "model:h3",
-            }
         ]
         resolution_row = [
             {
@@ -5280,9 +5309,6 @@ class TelegramMenuBot(TelegramTurboBot):
             }
             for seconds in self.LONG_SECONDS
         ]
-        custom_seconds_row = [
-            {"text": "✏️ 自定義秒數", "callback_data": "sec_custom"}
-        ]
         steps_row = [
             {
                 "text": self.selected(f"{steps} steps", current.steps == steps),
@@ -5292,14 +5318,7 @@ class TelegramMenuBot(TelegramTurboBot):
         ]
         with self.lock:
             active_job = self.job
-        checkpoint_rows: list[list[dict[str, str]]] = []
-        if active_job is None:
-            checkpoint_record = self.latest_long_checkpoint()
-            if checkpoint_record is not None:
-                checkpoint_path, checkpoint_payload = checkpoint_record
-                checkpoint_rows = self.checkpoint_markup(
-                    checkpoint_path, checkpoint_payload
-                ).get("inline_keyboard", [])
+
         if active_job is not None and active_job.pause_requested.is_set():
             pause_button = {"text": "⏸ 暫停中", "callback_data": "job_pause"}
         else:
@@ -5309,62 +5328,92 @@ class TelegramMenuBot(TelegramTurboBot):
             pause_button,
             {"text": "▶️ 播放／繼續", "callback_data": "job_resume"},
         ]
-        if self._shutdown_pending:
-            shutdown_row = [
-                {"text": "🛑 取消即將關機", "callback_data": "shutdown_cancel"}
+        checkpoint_rows: list[list[dict[str, str]]] = []
+        if section == MENU_HISTORY and active_job is None:
+            checkpoint_record = self.latest_long_checkpoint()
+            if checkpoint_record is not None:
+                checkpoint_path, checkpoint_payload = checkpoint_record
+                checkpoint_rows = self.checkpoint_markup(
+                    checkpoint_path, checkpoint_payload
+                ).get("inline_keyboard", [])
+
+        def back_row(callback: str = "menu:main") -> list[list[dict[str, str]]]:
+            label = "↩️ 返回生成設定" if callback == "menu:settings" else "↩️ 返回主選單"
+            return [[{"text": label, "callback_data": callback}]]
+
+        if section == MENU_MAIN:
+            rows = [
+                [{"text": "🚀 生成影片", "callback_data": "generate"}],
+                [{"text": "📝 提示詞／上傳素材", "callback_data": "menu:input"}],
+                [{"text": "⚙️ 生成設定", "callback_data": "menu:settings"}],
+                [{"text": "🎬 當前任務", "callback_data": "menu:job"}],
+                [{"text": "🖥️ ComfyUI／系統", "callback_data": "menu:system"}],
+                [{"text": "📚 歷史／長片／排隊", "callback_data": "menu:history"}],
+                [{"text": "♻️ 讀取上次設定", "callback_data": "last"}],
             ]
-        elif self.total_seconds > MAX_SEGMENT_SECONDS:
-            shutdown_row = [
-                {
-                    "text": self.selected(
-                        "🔌 長片完成後關機", self.shutdown_after_generation
-                    ),
-                    "callback_data": "shutdown_toggle",
-                }
-            ]
-        else:
-            shutdown_row = [
-                {
-                    "text": "🔌 完成後關機（只限長片）",
-                    "callback_data": "shutdown_toggle",
-                }
-            ]
-        return {
-            "inline_keyboard": [
-                [{"text": "🎬 生成模式（选择一种）", "callback_data": "noop"}],
-                model_row,
-                mode_row,
-                reference_mode_row,
-                [{"text": "⏱ 總片長（短片）", "callback_data": "noop"}],
-                short_seconds_row,
-                [{"text": "🎞 總片長（長片，會自動分段）", "callback_data": "noop"}],
-                long_seconds_row[:4],
-                long_seconds_row[4:8],
-                long_seconds_row[8:],
-                custom_seconds_row,
-                [{"text": "🖼 解析度／MP（按下選擇）", "callback_data": "noop"}],
-                resolution_row[:3],
-                resolution_row[3:6],
-                resolution_row[6:],
-                [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
-                steps_row,
+        elif section == MENU_INPUT:
+            rows = [
                 [
                     {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
                     {"text": "🧹 清除提示詞", "callback_data": "clear"},
-                    {"text": "🗑 清除图片", "callback_data": "clear_image"},
                 ],
-                [
-                    {"text": "🚀 生成影片", "callback_data": "generate"},
-                    {"text": "♻️ 讀取上次設定", "callback_data": "last"},
-                ],
-                [{"text": "✅ 完成參考素材上傳", "callback_data": "media_done"}],
-                *checkpoint_rows,
-                [
-                    {"text": "📚 歷史長片", "callback_data": "history"},
-                    {"text": "🧾 故事排隊", "callback_data": "queue_view"},
-                ],
-                job_control_row,
-                shutdown_row,
+                [{"text": "🗑 清除上傳素材", "callback_data": "clear_image"}],
+            ]
+            if self.input_mode == INPUT_MODE_REF2VA:
+                rows.append(
+                    [{"text": "✅ 完成參考素材上傳", "callback_data": "media_done"}]
+                )
+            rows.append([{"text": "🎛️ 前往生成模式", "callback_data": "menu:mode"}])
+            rows.extend(back_row())
+        elif section == MENU_SETTINGS:
+            rows = [
+                [{"text": "🎛️ 生成模式", "callback_data": "menu:mode"}],
+                [{"text": "⏱️ 片長／秒數", "callback_data": "menu:duration"}],
+                [{"text": "🖼️ 解析度／步數", "callback_data": "menu:quality"}],
+                [{"text": "♻️ 讀取上次設定", "callback_data": "last"}],
+            ]
+            rows.extend(back_row())
+        elif section == MENU_MODE:
+            rows = [mode_row, reference_mode_row]
+            rows.extend(back_row("menu:settings"))
+        elif section == MENU_DURATION:
+            rows = [
+                [{"text": "短片：5／10／12／15 秒", "callback_data": "noop"}],
+                short_seconds_row[:2],
+                short_seconds_row[2:],
+                [{"text": "長片：自動分段", "callback_data": "noop"}],
+                long_seconds_row[:3],
+                long_seconds_row[3:6],
+                long_seconds_row[6:],
+                [{"text": "✏️ 自定義秒數", "callback_data": "sec_custom"}],
+            ]
+            rows.extend(back_row("menu:settings"))
+        elif section == MENU_QUALITY:
+            rows = [
+                [{"text": "🖼️ 解析度／MP", "callback_data": "noop"}],
+                resolution_row[:3],
+                resolution_row[3:6],
+                resolution_row[6:],
+                [{"text": "⚙️ 步數", "callback_data": "noop"}],
+                steps_row,
+            ]
+            rows.extend(back_row("menu:settings"))
+        elif section == MENU_JOB:
+            rows = [[{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}]]
+            if active_job is not None:
+                rows.append(job_control_row)
+            else:
+                rows.append([{"text": "目前沒有進行中的任務", "callback_data": "noop"}])
+            rows.extend(back_row())
+        elif section == MENU_SYSTEM:
+            shutdown_label = (
+                "🛑 取消即將關機"
+                if self._shutdown_pending
+                else self.selected(
+                    "🔌 長片完成後關機", self.shutdown_after_generation
+                )
+            )
+            rows = [
                 [{"text": "🌡 查看電腦溫度", "callback_data": "temperature"}],
                 [
                     {"text": "▶️ 啟動 ComfyUI", "callback_data": "comfy_start"},
@@ -5375,9 +5424,24 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "⏹ 關閉 ComfyUI", "callback_data": "comfy_stop"},
                 ],
                 [{"text": "🔄 重啟 Bot", "callback_data": "bot_restart"}],
-                [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
+                [{"text": shutdown_label, "callback_data": "shutdown_toggle"}],
             ]
-        }
+            if self._shutdown_pending:
+                rows[-1][0]["callback_data"] = "shutdown_cancel"
+            rows.extend(back_row())
+        elif section == MENU_HISTORY:
+            rows = [
+                [
+                    {"text": "📚 歷史長片", "callback_data": "history"},
+                    {"text": "🧾 故事排隊", "callback_data": "queue_view"},
+                ],
+                *checkpoint_rows,
+            ]
+            rows.extend(back_row())
+        else:
+            rows = []
+            rows.extend(back_row())
+        return {"inline_keyboard": rows}
 
     def effective_config(self) -> GenerationConfig:
         segment_seconds = min(self.total_seconds, MAX_SEGMENT_SECONDS)
@@ -6389,16 +6453,28 @@ class TelegramMenuBot(TelegramTurboBot):
             self.on_job_finished(job.chat_id)
 
     def menu_text(self, notice: str = "") -> str:
+        section = normalize_menu_section(
+            getattr(self, "menu_section", MENU_MAIN)
+        )
+        section_titles = {
+            MENU_MAIN: "主選單",
+            MENU_INPUT: "提示詞／上傳素材",
+            MENU_SETTINGS: "生成設定",
+            MENU_MODE: "生成模式",
+            MENU_DURATION: "片長／秒數",
+            MENU_QUALITY: "解析度／步數",
+            MENU_JOB: "當前任務",
+            MENU_SYSTEM: "ComfyUI／系統",
+            MENU_HISTORY: "歷史／長片／排隊",
+        }
         current = self.settings
         prompt_status = f"已輸入（{len(self.prompt)} 字）" if self.prompt else "尚未輸入"
-        mode_text = "圖片生視頻" if self.input_mode == "image" else "文字生視頻"
         mode_text = {
             INPUT_MODE_TEXT: "T2VA 文字生視頻",
             INPUT_MODE_IMAGE: "I2VA 圖片生視頻",
             INPUT_MODE_FL2VA: "FL2VA 首尾幀生視頻",
             INPUT_MODE_REF2VA: "Ref2VA 參考素材生視頻",
         }.get(self.input_mode, "T2VA 文字生視頻")
-        model_text = "MiniMax H3 Turbo"
         image_status = "已收到" if self.image_path and self.image_path.is_file() else "未收到"
         media_status = (
             f"首幀：{'已上傳' if self.image_path and self.image_path.is_file() else '未上傳'}；"
@@ -6414,15 +6490,10 @@ class TelegramMenuBot(TelegramTurboBot):
         )
         prefix = f"{notice}\n\n" if notice else ""
         if self.total_seconds > MAX_SEGMENT_SECONDS:
-            duration_text = (
-                f"總片長：約 {self.total_seconds:.0f} 秒"
-                f"（按提示詞時間軸拆成最多 {MAX_SHOT_SECONDS:g} 秒鏡頭）"
-            )
+            duration_text = f"長片 {self.total_seconds:.0f} 秒"
         else:
             effective = self.effective_config()
-            duration_text = (
-                f"總片長：約 {effective.actual_seconds:.2f} 秒（{effective.length} frames）"
-            )
+            duration_text = f"短片 {effective.actual_seconds:.2f} 秒"
         if self._shutdown_pending:
             shutdown_text = "完成後關機：倒數中（可取消）"
         elif self.shutdown_after_generation:
@@ -6448,30 +6519,33 @@ class TelegramMenuBot(TelegramTurboBot):
         if pending_upscale and queue_count:
             queue_text += "（等待放大選擇後接續）"
         if COMFY_IDLE_SHUTDOWN_SECONDS > 0:
-            idle_shutdown_text = (
-                f"{COMFY_IDLE_SHUTDOWN_SECONDS / 60:g} 分鐘無任務自動關閉"
-            )
+            idle_shutdown_text = f"閒置 {COMFY_IDLE_SHUTDOWN_SECONDS / 60:g} 分鐘關閉"
         else:
-            idle_shutdown_text = "已關閉"
+            idle_shutdown_text = "閒置自動關閉：關閉"
+        section_hints = {
+            MENU_MAIN: "選擇下方功能；主選單只保留核心按鈕。",
+            MENU_INPUT: "可直接發圖片、影片、音訊或 TXT；Ref2VA 素材完成後按確認。",
+            MENU_SETTINGS: "進入子頁面調整模式、片長、解析度和步數。",
+            MENU_MODE: "T2VA／I2VA／FL2VA／Ref2VA 會在生成時使用對應接線。",
+            MENU_DURATION: "超過 15 秒會按提示詞時間軸自動分段。",
+            MENU_QUALITY: "解析度越高越清晰，也越容易需要更多顯存。",
+            MENU_JOB: "生成中的任務可以查看進度、暫停、繼續或中止。",
+            MENU_SYSTEM: "這裡管理 ComfyUI、溫度、顯存模式和自動關機。",
+            MENU_HISTORY: "可以恢復失敗鏡頭、延續長片或管理故事排隊。",
+        }
         menu = (
-            f"模式素材：{media_status}\n"
-            f"{prefix}{model_text} 控制面板\n\n"
-            f"模型：{model_text}\n"
-            f"輸入模式：{mode_text}\n"
-            f"輸入圖片：{image_status}\n"
-            f"解析度：{resolution_label(current.width, current.height)}\n"
-            f"步數：{current.steps}\n"
-                f"{duration_text}\n"
-                f"ComfyUI 顯存模式：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"
-            f"ComfyUI 閒置關閉：{idle_shutdown_text}\n"
-            f"{shutdown_text}\n"
-            f"{job_text}\n"
-            f"{queue_text}\n"
-            f"提示詞：{prompt_status}\n\n"
-            "圖片模式：先發圖片，再輸入提示詞；文字模式：直接輸入提示詞。\n"
-            "提示詞太長時，可直接上傳 UTF-8 的 .txt 檔案，Bot 會完整讀取。\n"
-            "最後按「生成影片」。\n"
-            "長片會解析時間軸、短鏡頭接力生成後加入轉場合併；設定和提示詞會自動保存。"
+            f"{prefix}🎬 MiniMax H3 Turbo 控制面板\n"
+            f"目前頁面：{section_titles.get(section, '主選單')}\n\n"
+            f"模式：{mode_text}\n"
+            f"參數：{resolution_label(current.width, current.height)} | "
+            f"{current.steps} steps | {duration_text}\n"
+            f"素材：{media_status}\n"
+            f"提示詞：{prompt_status}\n"
+            f"任務：{job_text}\n"
+            f"排隊：{queue_text}\n"
+            f"顯存：{comfyui_vram_mode_label(self.comfyui_vram_mode())}\n"
+            f"{shutdown_text}；{idle_shutdown_text}\n\n"
+            f"{section_hints.get(section, section_hints[MENU_MAIN])}"
         )
         return menu
 
@@ -6584,9 +6658,14 @@ class TelegramMenuBot(TelegramTurboBot):
         message_id: Optional[int] = None,
         notice: str = "",
         force_new: bool = False,
+        section: Optional[str] = None,
     ) -> None:
+        if section is not None:
+            self.menu_section = normalize_menu_section(section)
+        elif force_new:
+            self.menu_section = MENU_MAIN
         text = self.menu_text(notice)
-        markup = self.menu_markup()
+        markup = self.menu_markup(self.menu_section)
         target_message_id = None if force_new else (message_id or self.menu_message_id)
         try:
             if target_message_id is None:
@@ -7158,6 +7237,10 @@ class TelegramMenuBot(TelegramTurboBot):
                 return
             if data == "noop":
                 return
+            if data.startswith("menu:"):
+                self.menu_section = normalize_menu_section(data.removeprefix("menu:"))
+                self.show_menu(chat_id, message_id, section=self.menu_section)
+                return
             if data == "progress":
                 self.show_progress(chat_id, message_id)
                 return
@@ -7179,7 +7262,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.show_history(chat_id, message_id)
                 return
             if data == "history_back":
-                self.show_menu(chat_id, message_id)
+                self.show_menu(chat_id, message_id, section=MENU_MAIN)
                 return
             if data.startswith("history_select:"):
                 self.show_checkpoint_detail(
@@ -7405,7 +7488,7 @@ class TelegramMenuBot(TelegramTurboBot):
 
         if command in {"/start", "/menu", "/help"}:
             try:
-                self.show_menu(chat_id, force_new=True)
+                self.show_menu(chat_id, force_new=True, section=MENU_MAIN)
             except (BotError, ValueError) as exc:
                 self.send_safe(chat_id, str(exc))
             return
