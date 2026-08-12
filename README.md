@@ -63,7 +63,7 @@ Bot 本身會保持運行；ComfyUI 連續 5 分鐘沒有 Bot 任務、而且 Co
 
 如果時間軸有缺口、重疊，或只寫到 50 秒卻選了 60 秒，Bot 會在生成前指出。純粹貼一段沒有時間軸的長提示詞會被拒絕，避免每個鏡頭重新演繹開頭。
 
-原有 `GLOBAL`／`SEGMENT N` 格式仍然支援，每個 `SEGMENT` 也會再拆成最多 8 秒鏡頭：
+原有 `GLOBAL`／`SEGMENT N` 格式仍然支援。Bot 會讀取所有連續的 `SEGMENT 1`、`SEGMENT 2`、`SEGMENT 3`……，不再按固定 15 秒限制段落數；每個 `SEGMENT` 會再拆成最多 8 秒鏡頭。總片長會平均分配到你提供的 SEGMENT 數量，因此 120 秒可以寫 8 段、12 段或更多段，但每段仍須至少 2 秒、最多 15 秒：
 
 ```text
 GLOBAL:
@@ -76,7 +76,20 @@ SEGMENT 2:
 只描述第 2 段最多 15 秒的延續動作。
 ```
 
+SEGMENT 編號必須由 1 開始並連續遞增；例如寫到 `SEGMENT 12` 時，`SEGMENT 1` 至 `SEGMENT 12` 都要存在。影片總長仍受目前 30 分鐘上限、硬碟空間、生成時間和 Telegram 檔案大小限制。
+
 H3 使用 FL2VA INT8 和 Turbo LoRA，不會強行加入需要 Ref2VA 模型的人物參考輸入。人物主要依靠全局描述和上一鏡尾幀接力保持。首幀和音訊參考仍屬模型條件而非硬性鎖定，因此可能有輕微漂移。
+
+### 四種 H3 生成模式
+
+面板現在提供四種模式，會按模式選擇正確的 H3 主模型和 Conditioning 輸入：
+
+- `T2VA`：只用文字提示詞，使用 `minimax_h3_fl2va_int8_convrot.safetensors`。
+- `I2VA`：上傳一張圖片作為首幀，再輸入提示詞。
+- `FL2VA`：先上傳首幀，再上傳尾幀；短片會同時把兩張圖接到 `first_frame`／`last_frame`。
+- `Ref2VA`：可上傳最多 9 張參考圖、3 段參考影片和 3 段參考音訊；此模式改用 `minimax_h3_ref2va_pruned_int8_convrot.safetensors`，不會和 FL2VA 主模型同時載入。
+
+使用 Ref2VA 前在面板按「📚 Ref2VA 參考素材」，連續傳素材，最後按「✅ 完成參考素材上傳」，再輸入提示詞和按生成。Ref2VA 模型約 20.97 GB，放在 ComfyUI 的 `models/diffusion_models`，不會放進 GitHub；這個模式較吃系統 RAM，屬於實驗性參考素材工作流。
 
 生成中的面板提供「⛔ 中止」「⏸ 暫停」和「▶️ 播放／繼續」。中止會打斷目前 ComfyUI 工作；暫停會在目前短鏡頭完成後生效，播放／繼續會生成下一鏡。因為 ComfyUI 不保存採樣中的中間狀態，單段短片不能安全地在採樣中途暫停。
 

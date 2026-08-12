@@ -126,6 +126,7 @@ STATE_PATH = Path(
     )
 )
 IMAGE_DIR = STATE_PATH.parent / "input_images"
+REFERENCE_DIR = STATE_PATH.parent / "reference_media"
 MAX_SEGMENT_SECONDS = 15.0
 MAX_SHOT_SECONDS = 8.0
 SHOT_TRANSITION_SECONDS = 0.12
@@ -151,11 +152,33 @@ LONG_CONTINUITY_MODE = os.environ.get(
 MOTION_CONTEXT_LENGTH = 22
 MOTION_CONTEXT_EXTRA_SECONDS = MOTION_CONTEXT_LENGTH / 24.0
 MODEL_H3 = "h3"
+INPUT_MODE_TEXT = "text"
+INPUT_MODE_IMAGE = "image"
+INPUT_MODE_FL2VA = "fl2va"
+INPUT_MODE_REF2VA = "ref2va"
+INPUT_MODES = {
+    INPUT_MODE_TEXT,
+    INPUT_MODE_IMAGE,
+    INPUT_MODE_FL2VA,
+    INPUT_MODE_REF2VA,
+}
+REF2VA_UNET_NAME = os.environ.get(
+    "MINIMAX_H3_REF2VA_MODEL",
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+)
+MAX_REF2VA_IMAGES = 9
+MAX_REF2VA_VIDEOS = 3
+MAX_REF2VA_AUDIOS = 3
 
 
 def normalize_model_mode(value: Any) -> str:
     # Only the MiniMax H3 Turbo workflow is installed.
     return MODEL_H3
+
+
+def normalize_input_mode(value: Any) -> str:
+    mode = str(value or INPUT_MODE_TEXT).strip().lower()
+    return mode if mode in INPUT_MODES else INPUT_MODE_TEXT
 
 
 class BotError(RuntimeError):
@@ -347,7 +370,16 @@ class JobState:
     segment_start_seconds: float = 0.0
     segment_end_seconds: float = 0.0
     input_image_path: Optional[Path] = None
+    last_image_path: Optional[Path] = None
+    reference_image_paths: list[Path] = field(default_factory=list)
+    reference_video_paths: list[Path] = field(default_factory=list)
+    reference_audio_paths: list[Path] = field(default_factory=list)
+    continuation_video_path: Optional[Path] = None
     comfy_image_name: Optional[str] = None
+    comfy_last_image_name: Optional[str] = None
+    comfy_reference_image_names: list[str] = field(default_factory=list)
+    comfy_reference_video_names: list[str] = field(default_factory=list)
+    comfy_reference_audio_names: list[str] = field(default_factory=list)
     continuation_image_path: Optional[Path] = None
     audio_reference_name: Optional[str] = None
     workflow_reports: list[str] = field(default_factory=list)
@@ -363,6 +395,7 @@ class JobState:
     progress_phase: str = "queued"
     progress_tracker: Any = field(default=None, repr=False, compare=False)
     task_type: str = "h3"
+    generation_mode: str = INPUT_MODE_TEXT
     upscale_source_path: Optional[Path] = None
     upscale_target_width: int = 0
     upscale_target_height: int = 0
@@ -400,6 +433,11 @@ class QueuedStory:
     config: GenerationConfig
     total_seconds: float
     input_image_path: Optional[Path] = None
+    last_image_path: Optional[Path] = None
+    reference_image_paths: tuple[Path, ...] = field(default_factory=tuple)
+    reference_video_paths: tuple[Path, ...] = field(default_factory=tuple)
+    reference_audio_paths: tuple[Path, ...] = field(default_factory=tuple)
+    generation_mode: str = INPUT_MODE_TEXT
     model_mode: str = MODEL_H3
     created_at: float = field(default_factory=time.time)
 
@@ -992,21 +1030,43 @@ def build_long_video_plan(prompt: str, total_seconds: float) -> LongVideoPlan:
 
     segmented = parse_segmented_prompt(prompt)
     if segmented is not None:
-        segment_total = math.ceil(total_seconds / MAX_SEGMENT_SECONDS)
-        missing = [
-            number
-            for number in range(1, segment_total + 1)
-            if number not in segmented.segments
-        ]
-        if missing:
-            missing_text = "、".join(f"SEGMENT {number}" for number in missing)
+        segment_numbers = sorted(segmented.segments)
+        if not segment_numbers or segment_numbers[0] != 1:
+            raise BotError("SEGMENT numbering must start at SEGMENT 1.")
+        for expected_number, actual_number in enumerate(segment_numbers, start=1):
+            if actual_number != expected_number:
+                raise BotError(
+                    "SEGMENT numbering must be consecutive; "
+                    f"expected SEGMENT {expected_number}, got SEGMENT {actual_number}."
+                )
+
+        # The number of SEGMENT blocks controls the story beats. Do not derive
+        # it from total_seconds: a 120-second video may intentionally have 8,
+        # 12, or more story beats. Each beat is then split into <= 8-second
+        # generation shots by split_scene_into_shots().
+        segment_total = len(segment_numbers)
+        segment_duration = total_seconds / segment_total
+        if segment_duration < MIN_TOTAL_SECONDS:
             raise BotError(
-                f"這條影片需要 {segment_total} 個 SEGMENT，但缺少 {missing_text}。"
+                f"{segment_total} SEGMENT blocks are too many for "
+                f"{total_seconds:g} seconds; each SEGMENT must be at least "
+                f"{MIN_TOTAL_SECONDS:g} seconds."
             )
+        if segment_duration > MAX_SEGMENT_SECONDS:
+            raise BotError(
+                f"{segment_total} SEGMENT blocks are too few for "
+                f"{total_seconds:g} seconds; each SEGMENT can be at most "
+                f"{MAX_SEGMENT_SECONDS:g} seconds. Add more SEGMENT blocks."
+            )
+
         shots: list[ShotSpec] = []
-        for number in range(1, segment_total + 1):
-            start_seconds = (number - 1) * MAX_SEGMENT_SECONDS
-            end_seconds = min(number * MAX_SEGMENT_SECONDS, total_seconds)
+        for position, number in enumerate(segment_numbers):
+            start_seconds = round(total_seconds * position / segment_total, 3)
+            end_seconds = (
+                round(total_seconds * (position + 1) / segment_total, 3)
+                if position < segment_total - 1
+                else round(total_seconds, 3)
+            )
             scene = TimelineScene(
                 start_seconds,
                 end_seconds,
@@ -1118,6 +1178,15 @@ def _workflow_node_input(
         return default
     value = inputs.get(name, default)
     return default if isinstance(value, (list, dict)) else value
+
+
+def _next_workflow_node_id(workflow: dict[str, Any]) -> str:
+    """Return an unused numeric node id without overwriting template nodes."""
+    numeric_ids = [int(node_id) for node_id in workflow if str(node_id).isdigit()]
+    next_id = max(numeric_ids, default=0) + 1
+    while str(next_id) in workflow:
+        next_id += 1
+    return str(next_id)
 
 
 def _model_filename(value: Any) -> str:
@@ -1232,7 +1301,12 @@ def build_workflow(
     prompt: str,
     output_prefix: str = OUTPUT_PREFIX,
     image_name: Optional[str] = None,
+    last_image_name: Optional[str] = None,
+    reference_image_names: Optional[list[str]] = None,
+    reference_video_names: Optional[list[str]] = None,
+    reference_audio_names: Optional[list[str]] = None,
     audio_reference_name: Optional[str] = None,
+    generation_mode: str = INPUT_MODE_TEXT,
     motion_context: bool = False,
     context_video_name: Optional[str] = None,
     context_latent_path: Optional[str] = None,
@@ -1247,7 +1321,10 @@ def build_workflow(
     workflow["1"]["inputs"]["vae_name"] = VIDEO_VAE
     workflow["2"]["inputs"]["vae_name"] = AUDIO_VAE
     workflow["3"]["inputs"]["clip_name"] = CLIP_NAME
-    workflow["4"]["inputs"]["unet_name"] = UNET_NAME
+    mode = normalize_input_mode(generation_mode)
+    workflow["4"]["inputs"]["unet_name"] = (
+        REF2VA_UNET_NAME if mode == INPUT_MODE_REF2VA else UNET_NAME
+    )
 
     # INT8 ConvRot uses the bypass model-only loader for the Turbo LoRA.
     workflow["5"]["class_type"] = "LoraLoaderBypassModelOnly"
@@ -1255,6 +1332,19 @@ def build_workflow(
     workflow["5"]["inputs"]["strength_model"] = 1.0
 
     conditioning = workflow["6"]["inputs"]
+    reference_image_names = list(reference_image_names or [])
+    reference_video_names = list(reference_video_names or [])
+    reference_audio_names = list(reference_audio_names or [])
+    if len(reference_image_names) > MAX_REF2VA_IMAGES:
+        raise BotError(f"Ref2VA 最多支援 {MAX_REF2VA_IMAGES} 張參考圖。")
+    if len(reference_video_names) > MAX_REF2VA_VIDEOS:
+        raise BotError(f"Ref2VA 最多支援 {MAX_REF2VA_VIDEOS} 段參考影片。")
+    if len(reference_audio_names) > MAX_REF2VA_AUDIOS:
+        raise BotError(f"Ref2VA 最多支援 {MAX_REF2VA_AUDIOS} 段參考音訊。")
+    if mode == INPUT_MODE_REF2VA and not (
+        reference_image_names or reference_video_names or reference_audio_names
+    ):
+        raise BotError("Ref2VA 至少需要一張參考圖片、一段參考影片或一段參考音訊。")
     prompt_enhancer = workflow.get("30", {}).get("class_type") == "MiniMaxH3PromptEnhancer"
     if not prompt_enhancer:
         conditioning["prompt"] = prompt.strip()
@@ -1273,6 +1363,24 @@ def build_workflow(
         conditioning["audio_mode"] = "native"
         conditioning["add_source_as_reference"] = False
         conditioning["prompt_primary_audio_ordinal"] = 0
+    elif mode == INPUT_MODE_REF2VA:
+        conditioning["task_type"] = "Ref2VA"
+        conditioning["audio_mode"] = (
+            "reference_only"
+            if audio_reference_name or reference_audio_names
+            else "native"
+        )
+        conditioning["add_source_as_reference"] = bool(
+            audio_reference_name or reference_audio_names
+        )
+        conditioning["prompt_primary_audio_ordinal"] = (
+            1 if audio_reference_name or reference_audio_names else 0
+        )
+    elif mode == INPUT_MODE_FL2VA:
+        conditioning["task_type"] = "auto" if audio_reference_name else "FL2VA"
+        conditioning["audio_mode"] = "reference_only" if audio_reference_name else "native"
+        conditioning["add_source_as_reference"] = bool(audio_reference_name)
+        conditioning["prompt_primary_audio_ordinal"] = 1 if audio_reference_name else 0
     else:
         # Audio references plus a continuation first frame require T8 Auto,
         # which resolves to Hybrid; explicit I2VA rejects reference media.
@@ -1291,22 +1399,66 @@ def build_workflow(
             f"audio_mode={conditioning['audio_mode']}; "
             "preserve the user's requested content and timing."
         )
-    if image_name and not motion_context:
-        workflow["13"] = {
+    if image_name and not motion_context and mode != INPUT_MODE_REF2VA:
+        image_node_id = _next_workflow_node_id(workflow)
+        workflow[image_node_id] = {
             "inputs": {"image": image_name},
             "class_type": "LoadImage",
             "_meta": {"title": "Telegram input image"},
         }
-        conditioning["first_frame"] = ["13", 0]
+        conditioning["first_frame"] = [image_node_id, 0]
         if prompt_enhancer:
-            workflow["30"]["inputs"]["image"] = ["13", 0]
+            workflow["30"]["inputs"]["image"] = [image_node_id, 0]
+    if last_image_name and not motion_context and mode == INPUT_MODE_FL2VA:
+        last_image_node_id = _next_workflow_node_id(workflow)
+        workflow[last_image_node_id] = {
+            "inputs": {"image": last_image_name},
+            "class_type": "LoadImage",
+            "_meta": {"title": "Telegram FL2VA last frame"},
+        }
+        conditioning["last_frame"] = [last_image_node_id, 0]
+    for index, reference_name in enumerate(reference_image_names):
+        ref_node_id = _next_workflow_node_id(workflow)
+        workflow[ref_node_id] = {
+            "inputs": {"image": reference_name},
+            "class_type": "LoadImage",
+            "_meta": {"title": f"Telegram Ref2VA image {index + 1}"},
+        }
+        conditioning[f"ref_images.ref_image_{index}"] = [ref_node_id, 0]
+    for index, reference_name in enumerate(reference_video_names):
+        video_node_id = _next_workflow_node_id(workflow)
+        workflow[video_node_id] = {
+            "inputs": {"file": reference_name},
+            "class_type": "LoadVideo",
+            "_meta": {"title": f"Telegram Ref2VA video {index + 1}"},
+        }
+        components_node_id = _next_workflow_node_id(workflow)
+        workflow[components_node_id] = {
+            "inputs": {"video": [video_node_id, 0]},
+            "class_type": "GetVideoComponents",
+            "_meta": {"title": f"Ref2VA video {index + 1} frames and audio"},
+        }
+        conditioning[f"ref_videos.ref_video_{index}"] = [components_node_id, 0]
+        conditioning[f"ref_video_audios.ref_video_audio_{index}"] = [
+            components_node_id,
+            1,
+        ]
+    for index, reference_name in enumerate(reference_audio_names):
+        audio_node_id = _next_workflow_node_id(workflow)
+        workflow[audio_node_id] = {
+            "inputs": {"audio": reference_name},
+            "class_type": "LoadAudio",
+            "_meta": {"title": f"Telegram Ref2VA audio {index + 1}"},
+        }
+        conditioning[f"ref_audios.ref_audio_{index}"] = [audio_node_id, 0]
     if audio_reference_name and not motion_context:
-        workflow["14"] = {
+        audio_node_id = _next_workflow_node_id(workflow)
+        workflow[audio_node_id] = {
             "inputs": {"audio": audio_reference_name},
             "class_type": "LoadAudio",
             "_meta": {"title": "Previous segment audio reference"},
         }
-        conditioning["drive_audio"] = ["14", 0]
+        conditioning["drive_audio"] = [audio_node_id, 0]
 
     if motion_context:
         workflow["15"] = {
@@ -1758,6 +1910,36 @@ def motion_context_nodes_available() -> bool:
         return required.issubset(object_info.keys())
     except Exception:
         return False
+
+
+def comfy_model_candidates(model_name: str) -> tuple[Path, ...]:
+    """Return the local ComfyUI model paths used by this installation."""
+    name = str(model_name or "").replace("/", "\\").strip("\\")
+    if not name:
+        return tuple()
+    return tuple(
+        dict.fromkeys(
+            (
+                COMFYUI_BASE_DIR / "models" / "diffusion_models" / name,
+                COMFYUI_DIR / "models" / "diffusion_models" / name,
+                Path(r"E:\Comfy\ComfyUI\ComfyUI\models\diffusion_models") / name,
+            )
+        )
+    )
+
+
+def comfy_model_available(model_name: str) -> bool:
+    return any(path.is_file() for path in comfy_model_candidates(model_name))
+
+
+def require_ref2va_model() -> None:
+    if comfy_model_available(REF2VA_UNET_NAME):
+        return
+    raise BotError(
+        "Ref2VA 主模型尚未安裝："
+        f"{REF2VA_UNET_NAME}。請放到 ComfyUI\\models\\diffusion_models，"
+        "再按一次生成。"
+    )
 
 
 def upload_image_to_comfy(image_path: Path) -> str:
@@ -3408,12 +3590,39 @@ class TelegramTurboBot:
         config: GenerationConfig,
         prompt: str,
         input_image_path: Optional[Path] = None,
+        last_image_path: Optional[Path] = None,
+        reference_image_paths: Optional[list[Path]] = None,
+        reference_video_paths: Optional[list[Path]] = None,
+        reference_audio_paths: Optional[list[Path]] = None,
+        generation_mode: str = INPUT_MODE_TEXT,
         task_type: str = MODEL_H3,
     ) -> bool:
         prompt = prompt.strip()
         if not prompt:
             self.send_safe(chat_id, "提示詞不可為空白。")
             return False
+        mode = normalize_input_mode(generation_mode)
+        if mode == INPUT_MODE_FL2VA and (
+            input_image_path is None
+            or not input_image_path.is_file()
+            or last_image_path is None
+            or not last_image_path.is_file()
+        ):
+            self.send_safe(chat_id, "FL2VA 需要首幀和尾幀兩張圖片。")
+            return False
+        if mode == INPUT_MODE_REF2VA:
+            if not (
+                any(path.is_file() for path in (reference_image_paths or []))
+                or any(path.is_file() for path in (reference_video_paths or []))
+                or any(path.is_file() for path in (reference_audio_paths or []))
+            ):
+                self.send_safe(chat_id, "Ref2VA 尚未收到參考素材，請先上傳圖片、影片或音訊。")
+                return False
+            try:
+                require_ref2va_model()
+            except BotError as exc:
+                self.send_safe(chat_id, str(exc))
+                return False
         with self.lock:
             if self.job:
                 self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或使用 /cancel。")
@@ -3425,7 +3634,12 @@ class TelegramTurboBot:
                 time.time(),
                 cancel_event=threading.Event(),
                 input_image_path=input_image_path,
+                last_image_path=last_image_path,
+                reference_image_paths=list(reference_image_paths or []),
+                reference_video_paths=list(reference_video_paths or []),
+                reference_audio_paths=list(reference_audio_paths or []),
                 task_type=normalize_model_mode(task_type),
+                generation_mode=mode,
             )
             job.resume_event.set()
             self.job = job
@@ -3486,22 +3700,73 @@ class TelegramTurboBot:
     ) -> Path:
         segment_started_at = time.time()
         image_name: Optional[str] = None
-        if not motion_context and job.input_image_path is not None and job.segment_index == 1:
+        last_image_name: Optional[str] = None
+        if (
+            not motion_context
+            and job.generation_mode in {INPUT_MODE_IMAGE, INPUT_MODE_FL2VA}
+            and job.input_image_path is not None
+            and job.segment_index == 1
+        ):
             if job.comfy_image_name is None:
                 job.comfy_image_name = upload_image_to_comfy(job.input_image_path)
             image_name = job.comfy_image_name
+            if (
+                job.generation_mode == INPUT_MODE_FL2VA
+                and job.last_image_path is not None
+            ):
+                if job.comfy_last_image_name is None:
+                    job.comfy_last_image_name = upload_image_to_comfy(job.last_image_path)
+                last_image_name = job.comfy_last_image_name
         elif (
             not motion_context
+            and job.generation_mode in {INPUT_MODE_IMAGE, INPUT_MODE_FL2VA}
             and job.segment_index > 1
             and job.continuation_image_path is not None
         ):
             image_name = upload_image_to_comfy(job.continuation_image_path)
+        if not motion_context and job.generation_mode == INPUT_MODE_REF2VA:
+            if not job.comfy_reference_image_names:
+                job.comfy_reference_image_names = [
+                    upload_image_to_comfy(path)
+                    for path in job.reference_image_paths
+                    if path.is_file()
+                ]
+            if not job.comfy_reference_video_names:
+                job.comfy_reference_video_names = [
+                    upload_video_to_comfy(path)
+                    for path in job.reference_video_paths
+                    if path.is_file()
+                ]
+            if not job.comfy_reference_audio_names:
+                job.comfy_reference_audio_names = [
+                    upload_audio_to_comfy(path)
+                    for path in job.reference_audio_paths
+                    if path.is_file()
+                ]
+            if not (
+                job.comfy_reference_image_names
+                or job.comfy_reference_video_names
+                or job.comfy_reference_audio_names
+            ):
+                raise BotError("Ref2VA 參考素材不存在，請重新上傳圖片、影片或音訊。")
+        workflow_mode = job.generation_mode
+        if (
+            workflow_mode == INPUT_MODE_FL2VA
+            and job.segment_index > 1
+            and not last_image_name
+        ):
+            workflow_mode = INPUT_MODE_IMAGE
         workflow = build_workflow(
             job.config,
             segment_prompt(job),
             job.output_prefix,
             image_name=image_name,
+            last_image_name=last_image_name,
+            reference_image_names=job.comfy_reference_image_names,
+            reference_video_names=job.comfy_reference_video_names,
+            reference_audio_names=job.comfy_reference_audio_names,
             audio_reference_name=(None if motion_context else job.audio_reference_name),
+            generation_mode=workflow_mode,
             motion_context=motion_context,
             context_video_name=context_video_name,
             context_latent_path=context_latent_path,
@@ -3704,6 +3969,12 @@ class TelegramMenuBot(TelegramTurboBot):
         self.input_mode = self.load_saved_mode()
         self.model_mode = self.load_saved_model_mode()
         self.image_path = self.load_saved_image_path()
+        saved_media = self._load_saved_media_paths
+        saved_last = saved_media("last_image_paths")
+        self.last_image_path = saved_last[0] if saved_last else None
+        self.reference_image_paths = saved_media("reference_image_paths")
+        self.reference_video_paths = saved_media("reference_video_paths")
+        self.reference_audio_paths = saved_media("reference_audio_paths")
         self.vram_mode = self.load_saved_vram_mode()
         self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
         self._shutdown_pending = False
@@ -3752,8 +4023,7 @@ class TelegramMenuBot(TelegramTurboBot):
         try:
             with STATE_PATH.open("r", encoding="utf-8") as handle:
                 saved = json.load(handle)
-            mode = str(saved.get("input_mode", "text"))
-            return mode if mode in {"text", "image"} else "text"
+            return normalize_input_mode(saved.get("input_mode", INPUT_MODE_TEXT))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return "text"
 
@@ -3799,13 +4069,41 @@ class TelegramMenuBot(TelegramTurboBot):
             path = Path(value) if value else None
             if not path or not path.is_file():
                 return None
-            try:
-                path.resolve().relative_to(IMAGE_DIR.resolve())
-            except ValueError:
+            allowed_roots = (IMAGE_DIR.resolve(), REFERENCE_DIR.resolve())
+            if not any(
+                path.resolve().is_relative_to(root) for root in allowed_roots
+            ):
                 return None
             return path
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _load_saved_media_paths(key: str) -> list[Path]:
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return []
+        raw_paths = saved.get(key, [])
+        if not isinstance(raw_paths, list):
+            raw_paths = [raw_paths]
+        result: list[Path] = []
+        try:
+            reference_root = REFERENCE_DIR.resolve()
+        except OSError:
+            reference_root = REFERENCE_DIR.absolute()
+        for raw_path in raw_paths:
+            candidate = Path(str(raw_path).strip()) if raw_path else None
+            if candidate is None:
+                continue
+            try:
+                candidate.resolve().relative_to(reference_root)
+            except (OSError, ValueError):
+                continue
+            if candidate.is_file():
+                result.append(candidate)
+        return result
 
     def load_saved_total_seconds(self) -> float:
         try:
@@ -3861,11 +4159,17 @@ class TelegramMenuBot(TelegramTurboBot):
             if raw_image_path:
                 candidate = Path(raw_image_path)
                 try:
-                    candidate.resolve().relative_to(IMAGE_DIR.resolve())
-                except ValueError:
+                    allowed_roots = (IMAGE_DIR.resolve(), REFERENCE_DIR.resolve())
+                    if not any(
+                        candidate.resolve().is_relative_to(root)
+                        for root in allowed_roots
+                    ):
+                        raise ValueError
+                except (OSError, ValueError):
                     candidate = None
                 if candidate is not None and candidate.is_file():
                     input_image_path = candidate
+            last_paths = self._checkpoint_media_paths(raw, "last_image_paths")
             try:
                 created_at = float(raw.get("created_at", time.time()))
             except (TypeError, ValueError):
@@ -3877,6 +4181,19 @@ class TelegramMenuBot(TelegramTurboBot):
                     config=config,
                     total_seconds=total_seconds,
                     input_image_path=input_image_path,
+                    last_image_path=last_paths[0] if last_paths else None,
+                    reference_image_paths=tuple(
+                        self._checkpoint_media_paths(raw, "reference_image_paths")
+                    ),
+                    reference_video_paths=tuple(
+                        self._checkpoint_media_paths(raw, "reference_video_paths")
+                    ),
+                    reference_audio_paths=tuple(
+                        self._checkpoint_media_paths(raw, "reference_audio_paths")
+                    ),
+                    generation_mode=normalize_input_mode(
+                        raw.get("generation_mode", INPUT_MODE_TEXT)
+                    ),
                     model_mode=normalize_model_mode(raw.get("model_mode")),
                     created_at=created_at,
                 )
@@ -3906,6 +4223,15 @@ class TelegramMenuBot(TelegramTurboBot):
                         if item.input_image_path is not None
                         else ""
                     ),
+                    "last_image_paths": (
+                        [str(item.last_image_path)]
+                        if item.last_image_path is not None
+                        else []
+                    ),
+                    "reference_image_paths": [str(path) for path in item.reference_image_paths],
+                    "reference_video_paths": [str(path) for path in item.reference_video_paths],
+                    "reference_audio_paths": [str(path) for path in item.reference_audio_paths],
+                    "generation_mode": normalize_input_mode(item.generation_mode),
                     "model_mode": normalize_model_mode(item.model_mode),
                 }
                 for item in items
@@ -3948,6 +4274,26 @@ class TelegramMenuBot(TelegramTurboBot):
                         if getattr(self, "image_path", None)
                         else ""
                     ),
+                    "last_image_paths": (
+                        [str(getattr(self, "last_image_path"))]
+                        if getattr(self, "last_image_path", None)
+                        else []
+                    ),
+                    "reference_image_paths": [
+                        str(path)
+                        for path in getattr(self, "reference_image_paths", [])
+                        if path.is_file()
+                    ],
+                    "reference_video_paths": [
+                        str(path)
+                        for path in getattr(self, "reference_video_paths", [])
+                        if path.is_file()
+                    ],
+                    "reference_audio_paths": [
+                        str(path)
+                        for path in getattr(self, "reference_audio_paths", [])
+                        if path.is_file()
+                    ],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -4057,6 +4403,26 @@ class TelegramMenuBot(TelegramTurboBot):
             paths.append(path)
         return paths
 
+    @staticmethod
+    def _checkpoint_media_paths(payload: dict[str, Any], key: str) -> list[Path]:
+        raw_paths = payload.get(key, [])
+        if not isinstance(raw_paths, list):
+            raw_paths = [raw_paths]
+        try:
+            root = REFERENCE_DIR.resolve()
+        except OSError:
+            root = REFERENCE_DIR.absolute()
+        paths: list[Path] = []
+        for raw_path in raw_paths:
+            candidate = Path(str(raw_path))
+            try:
+                candidate.resolve().relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if candidate.is_file():
+                paths.append(candidate)
+        return paths
+
     def save_long_checkpoint(
         self,
         job: JobState,
@@ -4087,6 +4453,7 @@ class TelegramMenuBot(TelegramTurboBot):
             "checkpoint_id": self._checkpoint_id(job.checkpoint_path),
             "chat_id": str(job.chat_id),
             "task_type": normalize_model_mode(job.task_type),
+            "generation_mode": normalize_input_mode(job.generation_mode),
             "status": status,
             "last_error": error[-4000:] if error else "",
             "created_at": float(job.started_at),
@@ -4115,6 +4482,10 @@ class TelegramMenuBot(TelegramTurboBot):
             ],
             "story_global_text": job.story_global_text,
             "input_image_path": str(job.input_image_path or ""),
+            "last_image_path": str(job.last_image_path or ""),
+            "reference_image_paths": [str(path) for path in job.reference_image_paths],
+            "reference_video_paths": [str(path) for path in job.reference_video_paths],
+            "reference_audio_paths": [str(path) for path in job.reference_audio_paths],
             "completed_video_paths": [
                 str(path.resolve()) for path in video_paths if path.is_file()
             ],
@@ -4689,6 +5060,26 @@ class TelegramMenuBot(TelegramTurboBot):
             if self.input_mode == "image" and self.image_path and self.image_path.is_file()
             else None
         )
+        if self.input_mode in {INPUT_MODE_IMAGE, INPUT_MODE_FL2VA}:
+            input_image_path = (
+                self.image_path if self.image_path and self.image_path.is_file() else None
+            )
+        last_image_path = (
+            self.last_image_path
+            if self.input_mode == INPUT_MODE_FL2VA
+            and self.last_image_path
+            and self.last_image_path.is_file()
+            else None
+        )
+        reference_image_paths = tuple(
+            path for path in self.reference_image_paths if path.is_file()
+        )
+        reference_video_paths = tuple(
+            path for path in self.reference_video_paths if path.is_file()
+        )
+        reference_audio_paths = tuple(
+            path for path in self.reference_audio_paths if path.is_file()
+        )
         new_items = [
             QueuedStory(
                 item_id=f"q_{secrets.token_hex(4)}",
@@ -4696,6 +5087,11 @@ class TelegramMenuBot(TelegramTurboBot):
                 config=config,
                 total_seconds=total_seconds,
                 input_image_path=input_image_path,
+                last_image_path=last_image_path,
+                reference_image_paths=reference_image_paths,
+                reference_video_paths=reference_video_paths,
+                reference_audio_paths=reference_audio_paths,
+                generation_mode=self.input_mode,
                 model_mode=self.model_mode,
             )
             for prompt in prompts
@@ -4738,6 +5134,11 @@ class TelegramMenuBot(TelegramTurboBot):
                     item.prompt,
                     item.total_seconds,
                     input_image_path=item.input_image_path,
+                    last_image_path=item.last_image_path,
+                    reference_image_paths=list(item.reference_image_paths),
+                    reference_video_paths=list(item.reference_video_paths),
+                    reference_audio_paths=list(item.reference_audio_paths),
+                    generation_mode=item.generation_mode,
                 )
             else:
                 started = self.start_generation(
@@ -4745,6 +5146,11 @@ class TelegramMenuBot(TelegramTurboBot):
                     item.config,
                     item.prompt,
                     input_image_path=item.input_image_path,
+                    last_image_path=item.last_image_path,
+                    reference_image_paths=list(item.reference_image_paths),
+                    reference_video_paths=list(item.reference_video_paths),
+                    reference_audio_paths=list(item.reference_audio_paths),
+                    generation_mode=item.generation_mode,
                 )
         except Exception as exc:
             self.send_safe(chat_id, f"排隊故事啟動失敗：{exc}")
@@ -4824,6 +5230,20 @@ class TelegramMenuBot(TelegramTurboBot):
             {
                 "text": self.selected("🖼 图片生视频", self.input_mode == "image"),
                 "callback_data": "mode:image",
+            },
+        ]
+        reference_mode_row = [
+            {
+                "text": self.selected(
+                    "🎬 FL2VA 首尾幀", self.input_mode == INPUT_MODE_FL2VA
+                ),
+                "callback_data": "mode:fl2va",
+            },
+            {
+                "text": self.selected(
+                    "📚 Ref2VA 參考素材", self.input_mode == INPUT_MODE_REF2VA
+                ),
+                "callback_data": "mode:ref2va",
             },
         ]
         model_row = [
@@ -4914,6 +5334,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 [{"text": "🎬 生成模式（选择一种）", "callback_data": "noop"}],
                 model_row,
                 mode_row,
+                reference_mode_row,
                 [{"text": "⏱ 總片長（短片）", "callback_data": "noop"}],
                 short_seconds_row,
                 [{"text": "🎞 總片長（長片，會自動分段）", "callback_data": "noop"}],
@@ -4936,6 +5357,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "🚀 生成影片", "callback_data": "generate"},
                     {"text": "♻️ 讀取上次設定", "callback_data": "last"},
                 ],
+                [{"text": "✅ 完成參考素材上傳", "callback_data": "media_done"}],
                 *checkpoint_rows,
                 [
                     {"text": "📚 歷史長片", "callback_data": "history"},
@@ -5084,9 +5506,41 @@ class TelegramMenuBot(TelegramTurboBot):
         config = self.effective_config()
         input_image_path = (
             self.image_path
-            if self.input_mode == "image" and self.image_path and self.image_path.is_file()
+            if self.input_mode in {INPUT_MODE_IMAGE, INPUT_MODE_FL2VA}
+            and self.image_path
+            and self.image_path.is_file()
             else None
         )
+        last_image_path = (
+            self.last_image_path
+            if self.input_mode == INPUT_MODE_FL2VA
+            and self.last_image_path
+            and self.last_image_path.is_file()
+            else None
+        )
+        reference_image_paths = [
+            path for path in self.reference_image_paths if path.is_file()
+        ]
+        reference_video_paths = [
+            path for path in self.reference_video_paths if path.is_file()
+        ]
+        reference_audio_paths = [
+            path for path in self.reference_audio_paths if path.is_file()
+        ]
+        if self.input_mode == INPUT_MODE_FL2VA and (
+            input_image_path is None or last_image_path is None
+        ):
+            raise BotError("FL2VA 需要首幀和尾幀兩張圖片。")
+        if self.input_mode == INPUT_MODE_REF2VA:
+            require_ref2va_model()
+            if not (
+                reference_image_paths
+                or reference_video_paths
+                or reference_audio_paths
+            ):
+                raise BotError(
+                    "Ref2VA 尚未收到參考素材，請先上傳圖片、影片或音訊。"
+                )
         if self.total_seconds > MAX_SEGMENT_SECONDS:
             return self.start_long_generation(
                 chat_id,
@@ -5094,8 +5548,23 @@ class TelegramMenuBot(TelegramTurboBot):
                 prompt,
                 self.total_seconds,
                 input_image_path=input_image_path,
+                last_image_path=last_image_path,
+                reference_image_paths=reference_image_paths,
+                reference_video_paths=reference_video_paths,
+                reference_audio_paths=reference_audio_paths,
+                generation_mode=self.input_mode,
             )
-        return self.start_generation(chat_id, config, prompt, input_image_path=input_image_path)
+        return self.start_generation(
+            chat_id,
+            config,
+            prompt,
+            input_image_path=input_image_path,
+            last_image_path=last_image_path,
+            reference_image_paths=reference_image_paths,
+            reference_video_paths=reference_video_paths,
+            reference_audio_paths=reference_audio_paths,
+            generation_mode=self.input_mode,
+        )
 
     def resume_long_checkpoint(
         self,
@@ -5128,6 +5597,20 @@ class TelegramMenuBot(TelegramTurboBot):
             config = self._checkpoint_config(payload)
             shots = self._checkpoint_shots(payload)
             video_paths = self._checkpoint_video_paths(payload)
+            generation_mode = normalize_input_mode(
+                payload.get("generation_mode", INPUT_MODE_TEXT)
+            )
+            reference_image_paths = self._checkpoint_media_paths(
+                payload, "reference_image_paths"
+            )
+            reference_video_paths = self._checkpoint_media_paths(
+                payload, "reference_video_paths"
+            )
+            reference_audio_paths = self._checkpoint_media_paths(
+                payload, "reference_audio_paths"
+            )
+            if generation_mode == INPUT_MODE_REF2VA:
+                require_ref2va_model()
             if len(video_paths) != next_index - 1 or not video_paths:
                 raise BotError("檢查點的已完成鏡頭數量不一致。")
             missing = [str(video_path) for video_path in video_paths if not video_path.is_file()]
@@ -5151,6 +5634,10 @@ class TelegramMenuBot(TelegramTurboBot):
                 total_seconds=float(payload["total_seconds"]),
                 shot_plan=shots,
                 story_global_text=str(payload.get("story_global_text", "")),
+                generation_mode=generation_mode,
+                reference_image_paths=reference_image_paths,
+                reference_video_paths=reference_video_paths,
+                reference_audio_paths=reference_audio_paths,
                 resume_from_segment=next_index,
                 completed_video_paths=list(video_paths),
                 initial_context_video_path=video_paths[-1],
@@ -5302,6 +5789,20 @@ class TelegramMenuBot(TelegramTurboBot):
             config = self._checkpoint_config(payload)
             long_resolution = self._checkpoint_long_resolution(payload, config)
             resolution_fallbacks = self._checkpoint_resolution_fallbacks(payload)
+            generation_mode = normalize_input_mode(
+                payload.get("generation_mode", INPUT_MODE_TEXT)
+            )
+            reference_image_paths = self._checkpoint_media_paths(
+                payload, "reference_image_paths"
+            )
+            reference_video_paths = self._checkpoint_media_paths(
+                payload, "reference_video_paths"
+            )
+            reference_audio_paths = self._checkpoint_media_paths(
+                payload, "reference_audio_paths"
+            )
+            if generation_mode == INPUT_MODE_REF2VA:
+                require_ref2va_model()
             last_latent = str(payload.get("last_context_latent_path", "")).strip() or None
             motion_context = bool(payload.get("motion_context_enabled")) and bool(last_latent)
             extension_prefix = (
@@ -5321,6 +5822,10 @@ class TelegramMenuBot(TelegramTurboBot):
                 total_seconds=total_seconds,
                 shot_plan=combined_shots,
                 story_global_text=combined_global,
+                generation_mode=generation_mode,
+                reference_image_paths=reference_image_paths,
+                reference_video_paths=reference_video_paths,
+                reference_audio_paths=reference_audio_paths,
                 resume_from_segment=len(old_paths) + 1,
                 completed_video_paths=list(old_paths),
                 initial_context_video_path=old_paths[-1],
@@ -5369,6 +5874,11 @@ class TelegramMenuBot(TelegramTurboBot):
         prompt: str,
         total_seconds: float,
         input_image_path: Optional[Path] = None,
+        last_image_path: Optional[Path] = None,
+        reference_image_paths: Optional[list[Path]] = None,
+        reference_video_paths: Optional[list[Path]] = None,
+        reference_audio_paths: Optional[list[Path]] = None,
+        generation_mode: str = INPUT_MODE_TEXT,
         task_type: str = MODEL_H3,
     ) -> bool:
         prompt = prompt.strip()
@@ -5376,6 +5886,28 @@ class TelegramMenuBot(TelegramTurboBot):
             self.send_safe(chat_id, "提示詞不可為空白。")
             return False
         total_seconds = validate_total_seconds(total_seconds)
+        mode = normalize_input_mode(generation_mode)
+        if mode == INPUT_MODE_FL2VA and (
+            input_image_path is None
+            or not input_image_path.is_file()
+            or last_image_path is None
+            or not last_image_path.is_file()
+        ):
+            self.send_safe(chat_id, "FL2VA 長片需要首幀和尾幀兩張圖片。")
+            return False
+        if mode == INPUT_MODE_REF2VA:
+            if not (
+                any(path.is_file() for path in (reference_image_paths or []))
+                or any(path.is_file() for path in (reference_video_paths or []))
+                or any(path.is_file() for path in (reference_audio_paths or []))
+            ):
+                self.send_safe(chat_id, "Ref2VA 尚未收到參考素材，請先上傳圖片、影片或音訊。")
+                return False
+            try:
+                require_ref2va_model()
+            except BotError as exc:
+                self.send_safe(chat_id, str(exc))
+                return False
         try:
             plan = build_long_video_plan(prompt, total_seconds)
         except BotError as exc:
@@ -5402,7 +5934,12 @@ class TelegramMenuBot(TelegramTurboBot):
                 shot_plan=plan.shots,
                 story_global_text=plan.global_text,
                 input_image_path=input_image_path,
+                last_image_path=last_image_path,
+                reference_image_paths=list(reference_image_paths or []),
+                reference_video_paths=list(reference_video_paths or []),
+                reference_audio_paths=list(reference_audio_paths or []),
                 task_type=normalize_model_mode(task_type),
+                generation_mode=mode,
                 base_config=config,
                 long_base_prefix=batch_prefix,
                 checkpoint_path=LONG_CHECKPOINT_DIR
@@ -5547,6 +6084,8 @@ class TelegramMenuBot(TelegramTurboBot):
                     bot_log(f"ComfyUI memory release before long resume unavailable: {exc}")
             if job.resume_motion_context is None:
                 motion_context_enabled = (
+                    job.generation_mode != INPUT_MODE_REF2VA
+                    and
                     LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
                     and motion_context_nodes_available()
                 )
@@ -5853,8 +6392,26 @@ class TelegramMenuBot(TelegramTurboBot):
         current = self.settings
         prompt_status = f"已輸入（{len(self.prompt)} 字）" if self.prompt else "尚未輸入"
         mode_text = "圖片生視頻" if self.input_mode == "image" else "文字生視頻"
+        mode_text = {
+            INPUT_MODE_TEXT: "T2VA 文字生視頻",
+            INPUT_MODE_IMAGE: "I2VA 圖片生視頻",
+            INPUT_MODE_FL2VA: "FL2VA 首尾幀生視頻",
+            INPUT_MODE_REF2VA: "Ref2VA 參考素材生視頻",
+        }.get(self.input_mode, "T2VA 文字生視頻")
         model_text = "MiniMax H3 Turbo"
         image_status = "已收到" if self.image_path and self.image_path.is_file() else "未收到"
+        media_status = (
+            f"首幀：{'已上傳' if self.image_path and self.image_path.is_file() else '未上傳'}；"
+            f"尾幀：{'已上傳' if self.last_image_path and self.last_image_path.is_file() else '未上傳'}"
+            if self.input_mode == INPUT_MODE_FL2VA
+            else (
+                f"參考圖 {len(self.reference_image_paths)} 張／"
+                f"參考片 {len(self.reference_video_paths)} 段／"
+                f"參考音訊 {len(self.reference_audio_paths)} 段"
+                if self.input_mode == INPUT_MODE_REF2VA
+                else image_status
+            )
+        )
         prefix = f"{notice}\n\n" if notice else ""
         if self.total_seconds > MAX_SEGMENT_SECONDS:
             duration_text = (
@@ -5897,6 +6454,7 @@ class TelegramMenuBot(TelegramTurboBot):
         else:
             idle_shutdown_text = "已關閉"
         menu = (
+            f"模式素材：{media_status}\n"
             f"{prefix}{model_text} 控制面板\n\n"
             f"模型：{model_text}\n"
             f"輸入模式：{mode_text}\n"
@@ -6128,6 +6686,33 @@ class TelegramMenuBot(TelegramTurboBot):
         return None
 
     @staticmethod
+    def video_file_id(message: dict[str, Any]) -> Optional[str]:
+        video = message.get("video")
+        if isinstance(video, dict) and video.get("file_id"):
+            return str(video["file_id"])
+        document = message.get("document")
+        if isinstance(document, dict) and document.get("file_id"):
+            mime_type = str(document.get("mime_type", "")).lower()
+            suffix = Path(str(document.get("file_name", ""))).suffix.lower()
+            if mime_type.startswith("video/") or suffix in {".mp4", ".mov", ".webm", ".mkv"}:
+                return str(document["file_id"])
+        return None
+
+    @staticmethod
+    def audio_file_id(message: dict[str, Any]) -> Optional[str]:
+        for key in ("audio", "voice"):
+            media = message.get(key)
+            if isinstance(media, dict) and media.get("file_id"):
+                return str(media["file_id"])
+        document = message.get("document")
+        if isinstance(document, dict) and document.get("file_id"):
+            mime_type = str(document.get("mime_type", "")).lower()
+            suffix = Path(str(document.get("file_name", ""))).suffix.lower()
+            if mime_type.startswith("audio/") or suffix in {".mp3", ".wav", ".m4a", ".ogg", ".flac"}:
+                return str(document["file_id"])
+        return None
+
+    @staticmethod
     def prompt_file_info(
         message: dict[str, Any],
     ) -> Optional[tuple[str, str, Optional[int]]]:
@@ -6159,6 +6744,63 @@ class TelegramMenuBot(TelegramTurboBot):
             suffix = Path(remote_path).suffix.lower()
             if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
                 suffix = ".jpg"
+            caption = str(message.get("caption", "")).strip()
+            if self.input_mode == INPUT_MODE_FL2VA:
+                REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+                # A complete pair starts a fresh FL2VA pair when the user sends
+                # another image; an incomplete pair treats the next image as
+                # its tail frame.
+                is_first = self.image_path is None or self.last_image_path is not None
+                prefix = "fl2va_first" if is_first else "fl2va_last"
+                old_patterns = [f"{prefix}.*"]
+                if is_first:
+                    old_patterns.append("fl2va_last.*")
+                for pattern in old_patterns:
+                    for old_path in REFERENCE_DIR.glob(pattern):
+                        try:
+                            old_path.unlink()
+                        except OSError:
+                            pass
+                target_path = REFERENCE_DIR / f"{prefix}{suffix}"
+                self.telegram.download_file(remote_path, target_path)
+                if is_first:
+                    self.image_path = target_path
+                    self.last_image_path = None
+                    notice = "FL2VA 首幀已收到，請再上傳尾幀圖片。"
+                else:
+                    self.last_image_path = target_path
+                    notice = "FL2VA 首幀和尾幀都已收到；現在輸入提示詞即可生成。"
+                if caption:
+                    self.prompt = caption
+                self.awaiting_prompt = False
+                self.awaiting_duration = False
+                self.save_settings()
+                self.show_menu(chat_id, notice=notice)
+                return
+            if self.input_mode == INPUT_MODE_REF2VA:
+                if len(self.reference_image_paths) >= MAX_REF2VA_IMAGES:
+                    self.send_safe(chat_id, f"Ref2VA 最多支援 {MAX_REF2VA_IMAGES} 張參考圖。")
+                    return
+                REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+                target_path = (
+                    REFERENCE_DIR
+                    / f"ref_image_{len(self.reference_image_paths) + 1:02d}{suffix}"
+                )
+                self.telegram.download_file(remote_path, target_path)
+                self.reference_image_paths.append(target_path)
+                if caption:
+                    self.prompt = caption
+                self.awaiting_prompt = False
+                self.awaiting_duration = False
+                self.save_settings()
+                self.show_menu(
+                    chat_id,
+                    notice=(
+                        f"Ref2VA 已收到第 {len(self.reference_image_paths)} 張參考圖；"
+                        "可繼續上傳，完成後按「完成參考素材上傳」。"
+                    ),
+                )
+                return
             IMAGE_DIR.mkdir(parents=True, exist_ok=True)
             for old_path in IMAGE_DIR.glob("current_input.*"):
                 try:
@@ -6171,7 +6813,6 @@ class TelegramMenuBot(TelegramTurboBot):
             self.input_mode = "image"
             self.awaiting_prompt = False
             self.awaiting_duration = False
-            caption = str(message.get("caption", "")).strip()
             if caption:
                 self.prompt = caption
             self.save_settings()
@@ -6181,6 +6822,85 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.show_menu(chat_id, notice="图片已收到；现在输入提示詞")
         except BotError as exc:
             self.send_safe(chat_id, f"处理图片失败：{exc}")
+
+    def handle_reference_video_message(
+        self, message: dict[str, Any], chat_id: str
+    ) -> None:
+        file_id = self.video_file_id(message)
+        if not file_id:
+            return
+        if self.input_mode != INPUT_MODE_REF2VA:
+            self.send_safe(chat_id, "參考影片目前只在 Ref2VA 模式使用，請先按 Ref2VA。")
+            return
+        if len(self.reference_video_paths) >= MAX_REF2VA_VIDEOS:
+            self.send_safe(chat_id, f"Ref2VA 最多支援 {MAX_REF2VA_VIDEOS} 段參考影片。")
+            return
+        try:
+            remote_path = self.telegram.get_file(file_id)
+            suffix = Path(remote_path).suffix.lower()
+            if suffix not in {".mp4", ".mov", ".webm", ".mkv"}:
+                suffix = ".mp4"
+            REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+            target_path = (
+                REFERENCE_DIR
+                / f"ref_video_{len(self.reference_video_paths) + 1:02d}{suffix}"
+            )
+            data = self.telegram.download_bytes(
+                remote_path, MAX_TELEGRAM_IMAGE_BYTES, "參考影片"
+            )
+            target_path.write_bytes(data)
+            self.reference_video_paths.append(target_path)
+            caption = str(message.get("caption", "")).strip()
+            if caption:
+                self.prompt = caption
+            self.save_settings()
+            self.show_menu(
+                chat_id,
+                notice=(
+                    f"Ref2VA 已收到第 {len(self.reference_video_paths)} 段參考影片；"
+                    "可繼續上傳，完成後按「完成參考素材上傳」。"
+                ),
+            )
+        except BotError as exc:
+            self.send_safe(chat_id, f"參考影片下載失敗：{exc}")
+
+    def handle_reference_audio_message(
+        self, message: dict[str, Any], chat_id: str
+    ) -> None:
+        file_id = self.audio_file_id(message)
+        if not file_id:
+            return
+        if self.input_mode != INPUT_MODE_REF2VA:
+            self.send_safe(chat_id, "參考音訊目前只在 Ref2VA 模式使用，請先按 Ref2VA。")
+            return
+        if len(self.reference_audio_paths) >= MAX_REF2VA_AUDIOS:
+            self.send_safe(chat_id, f"Ref2VA 最多支援 {MAX_REF2VA_AUDIOS} 段參考音訊。")
+            return
+        try:
+            remote_path = self.telegram.get_file(file_id)
+            suffix = Path(remote_path).suffix.lower()
+            if suffix not in {".mp3", ".wav", ".m4a", ".ogg", ".flac"}:
+                suffix = ".ogg"
+            REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+            target_path = (
+                REFERENCE_DIR
+                / f"ref_audio_{len(self.reference_audio_paths) + 1:02d}{suffix}"
+            )
+            data = self.telegram.download_bytes(
+                remote_path, MAX_TELEGRAM_IMAGE_BYTES, "參考音訊"
+            )
+            target_path.write_bytes(data)
+            self.reference_audio_paths.append(target_path)
+            self.save_settings()
+            self.show_menu(
+                chat_id,
+                notice=(
+                    f"Ref2VA 已收到第 {len(self.reference_audio_paths)} 段參考音訊；"
+                    "可繼續上傳，完成後按「完成參考素材上傳」。"
+                ),
+            )
+        except BotError as exc:
+            self.send_safe(chat_id, f"參考音訊下載失敗：{exc}")
 
     def handle_prompt_file_message(self, message: dict[str, Any], chat_id: str) -> None:
         file_info = self.prompt_file_info(message)
@@ -6236,6 +6956,12 @@ class TelegramMenuBot(TelegramTurboBot):
     def handle_message(self, message: dict[str, Any]) -> None:
         chat_id = str(message.get("chat", {}).get("id", ""))
         if chat_id != self.allowed_chat_id:
+            return
+        if self.video_file_id(message):
+            self.handle_reference_video_message(message, chat_id)
+            return
+        if self.audio_file_id(message):
+            self.handle_reference_audio_message(message, chat_id)
             return
         if self.image_file_id(message):
             self.handle_image_message(message, chat_id)
@@ -6392,6 +7118,27 @@ class TelegramMenuBot(TelegramTurboBot):
         thread.start()
         self.show_menu(chat_id, message_id)
 
+    def clear_uploaded_media(self) -> None:
+        paths = []
+        if self.image_path:
+            paths.append(self.image_path)
+        if self.last_image_path:
+            paths.append(self.last_image_path)
+        paths.extend(self.reference_image_paths)
+        paths.extend(self.reference_video_paths)
+        paths.extend(self.reference_audio_paths)
+        for path in dict.fromkeys(paths):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        self.image_path = None
+        self.last_image_path = None
+        self.reference_image_paths = []
+        self.reference_video_paths = []
+        self.reference_audio_paths = []
+        self.save_settings()
+
     def handle_callback(self, callback: dict[str, Any]) -> None:
         query_id = str(callback.get("id", ""))
         message = callback.get("message") or {}
@@ -6478,15 +7225,40 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.save_settings()
                 self.show_menu(chat_id, message_id, "目前使用：MiniMax H3 Turbo")
                 return
-            if data == "mode:text":
-                self.input_mode = "text"
+            if data in {"mode:text", "mode:image"}:
+                self.input_mode = (
+                    INPUT_MODE_TEXT if data == "mode:text" else INPUT_MODE_IMAGE
+                )
                 self.save_settings()
-                self.show_menu(chat_id, message_id, "已切换到文字生视频")
+                self.show_menu(chat_id, message_id, "生成模式已切換。")
                 return
-            if data == "mode:image":
-                self.input_mode = "image"
+            if data == "mode:fl2va":
+                self.input_mode = INPUT_MODE_FL2VA
                 self.save_settings()
-                self.show_menu(chat_id, message_id, "请发送一张图片")
+                self.show_menu(
+                    chat_id,
+                    message_id,
+                    "已選 FL2VA：請依次上傳首幀圖片、尾幀圖片，再輸入提示詞。",
+                )
+                return
+            if data == "mode:ref2va":
+                self.input_mode = INPUT_MODE_REF2VA
+                self.save_settings()
+                self.show_menu(
+                    chat_id,
+                    message_id,
+                    "已選 Ref2VA：可連續上傳參考圖片／影片／音訊，完成後按按鈕。",
+                )
+                return
+            if data == "media_done":
+                if self.input_mode == INPUT_MODE_REF2VA and not (
+                    self.reference_image_paths
+                    or self.reference_video_paths
+                    or self.reference_audio_paths
+                ):
+                    self.send_safe(chat_id, "Ref2VA 尚未收到任何參考素材。")
+                    return
+                self.show_menu(chat_id, message_id, "參考素材已完成；現在輸入提示詞或按生成。")
                 return
             if data.startswith("res:"):
                 width, height = data.removeprefix("res:").split("x", 1)
@@ -6511,6 +7283,12 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.input_mode = self.load_saved_mode()
                 self.model_mode = self.load_saved_model_mode()
                 self.image_path = self.load_saved_image_path()
+                saved_media = self._load_saved_media_paths
+                saved_last = saved_media("last_image_paths")
+                self.last_image_path = saved_last[0] if saved_last else None
+                self.reference_image_paths = saved_media("reference_image_paths")
+                self.reference_video_paths = saved_media("reference_video_paths")
+                self.reference_audio_paths = saved_media("reference_audio_paths")
                 self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
                 self.show_menu(chat_id, message_id, "已讀取上次設定")
                 return
@@ -6546,14 +7324,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.show_menu(chat_id, message_id, "提示詞已清除")
                 return
             if data == "clear_image":
-                if self.image_path and self.image_path.is_file():
-                    try:
-                        self.image_path.unlink()
-                    except OSError:
-                        pass
-                self.image_path = None
-                self.save_settings()
-                self.show_menu(chat_id, message_id, "输入图片已清除")
+                self.clear_uploaded_media()
+                self.show_menu(chat_id, message_id, "已清除目前模式的全部上傳素材。")
                 return
             if data.startswith("vram:"):
                 mode = normalize_comfyui_vram_mode(data.removeprefix("vram:"))
@@ -6600,8 +7372,24 @@ class TelegramMenuBot(TelegramTurboBot):
                     self.send_safe(chat_id, "請先輸入自定義總片長秒數，或使用 /cancel 取消。")
                 elif self.awaiting_prompt:
                     self.send_safe(chat_id, "請先貼上提示詞，或使用 /cancel。")
-                elif self.input_mode == "image" and not self.image_path:
-                    self.send_safe(chat_id, "圖片模式還沒有圖片；請先發送一張圖片。")
+                elif self.input_mode == INPUT_MODE_IMAGE and not self.image_path:
+                    self.send_safe(chat_id, "請先上傳圖片。")
+                elif self.input_mode == INPUT_MODE_FL2VA and (
+                    not self.image_path or not self.last_image_path
+                ):
+                    self.send_safe(
+                        chat_id,
+                        "FL2VA 需要兩張圖片：請先上傳首幀，再上傳尾幀。",
+                    )
+                elif self.input_mode == INPUT_MODE_REF2VA and not (
+                    self.reference_image_paths
+                    or self.reference_video_paths
+                    or self.reference_audio_paths
+                ):
+                    self.send_safe(
+                        chat_id,
+                        "Ref2VA 需要至少一份參考圖片、影片或音訊。",
+                    )
                 elif not self.prompt:
                     self.request_prompt(chat_id)
                 else:
@@ -6635,6 +7423,22 @@ class TelegramMenuBot(TelegramTurboBot):
             self.model_mode = selected_model
             self.save_settings()
             self.show_menu(chat_id, notice="目前使用：MiniMax H3 Turbo")
+            return
+        if command in {"/fl2va", "/first_last"}:
+            self.input_mode = INPUT_MODE_FL2VA
+            self.save_settings()
+            self.send_safe(
+                chat_id,
+                "已選 FL2VA：請依次上傳首幀圖片、尾幀圖片，再輸入提示詞。",
+            )
+            return
+        if command in {"/ref2va", "/reference"}:
+            self.input_mode = INPUT_MODE_REF2VA
+            self.save_settings()
+            self.send_safe(
+                chat_id,
+                "已選 Ref2VA：連續上傳參考圖片／影片／音訊，完成後按選單按鈕。",
+            )
             return
         if command == "/image":
             self.input_mode = "image"
@@ -6873,6 +7677,8 @@ class TelegramMenuBot(TelegramTurboBot):
             {"command": "model", "description": "查看目前使用的 MiniMax H3 Turbo"},
             {"command": "image", "description": "切換圖生視頻"},
             {"command": "text", "description": "切換文生視頻"},
+            {"command": "fl2va", "description": "FL2VA 首尾幀模式"},
+            {"command": "ref2va", "description": "Ref2VA 參考素材模式"},
             {"command": "duration", "description": "設定秒數"},
             {"command": "status", "description": "查看目前狀態"},
             {"command": "cancel", "description": "中止目前生成"},

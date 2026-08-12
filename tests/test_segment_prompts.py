@@ -123,8 +123,26 @@ same camera language and realistic style
         self.assertEqual("reference_only", conditioning["audio_mode"])
         self.assertTrue(conditioning["add_source_as_reference"])
         self.assertEqual(1, conditioning["prompt_primary_audio_ordinal"])
-        self.assertEqual(["14", 0], conditioning["drive_audio"])
-        self.assertEqual("LoadAudio", workflow["14"]["class_type"])
+        audio_ref = conditioning["drive_audio"]
+        self.assertEqual("LoadAudio", workflow[audio_ref[0]]["class_type"])
+
+    def test_image_and_audio_references_do_not_overwrite_turbo_scheduler(self):
+        config = BOT.GenerationConfig(864, 480, 8, 15.0, BOT.valid_length(15.0))
+        workflow = BOT.build_workflow(
+            config,
+            "continue from the supplied image",
+            image_name="TelegramInputs/continuation.png",
+            audio_reference_name="TelegramAudio/previous.mp4",
+        )
+
+        self.assertEqual("BasicScheduler", workflow["13"]["class_type"])
+        self.assertEqual(["13", 0], workflow["10"]["inputs"]["sigmas"])
+        image_ref = workflow["6"]["inputs"]["first_frame"]
+        audio_ref = workflow["6"]["inputs"]["drive_audio"]
+        self.assertNotEqual(image_ref[0], "13")
+        self.assertNotEqual(audio_ref[0], "13")
+        self.assertEqual("LoadImage", workflow[image_ref[0]]["class_type"])
+        self.assertEqual("LoadAudio", workflow[audio_ref[0]]["class_type"])
 
 
 class TimelinePromptTests(unittest.TestCase):
@@ -210,6 +228,40 @@ action seven. then action eight.
         self.assertEqual(8, len(plan.shots))
         self.assertTrue(all(shot.duration <= 8.0 for shot in plan.shots))
         self.assertNotEqual(plan.shots[0].action, plan.shots[1].action)
+
+    def test_segment_count_is_not_derived_from_fifteen_second_default(self):
+        segments = "\n".join(
+            f"SEGMENT {number}:\nunique action {number}."
+            for number in range(1, 13)
+        )
+        plan = BOT.build_long_video_plan(
+            f"GLOBAL:\nsame person and location\n{segments}",
+            120.0,
+        )
+
+        self.assertEqual("segments", plan.source_format)
+        # Twelve story SEGMENT blocks become two <=8-second H3 shots each
+        # when the requested total is 120 seconds.
+        self.assertEqual(24, len(plan.shots))
+        self.assertAlmostEqual(0.0, plan.shots[0].start_seconds)
+        self.assertAlmostEqual(120.0, plan.shots[-1].end_seconds)
+        self.assertTrue(all(4.9 <= shot.duration <= 5.1 for shot in plan.shots))
+        self.assertEqual("unique action 12.", plan.shots[-1].action)
+
+    def test_segment_numbering_must_be_consecutive(self):
+        prompt = "GLOBAL:\nsame style\nSEGMENT 1:\nstart\nSEGMENT 3:\nlater"
+
+        with self.assertRaisesRegex(BOT.BotError, "expected SEGMENT 2"):
+            BOT.build_long_video_plan(prompt, 30.0)
+
+    def test_segment_count_cannot_make_each_segment_shorter_than_model_minimum(self):
+        segments = "\n".join(
+            f"SEGMENT {number}:\naction {number}."
+            for number in range(1, 17)
+        )
+
+        with self.assertRaisesRegex(BOT.BotError, "too many"):
+            BOT.build_long_video_plan(segments, 30.0)
 
     def test_transition_filter_preserves_story_offsets(self):
         shots = (
