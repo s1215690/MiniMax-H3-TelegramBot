@@ -212,6 +212,7 @@ def control_panel_reply_markup() -> dict[str, Any]:
     return {
         "keyboard": [[{"text": CONTROL_PANEL_BUTTON}]],
         "resize_keyboard": True,
+        "one_time_keyboard": False,
         "is_persistent": True,
     }
 
@@ -3190,7 +3191,11 @@ class TelegramTurboBot:
 
     def send_safe(self, chat_id: str, text: str) -> None:
         try:
-            self.telegram.send_message(chat_id, text)
+            self.telegram.send_message(
+                chat_id,
+                text,
+                reply_markup=control_panel_reply_markup(),
+            )
         except BotError as exc:
             print(f"Telegram sendMessage error: {exc}", flush=True)
 
