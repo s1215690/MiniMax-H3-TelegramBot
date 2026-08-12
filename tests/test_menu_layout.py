@@ -121,6 +121,38 @@ class MenuLayoutTests(unittest.TestCase):
             "123", 77, section=BOT.MENU_QUALITY
         )
 
+    def test_persistent_keyboard_button_reopens_the_panel(self):
+        self.bot.allowed_chat_id = "123"
+        self.bot.show_menu = Mock()
+
+        self.bot.handle_message(
+            {"chat": {"id": "123"}, "text": BOT.CONTROL_PANEL_BUTTON}
+        )
+
+        self.bot.show_menu.assert_called_once_with("123")
+
+    def test_control_panel_keyboard_is_persistent_and_compact(self):
+        markup = BOT.control_panel_reply_markup()
+        self.assertEqual([[{"text": BOT.CONTROL_PANEL_BUTTON}]], markup["keyboard"])
+        self.assertTrue(markup["resize_keyboard"])
+        self.assertTrue(markup["is_persistent"])
+
+    def test_menu_message_is_pinned(self):
+        client = BOT.TelegramClient.__new__(BOT.TelegramClient)
+        client.call = Mock(return_value=True)
+
+        client.pin_chat_message("123", 456)
+
+        client.call.assert_called_once_with(
+            "pinChatMessage",
+            {
+                "chat_id": "123",
+                "message_id": 456,
+                "disable_notification": "true",
+            },
+            timeout=30,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
