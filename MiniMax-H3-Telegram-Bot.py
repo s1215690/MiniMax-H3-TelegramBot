@@ -7158,7 +7158,9 @@ class TelegramMenuBot(TelegramTurboBot):
         if not text:
             return
         if text == CONTROL_PANEL_BUTTON:
-            self.show_menu(chat_id)
+            # Editing the old inline panel does not scroll Telegram back to it.
+            # Send a fresh panel at the current chat position instead.
+            self.show_menu(chat_id, force_new=True, section=MENU_MAIN)
             return
         if self.awaiting_extension_duration and text.lower() != "/cancel":
             if text.startswith("/"):

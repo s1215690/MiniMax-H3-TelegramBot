@@ -129,7 +129,9 @@ class MenuLayoutTests(unittest.TestCase):
             {"chat": {"id": "123"}, "text": BOT.CONTROL_PANEL_BUTTON}
         )
 
-        self.bot.show_menu.assert_called_once_with("123")
+        self.bot.show_menu.assert_called_once_with(
+            "123", force_new=True, section=BOT.MENU_MAIN
+        )
 
     def test_control_panel_keyboard_is_persistent_and_compact(self):
         markup = BOT.control_panel_reply_markup()
