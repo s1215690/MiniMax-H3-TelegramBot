@@ -5384,7 +5384,6 @@ class TelegramMenuBot(TelegramTurboBot):
                             "callback_data": "menu:settings",
                         }
                     ],
-                    [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
                 ]
             )
             if active_job is not None:
@@ -5400,16 +5399,12 @@ class TelegramMenuBot(TelegramTurboBot):
             rows.extend(checkpoint_rows)
             rows.extend(
                 [
-                    [{"text": "🌡 查看電腦溫度", "callback_data": "temperature"}],
                     [
-                        {"text": "▶️ 啟動 ComfyUI", "callback_data": "comfy_start"},
-                        {"text": "📡 ComfyUI 狀態", "callback_data": "comfy_status"},
+                        {
+                            "text": "🖥️ 電腦／ComfyUI／Bot",
+                            "callback_data": "menu:system",
+                        }
                     ],
-                    [
-                        {"text": "🔄 重啟 ComfyUI", "callback_data": "comfy_restart"},
-                        {"text": "⏹ 關閉 ComfyUI", "callback_data": "comfy_stop"},
-                    ],
-                    [{"text": "🔄 重啟 Bot", "callback_data": "bot_restart"}],
                 ]
             )
             shutdown_label = (
@@ -5429,6 +5424,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     }
                 ]
             )
+            rows.append([{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}])
         elif section == MENU_INPUT:
             rows = [
                 [
