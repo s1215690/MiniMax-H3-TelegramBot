@@ -6111,7 +6111,8 @@ class TelegramMenuBot(TelegramTurboBot):
             chat_id,
             f"已解析{format_text}：共 {segment_total} 個連續鏡頭，"
             f"每鏡頭最多 {MAX_SHOT_SECONDS:g} 秒。\n"
-            "後續鏡頭會使用上一鏡尾幀和第一鏡音訊風格，合併時加入短音畫轉場。",
+            "後續鏡頭會使用上一鏡尾幀；每鏡重新生成原生音訊，避免重複上一鏡對白。\n"
+            "若你另外上傳參考音訊，仍會按參考音訊模式生成。",
         )
         thread = threading.Thread(target=self.run_long_job, args=(job,), daemon=True)
         thread.start()
@@ -6251,7 +6252,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 else:
                     self.send_safe(
                         job.chat_id,
-                        "Motion Context 節點未就緒，這次先使用穩定的尾幀＋音訊參考模式。",
+                        "Motion Context 節點未就緒，這次先使用穩定的尾幀接續；每鏡頭改用原生音訊。",
                     )
             context_video_name: Optional[str] = None
             context_latent_path: Optional[str] = None
@@ -6276,12 +6277,14 @@ class TelegramMenuBot(TelegramTurboBot):
                         context_video_name = None
                         self.send_safe(
                             job.chat_id,
-                            "上一鏡沒有可用的 AV latent，這次改用尾幀＋音訊參考接續。",
+                            "上一鏡沒有可用的 AV latent，這次改用尾幀接續；後續鏡頭使用原生音訊。",
                         )
                 if not motion_context_enabled:
-                    job.audio_reference_name = upload_audio_to_comfy(
-                        job.initial_context_video_path
-                    )
+                    # Keep only the previous video's visual tail frame. Do not
+                    # feed its complete audio into the next shot: that can
+                    # replay the previous dialogue or music. Explicit audio
+                    # references uploaded by the user remain independent.
+                    job.audio_reference_name = None
                     continuation_path = (
                         CONTINUATION_DIR
                         / f"{uuid.uuid4().hex}_resume_segment.png"
@@ -6427,9 +6430,11 @@ class TelegramMenuBot(TelegramTurboBot):
                         )
                         context_video_name = upload_video_to_comfy(video_path)
                     else:
-                        # Keep the immediate previous segment as the stable
-                        # reference instead of always reusing segment 1.
-                        job.audio_reference_name = upload_audio_to_comfy(video_path)
+                        # Keep visual continuity from the immediate previous
+                        # segment, but generate native audio for this shot.
+                        # Reusing the complete previous audio can replay its
+                        # dialogue or music in every subsequent shot.
+                        job.audio_reference_name = None
                         previous_frame = job.continuation_image_path
                         continuation_path = (
                             CONTINUATION_DIR

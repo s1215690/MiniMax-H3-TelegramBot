@@ -71,6 +71,21 @@ class GenerationModeWorkflowTests(unittest.TestCase):
         )
         self.assertEqual("BasicScheduler", workflow["13"]["class_type"])
 
+    def test_ref2va_without_audio_reference_uses_native_audio(self):
+        workflow = BOT.build_workflow(
+            self.config,
+            "continue from the supplied visual reference",
+            reference_image_names=["TelegramInputs/ref.png"],
+            generation_mode=BOT.INPUT_MODE_REF2VA,
+        )
+
+        conditioning = workflow["6"]["inputs"]
+        self.assertEqual("Ref2VA", conditioning["task_type"])
+        self.assertEqual("native", conditioning["audio_mode"])
+        self.assertFalse(conditioning["add_source_as_reference"])
+        self.assertEqual(0, conditioning["prompt_primary_audio_ordinal"])
+        self.assertNotIn("drive_audio", conditioning)
+
     def test_ref2va_requires_at_least_one_reference(self):
         with self.assertRaisesRegex(BOT.BotError, "至少需要"):
             BOT.build_workflow(
