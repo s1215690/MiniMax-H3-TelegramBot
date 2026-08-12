@@ -5329,7 +5329,7 @@ class TelegramMenuBot(TelegramTurboBot):
             {"text": "▶️ 播放／繼續", "callback_data": "job_resume"},
         ]
         checkpoint_rows: list[list[dict[str, str]]] = []
-        if section == MENU_HISTORY and active_job is None:
+        if section in {MENU_MAIN, MENU_HISTORY} and active_job is None:
             checkpoint_record = self.latest_long_checkpoint()
             if checkpoint_record is not None:
                 checkpoint_path, checkpoint_payload = checkpoint_record
@@ -5343,14 +5343,75 @@ class TelegramMenuBot(TelegramTurboBot):
 
         if section == MENU_MAIN:
             rows = [
-                [{"text": "🚀 生成影片", "callback_data": "generate"}],
-                [{"text": "📝 提示詞／上傳素材", "callback_data": "menu:input"}],
-                [{"text": "⚙️ 生成設定", "callback_data": "menu:settings"}],
-                [{"text": "🎬 當前任務", "callback_data": "menu:job"}],
-                [{"text": "🖥️ ComfyUI／系統", "callback_data": "menu:system"}],
-                [{"text": "📚 歷史／長片／排隊", "callback_data": "menu:history"}],
-                [{"text": "♻️ 讀取上次設定", "callback_data": "last"}],
+                mode_row,
+                reference_mode_row,
+                [
+                    {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
+                    {"text": "🧹 清除提示詞", "callback_data": "clear"},
+                ],
+                [{"text": "🗑 清除上傳素材", "callback_data": "clear_image"}],
             ]
+            if self.input_mode == INPUT_MODE_REF2VA:
+                rows.append(
+                    [{"text": "✅ 完成參考素材上傳", "callback_data": "media_done"}]
+                )
+            rows.extend(
+                [
+                    [
+                        {"text": "🚀 生成影片", "callback_data": "generate"},
+                        {"text": "♻️ 讀取上次設定", "callback_data": "last"},
+                    ],
+                    [
+                        {
+                            "text": "⚙️ 片長／解析度／steps",
+                            "callback_data": "menu:settings",
+                        }
+                    ],
+                    [{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}],
+                ]
+            )
+            if active_job is not None:
+                rows.append(job_control_row)
+            else:
+                rows.append([{"text": "目前沒有進行中的任務", "callback_data": "noop"}])
+            rows.append(
+                [
+                    {"text": "📚 歷史長片", "callback_data": "history"},
+                    {"text": "🧾 故事排隊", "callback_data": "queue_view"},
+                ]
+            )
+            rows.extend(checkpoint_rows)
+            rows.extend(
+                [
+                    [{"text": "🌡 查看電腦溫度", "callback_data": "temperature"}],
+                    [
+                        {"text": "▶️ 啟動 ComfyUI", "callback_data": "comfy_start"},
+                        {"text": "📡 ComfyUI 狀態", "callback_data": "comfy_status"},
+                    ],
+                    [
+                        {"text": "🔄 重啟 ComfyUI", "callback_data": "comfy_restart"},
+                        {"text": "⏹ 關閉 ComfyUI", "callback_data": "comfy_stop"},
+                    ],
+                    [{"text": "🔄 重啟 Bot", "callback_data": "bot_restart"}],
+                ]
+            )
+            shutdown_label = (
+                "🛑 取消即將關機"
+                if self._shutdown_pending
+                else self.selected("🔌 長片完成後關機", self.shutdown_after_generation)
+            )
+            rows.append(
+                [
+                    {
+                        "text": shutdown_label,
+                        "callback_data": (
+                            "shutdown_cancel"
+                            if self._shutdown_pending
+                            else "shutdown_toggle"
+                        ),
+                    }
+                ]
+            )
         elif section == MENU_INPUT:
             rows = [
                 [
@@ -5367,10 +5428,20 @@ class TelegramMenuBot(TelegramTurboBot):
             rows.extend(back_row())
         elif section == MENU_SETTINGS:
             rows = [
-                [{"text": "🎛️ 生成模式", "callback_data": "menu:mode"}],
-                [{"text": "⏱️ 片長／秒數", "callback_data": "menu:duration"}],
-                [{"text": "🖼️ 解析度／步數", "callback_data": "menu:quality"}],
-                [{"text": "♻️ 讀取上次設定", "callback_data": "last"}],
+                [{"text": "⏱️ 片長／秒數（按下選擇）", "callback_data": "noop"}],
+                short_seconds_row[:2],
+                short_seconds_row[2:],
+                [{"text": "長片：自動分段", "callback_data": "noop"}],
+                long_seconds_row[:3],
+                long_seconds_row[3:6],
+                long_seconds_row[6:],
+                [{"text": "✏️ 自定義秒數", "callback_data": "sec_custom"}],
+                [{"text": "🖼️ 解析度／MP（按下選擇）", "callback_data": "noop"}],
+                resolution_row[:3],
+                resolution_row[3:6],
+                resolution_row[6:],
+                [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
+                steps_row,
             ]
             rows.extend(back_row())
         elif section == MENU_MODE:
@@ -6459,7 +6530,7 @@ class TelegramMenuBot(TelegramTurboBot):
         section_titles = {
             MENU_MAIN: "主選單",
             MENU_INPUT: "提示詞／上傳素材",
-            MENU_SETTINGS: "生成設定",
+            MENU_SETTINGS: "生成參數",
             MENU_MODE: "生成模式",
             MENU_DURATION: "片長／秒數",
             MENU_QUALITY: "解析度／步數",
@@ -6523,9 +6594,9 @@ class TelegramMenuBot(TelegramTurboBot):
         else:
             idle_shutdown_text = "閒置自動關閉：關閉"
         section_hints = {
-            MENU_MAIN: "選擇下方功能；主選單只保留核心按鈕。",
+            MENU_MAIN: "模式、提示詞、任務和系統按鈕直接顯示；只有片長、解析度和 steps 收納在生成參數。",
             MENU_INPUT: "可直接發圖片、影片、音訊或 TXT；Ref2VA 素材完成後按確認。",
-            MENU_SETTINGS: "進入子頁面調整模式、片長、解析度和步數。",
+            MENU_SETTINGS: "這裡集中調整片長、解析度和 steps；其他功能仍在主選單。",
             MENU_MODE: "T2VA／I2VA／FL2VA／Ref2VA 會在生成時使用對應接線。",
             MENU_DURATION: "超過 15 秒會按提示詞時間軸自動分段。",
             MENU_QUALITY: "解析度越高越清晰，也越容易需要更多顯存。",

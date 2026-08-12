@@ -41,24 +41,36 @@ class MenuLayoutTests(unittest.TestCase):
         self.bot._shutdown_pending = False
         self.bot.lock = threading.RLock()
         self.bot.job = None
+        self.bot.allowed_chat_id = "123"
 
     def test_main_menu_is_compact_and_links_to_sections(self):
         data = callback_data(self.bot.menu_markup(BOT.MENU_MAIN))
-        self.assertEqual(7, len(data))
+        self.assertGreater(len(data), 7)
         self.assertIn("generate", data)
-        self.assertIn("menu:input", data)
         self.assertIn("menu:settings", data)
-        self.assertIn("menu:job", data)
-        self.assertIn("menu:system", data)
-        self.assertIn("menu:history", data)
+        self.assertIn("mode:text", data)
+        self.assertIn("prompt", data)
+        self.assertIn("progress", data)
+        self.assertIn("temperature", data)
+        self.assertIn("history", data)
+        self.assertNotIn("menu:input", data)
+        self.assertNotIn("menu:job", data)
+        self.assertNotIn("menu:system", data)
+        self.assertNotIn("menu:history", data)
         self.assertNotIn("res:736x416", data)
+        self.assertNotIn("steps:8", data)
+        self.assertNotIn("sec:15", data)
 
     def test_settings_sections_keep_existing_controls(self):
         settings = callback_data(self.bot.menu_markup(BOT.MENU_SETTINGS))
-        self.assertEqual(
-            ["menu:mode", "menu:duration", "menu:quality", "last", "menu:main"],
-            settings,
-        )
+        self.assertIn("sec:15", settings)
+        self.assertIn("sec:1800", settings)
+        self.assertIn("sec_custom", settings)
+        self.assertIn("res:736x416", settings)
+        self.assertIn("steps:4", settings)
+        self.assertIn("steps:8", settings)
+        self.assertIn("steps:12", settings)
+        self.assertEqual("menu:main", settings[-1])
 
         mode = callback_data(self.bot.menu_markup(BOT.MENU_MODE))
         self.assertIn("mode:text", mode)
