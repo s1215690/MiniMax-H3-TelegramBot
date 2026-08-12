@@ -3016,18 +3016,6 @@ class TelegramClient:
             timeout=30,
         )
 
-    def pin_chat_message(self, chat_id: str, message_id: int) -> None:
-        """Pin the editable control panel so new status messages cannot bury it."""
-        self.call(
-            "pinChatMessage",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "disable_notification": "true",
-            },
-            timeout=30,
-        )
-
     def send_video(self, chat_id: str, video_path: Path, caption: str) -> None:
         if not video_path.is_file():
             raise BotError(f"找不到要傳送的影片：{video_path}")
@@ -6766,7 +6754,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 result = self.telegram.send_message(chat_id, text, reply_markup=markup)
                 if isinstance(result, dict) and result.get("message_id"):
                     self.menu_message_id = int(result["message_id"])
-                    self.keep_menu_reachable(chat_id, self.menu_message_id)
+                    self.ensure_control_panel_shortcut(chat_id)
             else:
                 self.telegram.edit_message_text(
                     chat_id, target_message_id, text, reply_markup=markup
@@ -6783,22 +6771,14 @@ class TelegramMenuBot(TelegramTurboBot):
                     )
                     if isinstance(result, dict) and result.get("message_id"):
                         self.menu_message_id = int(result["message_id"])
-                        self.keep_menu_reachable(chat_id, self.menu_message_id)
+                        self.ensure_control_panel_shortcut(chat_id)
                     return
                 except BotError:
                     pass
             self.send_safe(chat_id, f"選單更新失敗：{exc}")
 
-    def keep_menu_reachable(self, chat_id: str, message_id: int) -> None:
-        """Pin the live panel, falling back to a persistent bottom shortcut."""
-        try:
-            self.telegram.pin_chat_message(chat_id, message_id)
-        except BotError as exc:
-            bot_log(f"control panel pin unavailable: {exc}")
-            self.ensure_control_panel_shortcut(chat_id)
-
     def ensure_control_panel_shortcut(self, chat_id: str) -> None:
-        """Install a persistent bottom keyboard when pinning is unavailable."""
+        """Install a persistent bottom keyboard instead of pinning messages."""
         if self.control_keyboard_sent:
             return
         try:
