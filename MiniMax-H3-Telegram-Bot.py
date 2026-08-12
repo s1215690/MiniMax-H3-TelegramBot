@@ -117,7 +117,7 @@ VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 CLIP_NAME = "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
 UNET_NAME = "minimax_h3_fl2va_int8_convrot.safetensors"
-LORA_NAME = "minimax_h3_turbo_v4_step600_ema.safetensors"
+LORA_NAME = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
 OUTPUT_PREFIX = "MiniMaxH3/Telegram_Turbo"
 STATE_PATH = Path(
     os.environ.get(

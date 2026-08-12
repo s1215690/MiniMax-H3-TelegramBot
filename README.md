@@ -29,6 +29,9 @@ Bot 不會自動固定或置頂任何 Telegram 訊息；控制面板使用輸入
 
 - `🧠 MiniMax H3 Turbo`：H3 FL2VA INT8 + Turbo 工作流，支援長片、Motion Context、恢復和音訊接續。
 
+目前預設 Turbo LoRA 為 LightX2V 正式 8 步版：
+`minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`；LoRA strength 為 `1.0`，建議先用 `8 steps`。舊 v4 LoRA 只保留在本機回退備份，不會再被預設工作流使用。
+
 可以使用 `/model h3` 或 `/h3` 查看／切換目前模型；目前 Bot 只保留 MiniMax H3 Turbo。
 
 圖片生視頻：按「🖼 圖片生視頻」，直接發一張圖片，再貼提示詞，最後按「生成影片」。也可以給圖片加 caption，caption 會直接當作提示詞。Bot 會把圖片上傳到 ComfyUI，使用 H3 Turbo 的 I2VA 首幀工作流。
