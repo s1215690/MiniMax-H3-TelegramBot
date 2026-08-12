@@ -171,7 +171,7 @@ MENU_QUALITY = "quality"
 MENU_JOB = "job"
 MENU_SYSTEM = "system"
 MENU_HISTORY = "history"
-CONTROL_PANEL_BUTTON = "🎛️ 開啟控制面板"
+CONTROL_PANEL_BUTTON = "🎛️ 面板"
 MENU_SECTIONS = {
     MENU_MAIN,
     MENU_INPUT,
@@ -214,6 +214,7 @@ def control_panel_reply_markup() -> dict[str, Any]:
         "resize_keyboard": True,
         "one_time_keyboard": False,
         "is_persistent": True,
+        "input_field_placeholder": "輸入提示詞，或按 🎛️ 面板",
     }
 
 
@@ -2929,7 +2930,7 @@ class TelegramClient:
             "setChatMenuButton",
             {
                 "chat_id": chat_id,
-                "menu_button": json.dumps({"type": "commands"}),
+                "menu_button": json.dumps({"type": "default"}),
             },
             timeout=30,
         )
@@ -7891,7 +7892,9 @@ class TelegramMenuBot(TelegramTurboBot):
             {"command": "help", "description": "查看說明"},
         ]
         try:
-            self.telegram.set_my_commands(commands)
+            # Keep slash commands working when typed manually, but do not fill
+            # Telegram's native Menu button with a second large control panel.
+            self.telegram.set_my_commands([])
             self.telegram.set_chat_menu_button(self.allowed_chat_id)
         except BotError as exc:
             bot_log(f"Telegram menu setup failed: {exc}")

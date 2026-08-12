@@ -136,9 +136,11 @@ class MenuLayoutTests(unittest.TestCase):
     def test_control_panel_keyboard_is_persistent_and_compact(self):
         markup = BOT.control_panel_reply_markup()
         self.assertEqual([[{"text": BOT.CONTROL_PANEL_BUTTON}]], markup["keyboard"])
+        self.assertEqual("🎛️ 面板", BOT.CONTROL_PANEL_BUTTON)
         self.assertTrue(markup["resize_keyboard"])
         self.assertFalse(markup["one_time_keyboard"])
         self.assertTrue(markup["is_persistent"])
+        self.assertIn("面板", markup["input_field_placeholder"])
 
     def test_status_messages_refresh_the_shortcut_keyboard(self):
         self.bot.telegram = Mock()
@@ -149,6 +151,21 @@ class MenuLayoutTests(unittest.TestCase):
             "123",
             "狀態更新",
             reply_markup=BOT.control_panel_reply_markup(),
+        )
+
+    def test_native_menu_is_reset_to_default(self):
+        client = BOT.TelegramClient.__new__(BOT.TelegramClient)
+        client.call = Mock(return_value=True)
+
+        client.set_chat_menu_button("123")
+
+        client.call.assert_called_once_with(
+            "setChatMenuButton",
+            {
+                "chat_id": "123",
+                "menu_button": '{"type": "default"}',
+            },
+            timeout=30,
         )
 
 
