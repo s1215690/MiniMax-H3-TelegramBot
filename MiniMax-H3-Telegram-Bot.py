@@ -1401,7 +1401,11 @@ def build_workflow(
         conditioning["add_source_as_reference"] = False
         conditioning["prompt_primary_audio_ordinal"] = 0
     elif mode == INPUT_MODE_REF2VA:
-        conditioning["task_type"] = "Ref2VA"
+        # Long Ref2VA uses a stable Hybrid handoff: keep the user's identity
+        # references, and pin the previous shot's final frame when one exists.
+        # This is deliberately separate from Motion Context, which is kept for
+        # the text/image long-video modes and uses the previous AV latent.
+        conditioning["task_type"] = "Hybrid" if last_image_name else "Ref2VA"
         conditioning["audio_mode"] = (
             "reference_only"
             if audio_reference_name or reference_audio_names
@@ -1446,12 +1450,21 @@ def build_workflow(
         conditioning["first_frame"] = [image_node_id, 0]
         if prompt_enhancer:
             workflow["30"]["inputs"]["image"] = [image_node_id, 0]
-    if last_image_name and not motion_context and mode == INPUT_MODE_FL2VA:
+    if last_image_name and not motion_context and mode in {
+        INPUT_MODE_FL2VA,
+        INPUT_MODE_REF2VA,
+    }:
         last_image_node_id = _next_workflow_node_id(workflow)
         workflow[last_image_node_id] = {
             "inputs": {"image": last_image_name},
             "class_type": "LoadImage",
-            "_meta": {"title": "Telegram FL2VA last frame"},
+            "_meta": {
+                "title": (
+                    "Telegram Ref2VA Hybrid tail frame"
+                    if mode == INPUT_MODE_REF2VA
+                    else "Telegram FL2VA last frame"
+                )
+            },
         }
         conditioning["last_frame"] = [last_image_node_id, 0]
     for index, reference_name in enumerate(reference_image_names):
@@ -3765,6 +3778,15 @@ class TelegramTurboBot:
             and job.continuation_image_path is not None
         ):
             image_name = upload_image_to_comfy(job.continuation_image_path)
+        elif (
+            not motion_context
+            and job.generation_mode == INPUT_MODE_REF2VA
+            and job.segment_index > 1
+            and job.continuation_image_path is not None
+        ):
+            # Ref2VA Hybrid keeps the identity/reference media and adds only
+            # the immediate previous tail frame as the continuation anchor.
+            last_image_name = upload_image_to_comfy(job.continuation_image_path)
         if not motion_context and job.generation_mode == INPUT_MODE_REF2VA:
             if not job.comfy_reference_image_names:
                 job.comfy_reference_image_names = [
@@ -6242,8 +6264,23 @@ class TelegramMenuBot(TelegramTurboBot):
                 motion_context_enabled = bool(job.resume_motion_context)
                 if motion_context_enabled and not motion_context_nodes_available():
                     motion_context_enabled = False
-            if LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}:
+            if job.generation_mode == INPUT_MODE_REF2VA:
                 if motion_context_enabled:
+                    bot_log(
+                        "Ref2VA long job: switching from AV Motion Context to "
+                        "reference-plus-tail Hybrid"
+                    )
+                # Ref2VA must keep its identity references on every shot. The
+                # regular Motion Context graph intentionally replaces those
+                # inputs, so use the exact previous tail-frame Hybrid path.
+                motion_context_enabled = False
+            if LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}:
+                if job.generation_mode == INPUT_MODE_REF2VA:
+                    self.send_safe(
+                        job.chat_id,
+                        "已啟用 Ref2VA Hybrid：每個後續鏡頭保留參考圖，並接續上一鏡尾幀。",
+                    )
+                elif motion_context_enabled:
                     self.send_safe(
                         job.chat_id,
                         "已啟用實驗性 H3 Motion Context：後續鏡頭會接續上一段的尾幀、"

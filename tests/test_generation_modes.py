@@ -86,6 +86,42 @@ class GenerationModeWorkflowTests(unittest.TestCase):
         self.assertEqual(0, conditioning["prompt_primary_audio_ordinal"])
         self.assertNotIn("drive_audio", conditioning)
 
+    def test_ref2va_tail_frame_uses_hybrid_without_dropping_references(self):
+        workflow = BOT.build_workflow(
+            self.config,
+            "continue the exact subject from the supplied tail frame",
+            last_image_name="TelegramInputs/previous_tail.png",
+            reference_image_names=[
+                "TelegramInputs/identity_a.png",
+                "TelegramInputs/identity_b.png",
+            ],
+            generation_mode=BOT.INPUT_MODE_REF2VA,
+        )
+
+        conditioning = workflow["6"]["inputs"]
+        self.assertEqual("Hybrid", conditioning["task_type"])
+        self.assertEqual("native", conditioning["audio_mode"])
+        self.assertEqual(0, conditioning["prompt_primary_audio_ordinal"])
+        self.assertIn("last_frame", conditioning)
+        self.assertEqual(
+            "LoadImage",
+            workflow[conditioning["last_frame"][0]]["class_type"],
+        )
+        self.assertEqual(
+            "LoadImage",
+            workflow[conditioning["ref_images.ref_image_0"][0]]["class_type"],
+        )
+        self.assertEqual(
+            "LoadImage",
+            workflow[conditioning["ref_images.ref_image_1"][0]]["class_type"],
+        )
+        self.assertFalse(
+            any(
+                node.get("class_type") == "MiniMaxH3MotionContext"
+                for node in workflow.values()
+            )
+        )
+
     def test_ref2va_requires_at_least_one_reference(self):
         with self.assertRaisesRegex(BOT.BotError, "至少需要"):
             BOT.build_workflow(
