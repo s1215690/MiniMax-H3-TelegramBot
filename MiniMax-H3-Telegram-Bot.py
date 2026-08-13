@@ -3755,6 +3755,16 @@ class TelegramTurboBot:
         segment_started_at = time.time()
         image_name: Optional[str] = None
         last_image_name: Optional[str] = None
+        # Ref2VA is useful for locking the opening identity, but carrying the
+        # same reference images into every later shot can pull the model back
+        # to the same pose.  After the first shot, switch to ordinary I2VA and
+        # use only the immediately previous tail frame as its first frame.
+        use_ref2va_tail_i2va = (
+            not motion_context
+            and job.generation_mode == INPUT_MODE_REF2VA
+            and job.segment_index > 1
+            and job.continuation_image_path is not None
+        )
         if (
             not motion_context
             and job.generation_mode in {INPUT_MODE_IMAGE, INPUT_MODE_FL2VA}
@@ -3779,15 +3789,15 @@ class TelegramTurboBot:
         ):
             image_name = upload_image_to_comfy(job.continuation_image_path)
         elif (
+            use_ref2va_tail_i2va
+        ):
+            image_name = upload_image_to_comfy(job.continuation_image_path)
+        ref2va_reference_segment = (
             not motion_context
             and job.generation_mode == INPUT_MODE_REF2VA
-            and job.segment_index > 1
-            and job.continuation_image_path is not None
-        ):
-            # Ref2VA Hybrid keeps the identity/reference media and adds only
-            # the immediate previous tail frame as the continuation anchor.
-            last_image_name = upload_image_to_comfy(job.continuation_image_path)
-        if not motion_context and job.generation_mode == INPUT_MODE_REF2VA:
+            and not use_ref2va_tail_i2va
+        )
+        if ref2va_reference_segment:
             if not job.comfy_reference_image_names:
                 job.comfy_reference_image_names = [
                     upload_image_to_comfy(path)
@@ -3813,6 +3823,8 @@ class TelegramTurboBot:
             ):
                 raise BotError("Ref2VA 參考素材不存在，請重新上傳圖片、影片或音訊。")
         workflow_mode = job.generation_mode
+        if use_ref2va_tail_i2va:
+            workflow_mode = INPUT_MODE_IMAGE
         if (
             workflow_mode == INPUT_MODE_FL2VA
             and job.segment_index > 1
@@ -3825,9 +3837,21 @@ class TelegramTurboBot:
             job.output_prefix,
             image_name=image_name,
             last_image_name=last_image_name,
-            reference_image_names=job.comfy_reference_image_names,
-            reference_video_names=job.comfy_reference_video_names,
-            reference_audio_names=job.comfy_reference_audio_names,
+            reference_image_names=(
+                job.comfy_reference_image_names
+                if workflow_mode == INPUT_MODE_REF2VA
+                else []
+            ),
+            reference_video_names=(
+                job.comfy_reference_video_names
+                if workflow_mode == INPUT_MODE_REF2VA
+                else []
+            ),
+            reference_audio_names=(
+                job.comfy_reference_audio_names
+                if workflow_mode == INPUT_MODE_REF2VA
+                else []
+            ),
             audio_reference_name=(None if motion_context else job.audio_reference_name),
             generation_mode=workflow_mode,
             motion_context=motion_context,
@@ -6267,18 +6291,19 @@ class TelegramMenuBot(TelegramTurboBot):
             if job.generation_mode == INPUT_MODE_REF2VA:
                 if motion_context_enabled:
                     bot_log(
-                        "Ref2VA long job: switching from AV Motion Context to "
-                        "reference-plus-tail Hybrid"
+                        "Ref2VA long job: disabling AV Motion Context; using "
+                        "Ref2VA for shot 1 and I2VA tail continuation afterwards"
                     )
-                # Ref2VA must keep its identity references on every shot. The
-                # regular Motion Context graph intentionally replaces those
-                # inputs, so use the exact previous tail-frame Hybrid path.
+                # Ref2VA is used only for the opening shot.  Later shots are
+                # assembled by run_segment as I2VA from the previous tail
+                # frame, so the reference pose cannot reset every segment.
                 motion_context_enabled = False
             if LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}:
                 if job.generation_mode == INPUT_MODE_REF2VA:
                     self.send_safe(
                         job.chat_id,
-                        "已啟用 Ref2VA Hybrid：每個後續鏡頭保留參考圖，並接續上一鏡尾幀。",
+                        "已啟用長片接續：第 1 鏡使用 Ref2VA 多參考圖；第 2 鏡起改用 I2VA，"
+                        "只接續上一鏡尾幀，避免每段重複參考姿勢。",
                     )
                 elif motion_context_enabled:
                     self.send_safe(

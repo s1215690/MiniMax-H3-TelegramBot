@@ -122,6 +122,28 @@ class GenerationModeWorkflowTests(unittest.TestCase):
             )
         )
 
+    def test_ref2va_followup_uses_i2va_tail_without_references(self):
+        workflow = BOT.build_workflow(
+            self.config,
+            "continue the current shot from the previous tail frame",
+            image_name="TelegramInputs/previous_tail.png",
+            generation_mode=BOT.INPUT_MODE_IMAGE,
+        )
+
+        conditioning = workflow["6"]["inputs"]
+        self.assertEqual("I2VA", conditioning["task_type"])
+        self.assertEqual("native", conditioning["audio_mode"])
+        self.assertEqual(
+            "minimax_h3_fl2va_int8_convrot.safetensors",
+            workflow["4"]["inputs"]["unet_name"],
+        )
+        self.assertIn("first_frame", conditioning)
+        self.assertEqual(
+            "LoadImage",
+            workflow[conditioning["first_frame"][0]]["class_type"],
+        )
+        self.assertNotIn("ref_images.ref_image_0", conditioning)
+
     def test_ref2va_requires_at_least_one_reference(self):
         with self.assertRaisesRegex(BOT.BotError, "至少需要"):
             BOT.build_workflow(
