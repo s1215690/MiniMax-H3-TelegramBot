@@ -1347,6 +1347,7 @@ def build_workflow(
     motion_context: bool = False,
     context_video_name: Optional[str] = None,
     context_latent_path: Optional[str] = None,
+    load_latent_clip_index: int = 0,
     save_latent_prefix: Optional[str] = None,
     save_latent_clip_index: Optional[int] = None,
 ) -> dict[str, Any]:
@@ -1524,7 +1525,11 @@ def build_workflow(
         workflow["17"] = {
             "inputs": {
                 "latent_path": context_latent_path,
-                "clip_index": 0,
+                # The Motion Context loader selects the clip we continue
+                # FROM.  A path may point to an exact file (where this index
+                # is ignored), but a directory/prefix must use the previous
+                # shot's fixed slot instead of newest-file mode (0).
+                "clip_index": max(0, int(load_latent_clip_index)),
             },
             "class_type": "MiniMaxH3MotionContextLoadLatent",
             "_meta": {"title": "Previous H3 AV latent"},
@@ -3749,6 +3754,7 @@ class TelegramTurboBot:
         motion_context: bool = False,
         context_video_name: Optional[str] = None,
         context_latent_path: Optional[str] = None,
+        load_latent_clip_index: int = 0,
         save_latent_prefix: Optional[str] = None,
         save_latent_clip_index: Optional[int] = None,
     ) -> Path:
@@ -3857,6 +3863,7 @@ class TelegramTurboBot:
             motion_context=motion_context,
             context_video_name=context_video_name,
             context_latent_path=context_latent_path,
+            load_latent_clip_index=load_latent_clip_index,
             save_latent_prefix=save_latent_prefix,
             save_latent_clip_index=save_latent_clip_index,
         )
@@ -6413,6 +6420,7 @@ class TelegramMenuBot(TelegramTurboBot):
                             motion_context=use_motion_context,
                             context_video_name=context_video_name,
                             context_latent_path=context_latent_path,
+                            load_latent_clip_index=(index - 1 if use_motion_context else 0),
                             save_latent_prefix=latent_prefix,
                             save_latent_clip_index=index if latent_prefix else None,
                         )

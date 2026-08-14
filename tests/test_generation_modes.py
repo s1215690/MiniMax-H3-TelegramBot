@@ -144,6 +144,29 @@ class GenerationModeWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("ref_images.ref_image_0", conditioning)
 
+    def test_motion_context_loads_previous_clip_and_saves_current_clip(self):
+        workflow = BOT.build_workflow(
+            self.config,
+            "continue the previous motion context",
+            motion_context=True,
+            context_video_name="TelegramInputs/previous.mp4",
+            context_latent_path="MiniMaxH3/test_chain/latent",
+            load_latent_clip_index=2,
+            save_latent_prefix="MiniMaxH3/test_chain/latent",
+            save_latent_clip_index=3,
+        )
+
+        self.assertEqual(
+            "MiniMaxH3MotionContextLoadLatent",
+            workflow["17"]["class_type"],
+        )
+        self.assertEqual(2, workflow["17"]["inputs"]["clip_index"])
+        self.assertEqual(
+            "MiniMaxH3MotionContextSaveLatent",
+            workflow["20"]["class_type"],
+        )
+        self.assertEqual(3, workflow["20"]["inputs"]["clip_index"])
+
     def test_ref2va_requires_at_least_one_reference(self):
         with self.assertRaisesRegex(BOT.BotError, "至少需要"):
             BOT.build_workflow(
