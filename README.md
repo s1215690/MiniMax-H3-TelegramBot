@@ -25,14 +25,22 @@ Bot 本身會保持運行；ComfyUI 連續 5 分鐘沒有 Bot 任務、而且 Co
 
 Bot 不會自動固定或置頂任何 Telegram 訊息；控制面板使用輸入欄旁較短的常駐「🎛️ 面板」快捷按鈕。每次 Bot 發送狀態、錯誤或完成訊息時都會重新附上快捷鍵；新訊息很多時，按下這個按鈕會在聊天最底部重新發出控制面板。Bot 會把原生命令選單重設為預設狀態，斜線指令仍可手動輸入。Telegram 客戶端本身的原生選單位置不能由 Bot API 改成 Reply Keyboard 按鈕。
 
-模型：
+模型選擇：
 
-- `🧠 MiniMax H3 Turbo`：H3 FL2VA INT8 + Turbo 工作流，支援長片、Motion Context、恢復和音訊接續。
+- `🧠 MiniMax H3`：H3 FL2VA INT8 + LightX2V 正式 8 步 Turbo LoRA 工作流，支援長片、Motion Context、恢復和音訊接續；這是目前唯一支援的模型。LoRA strength 為 `1.0`，建議先用 `8 steps`。
 
-目前預設 Turbo LoRA 為 LightX2V 正式 8 步版：
-`minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`；LoRA strength 為 `1.0`，建議先用 `8 steps`。舊 v4 LoRA 只保留在本機回退備份，不會再被預設工作流使用。
+也可以使用 `/model h3` 查看目前模型，`/h3` 是快捷指令。
 
-可以使用 `/model h3` 或 `/h3` 查看／切換目前模型；目前 Bot 只保留 MiniMax H3 Turbo。
+### 四種 H3 生成模式
+
+面板會按模式選擇正確的 H3 主模型和 Conditioning 輸入：
+
+- `T2VA`：只用文字提示詞。
+- `I2VA`：上傳一張圖片作為首幀，再輸入提示詞。
+- `FL2VA`：提供首幀和尾幀，讓短片在兩張圖片之間生成。
+- `Ref2VA`：可上傳最多 9 張參考圖、3 段參考影片和 3 段參考音訊；此模式使用獨立的 Ref2VA INT8 主模型，不會和 FL2VA 主模型同時載入。
+
+使用 Ref2VA 前在面板按「📚 Ref2VA 參考素材」，連續傳素材，最後按「✅ 完成參考素材上傳」。Ref2VA 主模型需要另外放在 ComfyUI 的 `models/diffusion_models`，不會放進 GitHub；這個模式較吃系統 RAM，屬於實驗性參考素材工作流。
 
 圖片生視頻：按「🖼 圖片生視頻」，直接發一張圖片，再貼提示詞，最後按「生成影片」。也可以給圖片加 caption，caption 會直接當作提示詞。Bot 會把圖片上傳到 ComfyUI，使用 H3 Turbo 的 I2VA 首幀工作流。
 
@@ -40,7 +48,7 @@ Bot 不會自動固定或置頂任何 Telegram 訊息；控制面板使用輸入
 
 面板上的「🌡 查看電腦溫度」會讀取 NVIDIA GPU 溫度、GPU 使用率和 VRAM；CPU 溫度只有在 Windows/主機板提供感測器時才會顯示。選擇超過 15 秒的長片後，可以開啟「🔌 長片完成後關機」；影片合併並成功傳回 Telegram 後，系統會在 60 秒後關機。倒數期間可以按「🛑 取消即將關機」，或輸入 `/cancel_shutdown`。
 
-長片會先解析提示詞時間軸，再將場景拆成最多 8 秒的短鏡頭，而不是固定把整篇提示詞重複送進四個 15 秒任務。每鏡完成後，Bot 會擷取最後畫面作為下一鏡的 I2VA 首幀，並延續上一鏡的音訊參考。最後 FFmpeg 會加入 0.12 秒音畫轉場並維持原定總片長。
+長片會先解析提示詞時間軸，再將場景拆成最多 8 秒的短鏡頭，而不是固定把整篇提示詞重複送進四個 15 秒任務。每鏡完成後，Bot 會擷取最後畫面作為下一鏡的 I2VA 首幀；H3 會延續音訊參考。最後 FFmpeg 會加入 0.12 秒音畫轉場並維持原定總片長。
 
 建議使用自然時間軸，並由 0 秒連續寫到選擇的總片長：
 
@@ -83,26 +91,17 @@ SEGMENT 2:
 
 SEGMENT 編號必須由 1 開始並連續遞增；例如寫到 `SEGMENT 12` 時，`SEGMENT 1` 至 `SEGMENT 12` 都要存在。影片總長仍受目前 30 分鐘上限、硬碟空間、生成時間和 Telegram 檔案大小限制。
 
-H3 使用 FL2VA INT8 和 Turbo LoRA，不會強行加入需要 Ref2VA 模型的人物參考輸入。人物主要依靠全局描述和上一鏡尾幀接力保持。首幀和音訊參考仍屬模型條件而非硬性鎖定，因此可能有輕微漂移。
-
-### 四種 H3 生成模式
-
-面板現在提供四種模式，會按模式選擇正確的 H3 主模型和 Conditioning 輸入：
-
-- `T2VA`：只用文字提示詞，使用 `minimax_h3_fl2va_int8_convrot.safetensors`。
-- `I2VA`：上傳一張圖片作為首幀，再輸入提示詞。
-- `FL2VA`：先上傳首幀，再上傳尾幀；短片會同時把兩張圖接到 `first_frame`／`last_frame`。
-- `Ref2VA`：可上傳最多 9 張參考圖、3 段參考影片和 3 段參考音訊；此模式改用 `minimax_h3_ref2va_pruned_int8_convrot.safetensors`，不會和 FL2VA 主模型同時載入。
-
-使用 Ref2VA 前在面板按「📚 Ref2VA 參考素材」，連續傳素材，最後按「✅ 完成參考素材上傳」，再輸入提示詞和按生成。Ref2VA 模型約 20.97 GB，放在 ComfyUI 的 `models/diffusion_models`，不會放進 GitHub；這個模式較吃系統 RAM，屬於實驗性參考素材工作流。
+H3 主流程使用 FL2VA INT8 和 LightX2V Turbo LoRA；Ref2VA 只在你選擇該模式並提供參考素材時載入獨立模型。人物主要依靠全局描述和上一鏡尾幀接力保持。首幀和音訊參考仍屬模型條件而非硬性鎖定，因此可能有輕微漂移。
 
 生成中的面板提供「⛔ 中止」「⏸ 暫停」和「▶️ 播放／繼續」。中止會打斷目前 ComfyUI 工作；暫停會在目前短鏡頭完成後生效，播放／繼續會生成下一鏡。因為 ComfyUI 不保存採樣中的中間狀態，單段短片不能安全地在採樣中途暫停。
+
+長片生成中還提供「🎬 預覽已完成片段」按鈕（或輸入 `/preview`）：Bot 會把目前已完成的鏡頭合成成一段影片，立即傳回 Telegram 給你預覽，而長片生成**不會中斷**，其餘鏡頭會繼續生成。例如生成 2 分鐘長片、目前做到第 4 鏡時，按下預覽會收到前 3 鏡的合併影片；也可以連續預覽，每次都會包含最新完成的鏡頭。目前鏡頭仍在生成中時，該鏡不會被納入本次預覽。
 
 長片現在會在 E 槽的 `E:\MiniMax-H3-Telegram\runtime\bot\long_checkpoints` 保存檢查點。每完成一鏡就會記錄已完成 MP4、下一鏡編號和 Motion Context latent；如果第 3 鏡因顯存不足失敗，按失敗訊息的「🔁 從第 3 鏡繼續」，或輸入 `/resume_long`，只會重試第 3 鏡，不會重做第 1、2 鏡。恢復前 Bot 會先要求 ComfyUI 釋放暫存顯存。
 
 長片生成現在也會自動處理顯存不足：例如從 `0.4 MP` 開始時，第 3 鏡 OOM，Bot 會保留前兩鏡，將第 3 鏡改成 `0.3 MP` 重試；再失敗就依序降到 `0.2 MP`、`0.1 MP`，直到成功或已經沒有更低檔位。後續鏡頭會沿用成功的較低解析度，不會重新生成前面的鏡頭。最後合併時會把不同檔位統一成原本的影片尺寸；這是畫面尺寸統一，不等於 AI 放大，較低檔位的細節仍以實際生成結果為準。每次降級會在 Telegram 報告，完成資訊也會列出降級記錄。
 
-Telegram Bot API 對 Bot 上傳影片有 50 MB 限制。Bot 現在會在生成完成後自動檢查檔案大小：小於安全上限就直接傳送；超過時先用 FFmpeg 壓縮，仍然過大就自動切成多段 MP4 逐段傳送。原始影片不會被覆蓋，壓縮和分段只會產生暫存檔，傳送後自動清理。
+Telegram Bot API 對 Bot 上傳影片有 50 MB 限制。Bot 會在生成完成後自動檢查檔案大小；過大時先用 FFmpeg 壓縮，仍然過大就切成多段 MP4 逐段傳送。原始影片不會被覆蓋，暫存檔傳送後會清理。
 
 完整長片完成後也可以按面板的「📼 延續上一條長片」，輸入要新增的秒數和尾端提示詞。H3 會使用原片最後一鏡的影片和 AV latent 接續，再把原片與新增部分合併回傳。也可以使用 `/extend 30`，再貼上延續提示詞。只有由這個 Bot 保存過檢查點的完整長片能使用精確 Motion Context 延續；沒有檢查點的外部 MP4 不會被假裝成同樣的 latent 接續。
 
@@ -137,6 +136,8 @@ Bright photorealistic Japanese restaurant scene with two adult women eating dinn
 
 提示詞太長時，不要貼到 Telegram 輸入框；直接把提示詞另存為 `.txt` 或 `.text` 檔案後傳給 Bot。Bot 會讀取整個檔案、保留換行和 `GLOBAL`／`SEGMENT` 時間軸，然後保存成目前提示詞。建議使用 UTF-8 編碼，檔案上限為 512 KB；如果之前已上傳圖片，傳 TXT 不會清除圖片模式。
 
+輸入 `/prompt_help` 可以取得提示詞模板和長片時間軸格式說明。
+
 其他指令：
 
 ```text
@@ -144,6 +145,7 @@ Bright photorealistic Japanese restaurant scene with two adult women eating dinn
 /cancel
 /pause
 /resume
+/preview
 /resume_long
 /extend 30
 /history
@@ -154,6 +156,7 @@ Bright photorealistic Japanese restaurant scene with two adult women eating dinn
 /queue_clear
 /image
 /text
+/prompt_help
 /long 864 480 12 60
 /comfy_status
 /comfy_start

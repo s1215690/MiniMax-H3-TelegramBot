@@ -106,6 +106,42 @@ TELEGRAM_SAFE_VIDEO_BYTES = 48_000_000
 TELEGRAM_AUDIO_BITRATE_KBPS = 128
 MAX_TELEGRAM_PROMPT_BYTES = 512 * 1024
 PROMPT_FILE_EXTENSIONS = {".txt", ".text"}
+PROMPT_HELP_TEXT = """📝 MiniMax H3 提示詞精華
+
+【通用原則】
+• 按時間順序詳細描述，動作寫具體：不寫「跳舞」，寫「舉起左手轉了半圈，裙擺揚起」
+• 四要素：主體（外貌／服裝）→ 場景（地點／光線／天氣）→ 動作 → 運鏡（自然散文，如 "the camera slowly pushes in"）
+• 聲音一起寫：音樂、環境音、對白、音效（音畫聯合生成，不寫聲音會隨機）
+• 動作描述建議用英文；不要寫「接下來會發生」；不要手寫 <Picture N> 等媒體標籤（Bot 自動管理）
+
+【短片 T2V】
+[主體] + [場景] + [按秒推進的動作] + [運鏡] + [聲音]
+
+【圖片生視頻 I2V】
+caption 只寫：接下來做什麼動作 + 運鏡 + 聲音。不要重寫圖片已經看得見的外觀。
+
+【FL2VA】
+只寫首幀 → 尾幀的中間過程，開頭結尾姿勢不用重複。
+
+【Ref2VA】
+素材是參考不是重播：一句「keeping the exact appearance of the reference」+ 新動作。
+
+【長片時間軸】
+標題格式：場景名（開始秒-結束秒）：例如 開頭（0-5秒）：
+• 必須由 0 秒開始、連續寫到所選總片長；缺口、重疊、只寫到 50 秒卻選 60 秒都會被拒絕
+• 每一幕 2–15 秒（Bot 自動拆成 ≤8 秒鏡頭）
+• 第一個時間標題之前的文字 = 全局設定（人物外貌／場景／風格／音樂，只寫一次，每鏡自動附上）
+
+【長片 GLOBAL／SEGMENT】
+GLOBAL: 人物外貌、場景、光線、風格、音樂
+SEGMENT 1: 只寫第 1 段動作（2–15 秒）
+SEGMENT 2: ……（編號必須從 1 連續）
+
+【聲音速查】
+音樂：曲風＋樂器＋節奏；環境音：地點＋聲源；對白：直接寫句子；全片統一音樂寫進 GLOBAL；要無聲須明寫 "completely silent"
+
+完整範例見專案資料夾 MiniMax-H3-Prompt-Template.md。"""
+
 SAGE_ATTENTION_ENABLED = os.environ.get("MINIMAX_SAGE_ATTENTION", "1").strip().lower() not in {
     "0",
     "false",
@@ -193,7 +229,7 @@ MAX_REF2VA_AUDIOS = 3
 
 
 def normalize_model_mode(value: Any) -> str:
-    # Only the MiniMax H3 Turbo workflow is installed.
+    # The LTX 2.3 branch was removed; only the MiniMax H3 Turbo workflow remains.
     return MODEL_H3
 
 
@@ -398,6 +434,7 @@ class JobState:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     pause_requested: threading.Event = field(default_factory=threading.Event)
     resume_event: threading.Event = field(default_factory=threading.Event)
+    preview_in_progress: threading.Event = field(default_factory=threading.Event)
     output_prefix: str = OUTPUT_PREFIX
     segment_index: int = 1
     segment_total: int = 1
@@ -1468,6 +1505,20 @@ def build_workflow(
             },
         }
         conditioning["last_frame"] = [last_image_node_id, 0]
+    if motion_context and (
+        reference_image_names or reference_video_names or reference_audio_names
+    ):
+        # The motion context graph occupies the hard-coded node ids 15-20;
+        # creating Ref2VA reference nodes here would overwrite them. Ref2VA
+        # and motion context are mutually exclusive, so clear the lists as
+        # a defensive guard; the caller's gate is the normal path.
+        bot_log(
+            "build_workflow: motion context active; skipping Ref2VA reference "
+            "media to avoid node id conflicts"
+        )
+        reference_image_names = []
+        reference_video_names = []
+        reference_audio_names = []
     for index, reference_name in enumerate(reference_image_names):
         ref_node_id = _next_workflow_node_id(workflow)
         workflow[ref_node_id] = {
@@ -1598,270 +1649,6 @@ def build_workflow(
     return workflow
 
 
-def ltx_workflow_usage_report(vram_mode: str) -> str:
-    try:
-        vram_label = comfyui_vram_mode_label(vram_mode)
-    except NameError:
-        vram_label = vram_mode
-    return "\n".join(
-        [
-            "模型：LTX 2.3 PinkCherry NSFW v1.8",
-            "主模型：PinkCherry_FineTune_Q5_K_M_v18_LTX23.gguf",
-            "文字編碼器：Gemma 3 12B Heretic v2 INT4 + LTX projection",
-            "加速：LTX 2.3 distilled LoRA（工作流內置原生雙階段採樣）",
-            "解碼：LTX23 video VAE + audio VAE；目前不使用 H3 Turbo LoRA",
-            f"顯存模式：{vram_label}",
-        ]
-    )
-
-
-def ltx_workflow_usage_report(vram_mode: str) -> str:
-    """Report the actual LTX model/LoRA selected by the isolated branch."""
-    try:
-        vram_label = comfyui_vram_mode_label(vram_mode)
-    except NameError:
-        vram_label = vram_mode
-    if ltx_author_model_ready():
-        model_line = f"主模型：{LTX_AUTHOR_MODEL_NAME}"
-        lora_line = f"LoRA：{LTX_AUTHOR_LORA_NAME}（strength 0.6）"
-        graph_line = "作者 v1.8 graph：Chunk Feed-Forward + Preview Override + NAG"
-    else:
-        model_line = "主模型：PinkCherry_FineTune_Q5_K_M_v18_LTX23.gguf"
-        lora_line = "LoRA：dynamic distilled LTX 2.3（strength 0.5）"
-        graph_line = "簡化 LTX graph（作者 INT8 尚未完成下載）"
-    return "\n".join(
-        [
-            "LTX 2.3 PinkCherry v1.8",
-            model_line,
-            "Text encoder：Gemma 3 12B Heretic v2 INT4 + LTX projection",
-            lora_line,
-            graph_line,
-            "VAE：LTX23 video VAE + audio VAE；SaveVideo H264 CRF 8",
-            f"VRAM：{vram_label}",
-        ]
-    )
-
-
-def apply_ltx_author_graph(workflow: dict[str, Any]) -> dict[str, Any]:
-    """Upgrade only the LTX branch to the author's standard-checkpoint graph.
-
-    The original MiniMax H3 graph is built by ``build_workflow`` and is not
-    touched here.  The old Q5/GGUF LTX graph remains the fallback until the
-    separate author INT8 checkpoint has been fully downloaded.
-    """
-    loader_id = next(
-        node_id for node_id, node in workflow.items()
-        if node.get("class_type") == "UnetLoaderGGUF"
-    )
-    lora_id = next(
-        node_id for node_id, node in workflow.items()
-        if node.get("class_type") == "LoraLoaderModelOnly"
-    )
-    clip_id = next(
-        node_id for node_id, node in workflow.items()
-        if node.get("class_type") == "DualCLIPLoaderGGUF"
-    )
-    video_vae_id = next(
-        node_id for node_id, node in workflow.items()
-        if node.get("class_type") == "VAELoader"
-        and "video_vae" in str(node.get("inputs", {}).get("vae_name", ""))
-    )
-    guider_ids = [
-        node_id for node_id, node in workflow.items()
-        if node.get("class_type") == "CFGGuider"
-    ]
-    sigma_nodes = [
-        node_id for node_id, node in workflow.items()
-        if node.get("class_type") == "ManualSigmas"
-    ]
-    workflow[loader_id] = {
-        "class_type": "CheckpointLoaderSimple",
-        "inputs": {"ckpt_name": LTX_AUTHOR_MODEL_NAME},
-    }
-    workflow[lora_id]["inputs"]["lora_name"] = LTX_AUTHOR_LORA_NAME
-    workflow[lora_id]["inputs"]["strength_model"] = 0.6
-    low_sigma_id = next(
-        node_id for node_id in sigma_nodes
-        if str(workflow[node_id]["inputs"].get("sigmas", "")).strip().startswith("1.0")
-    )
-    high_sigma_id = next(node_id for node_id in sigma_nodes if node_id != low_sigma_id)
-    low_sampler_id = workflow[low_sigma_id]
-    workflow[low_sigma_id]["inputs"]["sigmas"] = (
-        "1.0, 0.998, 0.995, 0.99, 0.982, 0.97, 0.94, 0.89, "
-        "0.82, 0.73, 0.62, 0.50, 0.38, 0.27, 0.18, 0.11, "
-        "0.06, 0.03, 0.01, 0.0"
-    )
-    workflow[high_sigma_id]["inputs"]["sigmas"] = "0.85, 0.7250, 0.4219, 0.0"
-    for sampler in workflow.values():
-        if sampler.get("class_type") != "SamplerCustomAdvanced":
-            continue
-        sigma_ref = sampler.get("inputs", {}).get("sigmas")
-        if not isinstance(sigma_ref, list):
-            continue
-        sampler_select_id = sampler["inputs"].get("sampler", [None, 0])[0]
-        if sampler_select_id not in workflow:
-            continue
-        if sigma_ref[0] == low_sigma_id:
-            workflow[sampler_select_id]["inputs"]["sampler_name"] = "euler_ancestral_cfg_pp"
-        elif sigma_ref[0] == high_sigma_id:
-            workflow[sampler_select_id]["inputs"]["sampler_name"] = "euler_cfg_pp"
-
-    # These are the quality/denoise-control nodes present in the author's
-    # v1.8 workflow.  They run on the standard checkpoint, not on the old
-    # dynamic GGUF loader (which cannot evaluate NAG connectors safely).
-    workflow["1001"] = {
-        "class_type": "LTXVChunkFeedForward",
-        "inputs": {
-            "model": [lora_id, 0],
-            "chunks": 2,
-            "dim_threshold": 4096,
-        },
-    }
-    workflow["1002"] = {
-        "class_type": "LTX2SamplingPreviewOverride",
-        "inputs": {
-            "model": ["1001", 0],
-            "vae": [video_vae_id, 0],
-            "preview_rate": 8,
-        },
-    }
-    workflow["1003"] = {
-        "class_type": "CLIPTextEncode",
-        "inputs": {
-            "clip": [clip_id, 0],
-            "text": (
-                "logos, voice over, narration, off camera speech, watermarks, "
-                "poor anatomy, low detail, slow motion, slow, boring"
-            ),
-        },
-    }
-    workflow["1004"] = {
-        "class_type": "CLIPTextEncode",
-        "inputs": {
-            "clip": [clip_id, 0],
-            "text": (
-                "logos, voice over, narration, off camera speech, watermarks, "
-                "poor anatomy, low detail"
-            ),
-        },
-    }
-    workflow["1005"] = {
-        "class_type": "LTX2_NAG",
-        "inputs": {
-            "model": ["1002", 0],
-            "nag_cond_video": ["1003", 0],
-            "nag_cond_audio": ["1004", 0],
-            "nag_scale": 11.0,
-            "nag_alpha": 0.25,
-            "nag_tau": 2.5,
-            "inplace": True,
-        },
-    }
-    for guider_id in guider_ids:
-        workflow[guider_id]["inputs"]["model"] = ["1005", 0]
-
-    for node in workflow.values():
-        if not isinstance(node, dict) or node.get("class_type") != "SaveVideo":
-            continue
-        inputs = node.setdefault("inputs", {})
-        inputs.update(
-            {
-                "format": "mp4",
-                "codec": "h264",
-                "encoding": "re-encode",
-                "crf": 8,
-            }
-        )
-    return workflow
-
-
-def build_ltx_workflow(
-    config: GenerationConfig,
-    prompt: str,
-    output_prefix: str,
-    image_name: Optional[str] = None,
-) -> dict[str, Any]:
-    """Build an isolated LTX 2.3 API graph without touching the H3 graph."""
-
-    template_path = LTX_I2V_API_TEMPLATE if image_name else LTX_T2V_API_TEMPLATE
-    if not template_path.is_file():
-        raise BotError(f"找不到 LTX 2.3 API 工作流模板：{template_path}")
-    with template_path.open("r", encoding="utf-8") as handle:
-        workflow = json.load(handle)
-    if not isinstance(workflow, dict):
-        raise BotError("LTX 2.3 API 工作流格式無效。")
-
-    # The converted native template exposes these four values as PrimitiveInt
-    # nodes.  Identify them by their template defaults so the Bot remains
-    # compatible with both T2V and I2V node IDs.
-    primitive_nodes = [
-        node
-        for node in workflow.values()
-        if isinstance(node, dict) and node.get("class_type") == "PrimitiveInt"
-    ]
-
-    def set_primitive(default: int, value: int) -> None:
-        for node in primitive_nodes:
-            inputs = node.setdefault("inputs", {})
-            if inputs.get("value") == default:
-                inputs["value"] = int(value)
-                return
-        raise BotError(f"LTX 工作流缺少 PrimitiveInt 參數（預設值 {default}）。")
-
-    set_primitive(512, config.width)
-    set_primitive(288, config.height)
-    set_primitive(5, max(2, int(round(config.actual_seconds))))
-    set_primitive(24, 24)
-
-    for node in workflow.values():
-        if not isinstance(node, dict):
-            continue
-        class_type = str(node.get("class_type", ""))
-        inputs = node.setdefault("inputs", {})
-        if not isinstance(inputs, dict):
-            continue
-        if class_type == "CLIPTextEncode" and inputs.get("text") == "replace_with_prompt":
-            inputs["text"] = prompt.strip()
-        elif class_type == "ResizeImageMaskNode":
-            # ComfyUI API v3 DynamicCombo inputs use a selector and dotted
-            # child names; a nested dict is silently discarded by the API.
-            inputs["resize_type"] = "scale dimensions"
-            inputs["resize_type.width"] = int(config.width)
-            inputs["resize_type.height"] = int(config.height)
-            inputs["resize_type.crop"] = "center"
-            inputs["scale_method"] = "lanczos"
-        elif class_type == "ResizeImagesByLongerEdge":
-            inputs["longer_edge"] = max(int(config.width), int(config.height))
-        elif class_type == "VAEDecodeTiled":
-            # Small temporal tiles can show up as frame-to-frame snow and
-            # brightness jumps.  A 10-second 864x480 validation run fits on
-            # the 10GB card without temporal tiling, so keep short clips in
-            # one decode window.  Longer clips use large 240-frame windows;
-            # this keeps memory bounded while reducing the number of seams.
-            inputs["tile_size"] = min(512, max(256, max(config.width, config.height)))
-            inputs["overlap"] = 64
-            # A nominal 10-second request is encoded as about 10.04 seconds
-            # at 24 fps, so include that small frame-rounding margin.
-            if float(config.actual_seconds) <= 10.5:
-                inputs["temporal_size"] = 4096
-                inputs["temporal_overlap"] = 8
-            else:
-                inputs["temporal_size"] = 240
-                inputs["temporal_overlap"] = 16
-        elif class_type == "RandomNoise":
-            inputs["noise_seed"] = secrets.randbits(63)
-        elif class_type == "LoadImage" and image_name:
-            inputs["image"] = image_name
-        elif class_type == "SaveVideo":
-            inputs["filename_prefix"] = (
-                output_prefix if output_prefix != OUTPUT_PREFIX else "LTX23/Telegram"
-            )
-
-    if ltx_author_model_ready():
-        workflow = apply_ltx_author_graph(workflow)
-    return workflow
-
-
 def round_video_dimension(value: float) -> int:
     """Round a SeedVR2 target to a safe 32-pixel alignment."""
     return max(32, int(round(value / 32.0) * 32))
@@ -1943,7 +1730,7 @@ def comfy_post(path: str, payload: Optional[dict[str, Any]] = None) -> Any:
 
 
 def unload_comfy_models() -> None:
-    """Release a previous model before switching between H3 and LTX."""
+    """Release the previously loaded model so a new job starts clean."""
     try:
         comfy_post("/free", {"unload_models": True, "free_memory": True})
     except BotError:
@@ -3190,6 +2977,7 @@ class TelegramTurboBot:
             "/progress 查看即時生成進度\n"
             "/pause 暫停長片（在目前鏡頭完成後）\n"
             "/resume 或 /play 繼續長片\n"
+            "/preview 預覽已完成的長片片段（生成不中斷）\n"
             "長片顯存不足時會保留已完成鏡頭，自動逐級降低解析度重試\n"
              "/resume_long 從失敗檢查點繼續長片\n"
              "/extend 秒數 [提示詞] 從上一條完整長片尾端延續\n"
@@ -3936,6 +3724,51 @@ class TelegramTurboBot:
             if job.progress_tracker is progress_tracker:
                 job.progress_tracker = None
 
+    def _run_segment_with_oom_fallback(self, job: JobState) -> Path:
+        """Run a single-shot segment, auto-downgrading resolution on CUDA OOM.
+
+        The long-video loop already retries at a lower resolution when a
+        segment hits CUDA OOM; single-shot jobs (including I2VA, whose
+        first-frame VAE encode is the most VRAM-hungry mode) had no such
+        fallback and failed hard.  Mirror the long-video logic here.
+        """
+        while True:
+            try:
+                return self.run_segment(job, announce=True)
+            except Exception as exc:
+                if job.cancel_event.is_set() or not is_cuda_oom_error(exc):
+                    raise
+                next_resolution = next_lower_resolution(
+                    job.config.width, job.config.height
+                )
+                if next_resolution is None:
+                    self.send_safe(
+                        job.chat_id,
+                        f"最低解析度 {resolution_label(job.config.width, job.config.height)} "
+                        "仍然顯存不足，無法繼續。",
+                    )
+                    raise
+                old_label = resolution_label(job.config.width, job.config.height)
+                new_label = resolution_label(*next_resolution)
+                job.resolution_fallbacks.append(f"{old_label} → {new_label}")
+                job.config = parse_config(
+                    [
+                        str(next_resolution[0]),
+                        str(next_resolution[1]),
+                        str(job.config.steps),
+                        str(job.config.requested_seconds),
+                    ]
+                )
+                bot_log(f"single-shot OOM at {old_label}; retrying at {new_label}: {exc}")
+                try:
+                    comfy_post("/free", {"unload_models": True, "free_memory": True})
+                except BotError as free_exc:
+                    bot_log(f"OOM memory release before retry unavailable: {free_exc}")
+                self.send_safe(
+                    job.chat_id,
+                    f"⚠️ 顯存不足，自動降級：{old_label} → {new_label}\n正在以較低解析度重試。",
+                )
+
     def run_job(self, job: JobState) -> None:
         bot_log(
             f"job start {job.config.width}x{job.config.height} "
@@ -3943,7 +3776,7 @@ class TelegramTurboBot:
         )
         try:
             self.ensure_comfyui_ready(job)
-            video_path = self.run_segment(job, announce=True)
+            video_path = self._run_segment_with_oom_fallback(job)
             with job.progress_lock:
                 job.progress_phase = "uploading"
             model_label = "MiniMax H3 Turbo 完成"
@@ -3996,8 +3829,8 @@ class TelegramTurboBot:
                 continue
             # ComfyUI's SaveVideo node currently reports MP4 entries under
             # `images` (with `animated: true`), while other video nodes may
-            # use `gifs`, `videos`, or `files`.  Accept all of them so LTX
-            # outputs are delivered instead of being reported as missing.
+            # use `gifs`, `videos`, or `files`.  Accept all of them so
+            # produced videos are delivered instead of being reported missing.
             for key in ("images", "gifs", "videos", "files"):
                 for item in node_output.get(key, []) or []:
                     if not isinstance(item, dict) or not item.get("filename"):
@@ -5441,6 +5274,10 @@ class TelegramMenuBot(TelegramTurboBot):
             )
             if active_job is not None:
                 rows.append(job_control_row)
+                if active_job.segment_total > 1:
+                    rows.append(
+                        [{"text": "🎬 預覽已完成片段", "callback_data": "job_preview"}]
+                    )
             else:
                 rows.append([{"text": "目前沒有進行中的任務", "callback_data": "noop"}])
             rows.append(
@@ -5539,6 +5376,10 @@ class TelegramMenuBot(TelegramTurboBot):
             rows = [[{"text": "📊 查看／刷新生成進度", "callback_data": "progress"}]]
             if active_job is not None:
                 rows.append(job_control_row)
+                if active_job.segment_total > 1:
+                    rows.append(
+                        [{"text": "🎬 預覽已完成片段", "callback_data": "job_preview"}]
+                    )
             else:
                 rows.append([{"text": "目前沒有進行中的任務", "callback_data": "noop"}])
             rows.extend(back_row())
@@ -5702,6 +5543,140 @@ class TelegramMenuBot(TelegramTurboBot):
         else:
             self.send_safe(chat_id, "目前任務沒有暫停，會繼續生成。")
         self.show_menu(chat_id, message_id)
+
+    def request_video_preview(
+        self, chat_id: str, message_id: Optional[int] = None
+    ) -> None:
+        """Merge the finished shots so far and send them as an early preview.
+
+        Runs in its own thread so the long job keeps generating the remaining
+        shots while FFmpeg merges and Telegram uploads the completed part.
+        """
+        with self.lock:
+            job = self.job
+            if job is None:
+                self.show_menu(chat_id, message_id, "目前沒有生成中的任務")
+                return
+            if job.segment_total <= 1:
+                self.send_safe(chat_id, "單段影片沒有可預覽的已完成分段。")
+                return
+            if job.cancel_event.is_set():
+                self.send_safe(
+                    chat_id,
+                    "長片正在中止流程中，稍候會收到已合成的部分影片。",
+                )
+                return
+            with job.progress_lock:
+                phase = job.progress_phase
+            if phase in {"merging", "uploading"}:
+                self.send_safe(
+                    chat_id,
+                    "所有鏡頭都已完成，最終影片正在合併，稍候就會收到完整版。",
+                )
+                return
+            if job.preview_in_progress.is_set():
+                self.send_safe(
+                    chat_id,
+                    "🎬 預覽正在合成中，請稍候片刻，長片生成不受影響。",
+                )
+                return
+            snapshot = list(job.completed_video_paths)
+            if not snapshot:
+                self.send_safe(
+                    chat_id,
+                    "第一個鏡頭還沒完成，暫時沒有可預覽的內容；"
+                    "完成後再按一次即可。",
+                )
+                return
+            segment_total = job.segment_total
+            shot_plan = job.shot_plan
+            total_seconds = job.total_seconds
+            base_prefix = job.long_base_prefix or job.output_prefix
+            base_config = job.base_config or job.config
+            job.preview_in_progress.set()
+        completed_count = len(snapshot)
+        self.send_safe(
+            chat_id,
+            f"🎬 已收到預覽要求：正在合成已完成的前 {completed_count}/{segment_total} 段，"
+            "長片生成不會中斷。",
+        )
+        threading.Thread(
+            target=self._run_video_preview,
+            args=(
+                job,
+                snapshot,
+                base_prefix,
+                base_config,
+                completed_count,
+                shot_plan,
+                total_seconds,
+            ),
+            name="minimax-long-preview",
+            daemon=True,
+        ).start()
+        self.show_menu(chat_id, message_id)
+
+    def _run_video_preview(
+        self,
+        job: JobState,
+        snapshot: list[Path],
+        base_prefix: str,
+        base_config: GenerationConfig,
+        completed_count: int,
+        shot_plan: tuple[ShotSpec, ...],
+        total_seconds: float,
+    ) -> None:
+        """Background preview worker: merge a snapshot and send it to Telegram."""
+        try:
+            completed_shots = (
+                shot_plan[:completed_count]
+                if len(shot_plan) >= completed_count
+                else tuple()
+            )
+            if completed_shots:
+                completed_seconds = min(
+                    total_seconds,
+                    sum(shot.duration for shot in completed_shots),
+                )
+            else:
+                completed_seconds = min(
+                    total_seconds,
+                    total_seconds * completed_count / max(job.segment_total, 1),
+                )
+            batch_name = base_prefix.rsplit("/", 1)[-1]
+            output_path = (
+                OUTPUT_DIR
+                / base_prefix
+                / f"{batch_name}_preview_{completed_count:02d}_"
+                f"{uuid.uuid4().hex[:8]}.mp4"
+            )
+            merge_completed_segments(
+                snapshot,
+                output_path,
+                completed_seconds,
+                shot_plan=completed_shots or None,
+                output_size=(base_config.width, base_config.height),
+            )
+            caption = (
+                "🎬 提前預覽（長片仍在繼續生成）\n"
+                f"已完成 {completed_count}/{job.segment_total} 段，"
+                f"約 {completed_seconds:.2f} 秒 | "
+                f"{base_config.width}×{base_config.height}"
+            )
+            self.telegram.send_video(job.chat_id, output_path, caption)
+            bot_log(
+                f"long preview sent {output_path} "
+                f"({completed_count}/{job.segment_total})"
+            )
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        except Exception as exc:
+            bot_log(f"long preview error: {exc}")
+            self.send_safe(job.chat_id, f"🎬 預覽合成失敗：{exc}")
+        finally:
+            job.preview_in_progress.clear()
 
     def start_selected_generation(self, chat_id: str, prompt: str) -> bool:
         config = self.effective_config()
@@ -6286,8 +6261,6 @@ class TelegramMenuBot(TelegramTurboBot):
                     bot_log(f"ComfyUI memory release before long resume unavailable: {exc}")
             if job.resume_motion_context is None:
                 motion_context_enabled = (
-                    job.generation_mode != INPUT_MODE_REF2VA
-                    and
                     LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
                     and motion_context_nodes_available()
                 )
@@ -7482,6 +7455,9 @@ class TelegramMenuBot(TelegramTurboBot):
             if data == "job_resume":
                 self.resume_current_job(chat_id, message_id)
                 return
+            if data == "job_preview":
+                self.request_video_preview(chat_id, message_id)
+                return
             if data.startswith("model:"):
                 selected_model = normalize_model_mode(data.removeprefix("model:"))
                 self.model_mode = selected_model
@@ -7675,6 +7651,9 @@ class TelegramMenuBot(TelegramTurboBot):
         if command == "/prompt":
             self.request_prompt(chat_id)
             return
+        if command == "/prompt_help":
+            self.send_safe(chat_id, PROMPT_HELP_TEXT)
+            return
         if command in {"/model", "/h3"}:
             if command in {"/h3"}:
                 selected_model = MODEL_H3
@@ -7832,6 +7811,9 @@ class TelegramMenuBot(TelegramTurboBot):
         if command in {"/resume", "/play"}:
             self.resume_current_job(chat_id)
             return
+        if command == "/preview":
+            self.request_video_preview(chat_id)
+            return
         if command in {"/temperature", "/temp"}:
             self.send_safe(chat_id, temperature_report())
             return
@@ -7947,6 +7929,7 @@ class TelegramMenuBot(TelegramTurboBot):
             {"command": "cancel", "description": "中止目前生成"},
             {"command": "pause", "description": "暫停長片"},
             {"command": "resume", "description": "繼續長片"},
+            {"command": "preview", "description": "預覽已完成的長片片段"},
             {"command": "resume_long", "description": "從檢查點續做長片"},
             {"command": "extend", "description": "延續上一條長片"},
             {"command": "history", "description": "查看歷史長片 ID"},
