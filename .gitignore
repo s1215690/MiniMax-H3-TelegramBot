@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.bak_*
+*.zip
+HANDOFF_*.md
