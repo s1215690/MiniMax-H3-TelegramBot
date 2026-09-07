@@ -155,6 +155,93 @@ Bright photorealistic Japanese restaurant scene with two adult women eating dinn
 
 秒數會自動轉成 H3 的有效影格數；15 秒會使用 362 frames。完成後 Bot 會傳送含聲音的影片（官方 SaveVideo 節點把音訊直接併入同一個 MP4）。
 
+## 模型與節點
+
+### 模型（`models/` 資料夾）
+
+| 類別 | 檔案 | 大小 | 用途 |
+|---|---|---|---|
+| UNET（主模型） | `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | 19.5 GB | T2VA / I2VA / FL2VA 生成 |
+| UNET（Ref2VA） | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.5 GB | Ref2VA 參考素材生成 |
+| UNET（Hybrid） | `minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors` | 19.5 GB | Ref2VA 預設（FL2VA 品質 + Ref2VA 條件） |
+| CLIP（文字編碼） | `qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors` | ~32 GB | 提示詞 → conditioning |
+| LoRA（Turbo） | `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | 1.8 GB | 8 步加速（official v1.0） |
+| Video VAE | `minimax_h3_video_vae_fp16.safetensors` | — | 影片 latent ↔ 像素 |
+| Audio VAE | `minimax_h3_audio_vae_fp32.safetensors` | — | 音訊 latent ↔ 波形 |
+| Latent Upscaler | `minimax_h3_latent_upscaler_3d_fp16.safetensors` | — | 兩段式半解析度 → 全解析度 |
+| SeedVR2（放大） | `seedvr2_3b_int8_convrot.safetensors` | — | 可選影片放大（1080p/2K） |
+
+### ComfyUI 節點
+
+#### 官方核心節點（ComfyUI-Turbo 內建）
+
+| 節點 | 用途 |
+|---|---|
+| `VAELoader` × 2 | 載入 video / audio VAE |
+| `CLIPLoader` | 載入 Qwen3VL 文字編碼器 |
+| `UNETLoader` | 載入 H3 diffusion 模型 |
+| `LoraLoaderModelOnly` | 載入 8-step Turbo LoRA（strength 1.0） |
+| `MiniMaxH3ImageToVideo` | T2VA / I2VA / FL2VA 生成（含 first/last frame） |
+| `MiniMaxH3ReferenceToVideo` | Ref2VA 生成（ref_images / ref_videos / ref_audios） |
+| `KSamplerSelect` (`res_multistep`) | 多步降噪採樣器 |
+| `BasicScheduler` (`simple`) | 噪聲調度（denoise 1.0 或 0.5） |
+| `BasicGuider` | 模型 + conditioning → guider |
+| `SamplerCustomAdvanced` | 實際執行採樣 |
+| `RandomNoise` | 隨機種子 |
+| `VAEDecode` | Video latent → 像素幀 |
+| `VAEDecodeAudio` | Audio latent → 音訊波形 |
+| `CreateVideo` | 合併影片 + 音訊 → 影片物件（24 fps） |
+| `SaveVideo` | 輸出同步 MP4（H.264 + AAC） |
+| `LoadImage` / `LoadVideo` / `LoadAudio` | 載入用戶上傳的素材 |
+| `GetVideoComponents` | 拆出影片幀 + 內嵌音訊 |
+
+#### 自訂節點（`custom_nodes/`）
+
+| 套件 | 節點 | 用途 |
+|---|---|---|
+| **ComfyUI-H3-Motion-Context** (v0.3.1) | `MiniMaxH3MotionContext` | 長片接續：把上鏡 latent pin 到新鏡頭部 |
+| | `MiniMaxH3MotionContextTrim` | 裁掉 pinned 頭部（避免重複幀/音訊） |
+| | `MiniMaxH3MotionContextSaveLatent` | 保存本鏡 AV latent 給下一鏡 |
+| | `MiniMaxH3MotionContextLoadLatent` | 載入上鏡 AV latent |
+| **h3-av-latent-bridge** | `H3AVLatentSeparate` | 拆 AV NestedTensor → video latent + audio latent |
+| | `H3AVLatentJoin` | 合併 video latent + audio latent → AV NestedTensor |
+| **Comfyui_Minimax_h3_latent_Upscaler** | `MinimaxH3LatentUpscaler3D` | 3D latent 空間放大（無 VAE round-trip） |
+
+### 工作流結構
+
+```
+[VAE/CLIP/UNET/LoRA loaders] → [生成節點] → [Sampler chain]
+    → [VAEDecode + VAEDecodeAudio] → [CreateVideo] → [SaveVideo]
+
+長片：+ [MotionContext Load/Process/Trim/Save] 鏈
+兩段式：+ [LatentSeparate → Upscaler → LatentJoin → Stage2 Sampler]
+```
+
+### 環境要求
+
+| 項目 | 最低 | 建議 |
+|---|---|---|
+| GPU | NVIDIA 20 GB VRAM（RTX 3080/3090） | 24 GB（RTX 4090）可跑更高解析度 |
+| RAM | 32 GB | 64 GB |
+| ComfyUI | ComfyUI-Turbo fork 0.31.0+（`--base-directory` 模式） | — |
+| Python | 3.11+ | 3.13 |
+| PyTorch | 2.12+ cu130 | — |
+| FFmpeg | 6.0+（含 libx264 + AAC） | — |
+| 作業系統 | Windows 10/11 | — |
+
+### ComfyUI 啟動參數
+
+```
+python main.py \
+  --base-directory <models+custom_nodes 目錄> \
+  --listen 127.0.0.1 --port 8191 \
+  --lowvram --use-sage-attention \
+  --output-directory <輸出> --input-directory <輸入> \
+  --disable-auto-launch
+```
+
+環境變數 `CUDA_VISIBLE_DEVICES` 自動選取顯存最充裕的 GPU。
+
 ## 已知限制（2026-09-04 官方節點迁移後）
 
 - **drive_audio fallback**：長片在 H3 Motion Context 節點不可用時，會改用「上一鏡尾幀 + `<Audio 1>`」的尾幀接續；在官方核心節點下若沒有 Motion Context，`<Audio 1>` tag 沒有對應的參考音訊，該鏡會退化為原生音訊（不承接上一鏡的音訊）。Motion Context 預設可用，此情況罕見；若實際遇到再處理（候選方案：fallback 時把上一鏡音訊當 ref_audio 餵 R2V，但目前長片與參考素材互斥）。
