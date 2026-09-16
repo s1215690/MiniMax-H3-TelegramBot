@@ -4202,7 +4202,7 @@ SCRIPT_LLM_COMMANDCODE = "commandcode"
 SCRIPT_LLM_PROVIDERS = (SCRIPT_LLM_LOCAL, SCRIPT_LLM_COMMANDCODE)
 SCRIPT_LLM_LABEL = {
     SCRIPT_LLM_LOCAL: "本機",
-    SCRIPT_LLM_COMMANDCODE: "Command Code",
+    SCRIPT_LLM_COMMANDCODE: "雲端",
 }
 SCRIPT_LLM_DEFAULT = (
     os.environ.get("MINIMAX_SCRIPT_LLM", SCRIPT_LLM_LOCAL).strip().lower()
@@ -4339,6 +4339,11 @@ if SCRIPT_LANG_DEFAULT not in SCRIPT_LANGS:
 
 SCRIPT_LANG_LABEL = {
     SCRIPT_LANG_ZH: "簡體中文",
+    SCRIPT_LANG_EN: "English",
+}
+# Compact labels for the panel button row (full labels truncate on phones).
+SCRIPT_LANG_BUTTON = {
+    SCRIPT_LANG_ZH: "簡中",
     SCRIPT_LANG_EN: "English",
 }
 
@@ -8682,22 +8687,13 @@ class TelegramMenuBot(TelegramTurboBot):
                 [{"text": "✨ 一句話生成腳本", "callback_data": "script:new"}],
                 [
                     {
-                        "text": "🌐 腳本語言："
-                        + SCRIPT_LANG_LABEL[
+                        "text": "🌐 語言："
+                        + SCRIPT_LANG_BUTTON[
                             normalize_script_lang(
                                 getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
                             )
                         ],
                         "callback_data": "script_lang:toggle",
-                    },
-                    {
-                        "text": "🧠 LLM："
-                        + SCRIPT_LLM_LABEL[
-                            normalize_script_llm(
-                                getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
-                            )
-                        ],
-                        "callback_data": "script_llm:toggle",
                     },
                     {
                         "text": "📄 模板："
@@ -8707,6 +8703,17 @@ class TelegramMenuBot(TelegramTurboBot):
                             )
                         ],
                         "callback_data": "script_template:toggle",
+                    },
+                ],
+                [
+                    {
+                        "text": "🧠 LLM："
+                        + SCRIPT_LLM_LABEL[
+                            normalize_script_llm(
+                                getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_llm:toggle",
                     },
                     {"text": "📝 自訂指令", "callback_data": "script_file"},
                 ],
@@ -8782,22 +8789,13 @@ class TelegramMenuBot(TelegramTurboBot):
                 [{"text": "✨ 一句話生成腳本", "callback_data": "script:new"}],
                 [
                     {
-                        "text": "🌐 腳本語言："
-                        + SCRIPT_LANG_LABEL[
+                        "text": "🌐 語言："
+                        + SCRIPT_LANG_BUTTON[
                             normalize_script_lang(
                                 getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
                             )
                         ],
                         "callback_data": "script_lang:toggle",
-                    },
-                    {
-                        "text": "🧠 LLM："
-                        + SCRIPT_LLM_LABEL[
-                            normalize_script_llm(
-                                getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
-                            )
-                        ],
-                        "callback_data": "script_llm:toggle",
                     },
                     {
                         "text": "📄 模板："
@@ -8807,6 +8805,17 @@ class TelegramMenuBot(TelegramTurboBot):
                             )
                         ],
                         "callback_data": "script_template:toggle",
+                    },
+                ],
+                [
+                    {
+                        "text": "🧠 LLM："
+                        + SCRIPT_LLM_LABEL[
+                            normalize_script_llm(
+                                getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_llm:toggle",
                     },
                     {"text": "📝 自訂指令", "callback_data": "script_file"},
                 ],
