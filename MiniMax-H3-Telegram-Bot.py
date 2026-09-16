@@ -3628,6 +3628,30 @@ def promote_reference_frames(frames: list[Path], count: int = 2) -> list[Path]:
     return new_paths
 
 
+def chain_plan_durations(total: float, cap: float = 0.0) -> list[float]:
+    """Split a total duration into 2-15s clips using the varied rhythm.
+
+    Reuses the script generator's scene rhythm (the same irregular lengths the
+    timeline headings use) so an auto-chain feels hand-cut rather than
+    metronomic. `cap` (2-15s) hard-limits any single clip.
+    """
+    total = float(total)
+    plan = script_timeline_skeleton(total, SCRIPT_LANG_ZH, varied=True)
+    lengths = [round(end - start, 2) for _label, start, end in plan]
+    if cap and cap < float(MAX_SEGMENT_SECONDS):
+        split: list[float] = []
+        for length in lengths:
+            while length > cap + 0.01:
+                half = round(length / 2, 1)
+                if half < 2.0 or round(length - half, 2) < 2.0:
+                    break
+                split.append(half)
+                length = round(length - half, 2)
+            split.append(length)
+        lengths = split
+    return [length for length in lengths if length > 0]
+
+
 def chain_merge_clips(paths: list[Path], output_path: Path) -> Path:
     """Join equal-format clips with the ffmpeg concat demuxer (stream copy).
 
@@ -5703,7 +5727,7 @@ class TelegramTurboBot:
             "/lang zh|en 切換腳本語言（預設簡體中文）\n"
             "/scriptllm 切換腳本 LLM（本機 / Command Code）\n"
             "/scripttemplate 切換腳本模板（成人版 / 一般版）\n"
-            "/chain 段數 每段秒數 [想法] 自動接力：短段生成→尾帧接續→最後合併（/chain off 停）\n"
+            "/chain 5 8 5 10 或 48 [想法] 自動接力：短段生成→尾帧接續→合併（/chain off 停）\n"
             "/prompt_file 查看／編輯自訂指令檔（存檔即生效，免重啟）\n"
             "/prompt_help 提示詞寫作精華\n"
             "/progress 查看即時生成進度\n"
@@ -7138,13 +7162,12 @@ class TelegramMenuBot(TelegramTurboBot):
         # 🔗 auto-chain state (short clips chained by tail-frame handoff)
         self.chain_remaining = 0
         self.chain_total = 0
-        self.chain_seconds = 0.0
+        self.chain_durations: list[float] = []
         self.chain_idea = ""
         self.chain_done_paths: list[Path] = []
         self.chain_current_script = ""
         self.chain_awaiting_idea = False
-        self.chain_pending_segments = 0
-        self.chain_pending_seconds = 0.0
+        self.chain_pending_durations: list[float] = []
         self.awaiting_chain_setup = False
         self.last_job_video_path: Optional[Path] = None
         self.script_idea = ""
@@ -10906,8 +10929,7 @@ class TelegramMenuBot(TelegramTurboBot):
             self.awaiting_script_idea = False
             self.start_chain(
                 chat_id,
-                int(self.chain_pending_segments or 0),
-                float(self.chain_pending_seconds or 0.0),
+                list(self.chain_pending_durations or []),
                 text.strip(),
             )
             return
@@ -12089,58 +12111,103 @@ class TelegramMenuBot(TelegramTurboBot):
         self.telegram.send_message(
             chat_id,
             "🔗 自動接力（短段生成 → 尾帧接續）\n\n"
-            "一次過設定：段數、每段秒數（2–15）、一句想法。之後 bot 會：\n"
-            "生成第 1 段 → 自動抽尾帧做新參考圖 → LLM 讀住上一段寫下一段 → 再生成…\n"
+            "每段長度可以自己排，或者畀個總長由 bot 自動用「長短交替」節奏分段。\n"
+            "之後 bot 會：生成第 1 段 → 自動抽尾帧做新參考圖 → LLM 讀住上一段寫下一段 → 再生成…\n"
             "（每段都會即刻傳返 Telegram；最後自動合併成一段）\n\n"
-            "格式：段數 每段秒數 [想法]\n"
-            "例：8 6 女生在浴室沖涼，之後慢慢走出客廳\n"
-            "（唔寫想法，下一步會問你）",
+            "格式（三選一）：\n"
+            "  • 時長清單：5 8 5 10 → 4 段：5/8/5/10 秒\n"
+            "  • 總秒數：48 → 自動分段（例如 4、9、6、12、7、5、10、7 秒）\n"
+            "  • 總秒數＋每段上限：48 6 → 總 48 秒、每段唔超過 6 秒\n"
+            "（後面直接寫想法）\n\n"
+            "例：5 8 5 10 女生在浴室沖涼，之後慢慢走出客廳",
             reply_markup={
                 "force_reply": True,
-                "input_field_placeholder": "例：8 6 女生在浴室沖涼…",
+                "input_field_placeholder": "例：5 8 5 10 女生在浴室沖涼…",
             },
         )
 
     def handle_chain_setup(self, chat_id: str, text: str) -> None:
-        """Parse "段數 每段秒數 [想法]" and start the chain (or ask for the idea)."""
+        """Parse "<durations|total> [cap] [idea]" and start (or ask for the idea).
+
+        Accepted duration forms:
+          5 8 5 10      - explicit per-clip seconds (2-15 each)
+          48            - total seconds, split with the varied rhythm
+          48 6          - total seconds with a 6s per-clip cap
+        """
         self.awaiting_chain_setup = False
-        parts = text.strip().split(None, 2)
-        if len(parts) < 2:
+        numbers: list[float] = []
+        words: list[str] = []
+        for token in text.strip().replace(",", " ").replace("，", " ").split():
+            if not words and re.fullmatch(r"\d+(?:\.\d+)?", token):
+                numbers.append(float(token))
+            else:
+                words.append(token)
+        idea = " ".join(words).strip()
+        max_clip = float(MAX_SEGMENT_SECONDS)
+        durations: list[float] = []
+        if not numbers:
             self.send_safe(
-                chat_id, "格式：段數 每段秒數 [想法]，例如：8 6 女生在浴室沖涼"
+                chat_id,
+                "格式：時長清單（5 8 5 10）或總秒數（48）＋想法，"
+                "例如：5 8 5 10 女生在浴室沖涼",
             )
             return
-        try:
-            segments = int(parts[0])
-            seconds = float(parts[1])
-        except ValueError:
+        error = ""
+        if len(numbers) == 1:
+            # A single number is the TOTAL length: split with the varied rhythm.
+            total = numbers[0]
+            if not 2 <= total <= 1800:
+                error = "總秒數請在 2–1800 之間。"
+            else:
+                durations = chain_plan_durations(total)
+        elif all(n <= max_clip for n in numbers):
+            # Every number is a per-clip length: 5 8 5 10 -> four clips.
+            bad = [n for n in numbers if not 2 <= n <= max_clip]
+            if bad:
+                error = f"每段秒數請在 2–{max_clip:g} 秒之間（收到 {bad}）。"
+            else:
+                durations = list(numbers)
+        else:
+            # total [cap]: 48 6 -> 48 seconds total, no clip over 6s.
+            total = numbers[0]
+            cap = numbers[1] if len(numbers) > 1 else 0.0
+            if total <= max_clip:
+                error = f"每段秒數請在 2–{max_clip:g} 秒之間（收到 {numbers}）。"
+            elif not 2 <= total <= 1800:
+                error = "總秒數請在 2–1800 之間。"
+            elif cap and not 2 <= cap <= max_clip:
+                error = f"每段上限請在 2–{max_clip:g} 秒之間。"
+            else:
+                durations = chain_plan_durations(total, cap)
+        if error:
+            self.send_safe(chat_id, error)
+            return
+        if not durations:
             self.send_safe(
-                chat_id, "段數要整數、秒數要數字。例如：8 6 女生在浴室沖涼"
+                chat_id,
+                "睇唔明時長：可以寫清單（5 8 5 10）、總秒數（48）或總秒數＋上限（48 6）。",
             )
             return
-        if not 1 <= segments <= 50:
-            self.send_safe(chat_id, "段數請在 1–50 之間。")
+        if len(durations) > 50:
+            self.send_safe(chat_id, "段數太多（>50），請加大每段秒數。")
             return
-        if not 2 <= seconds <= float(MAX_SEGMENT_SECONDS):
-            self.send_safe(chat_id, f"每段秒數請在 2–{MAX_SEGMENT_SECONDS:g} 秒之間。")
-            return
-        idea = parts[2].strip() if len(parts) > 2 else ""
-        self.chain_pending_segments = segments
-        self.chain_pending_seconds = seconds
+        plan_text = "、".join(f"{d:g}" for d in durations)
+        self.chain_pending_durations = durations
         if idea:
-            self.start_chain(chat_id, segments, seconds, idea)
+            self.start_chain(chat_id, durations, idea)
             return
         self.chain_awaiting_idea = True
         self.request_script_idea(
             chat_id,
             note=(
-                f"🔗 自動接力已設定：{segments} 段 × 每段 {seconds:g} 秒\n"
+                f"🔗 自動接力已設定：{len(durations)} 段（{plan_text} 秒，總 "
+                f"{sum(durations):g} 秒）\n"
                 "請發一句「第 1 段」嘅想法；之後每段會自動接住上一段。"
             ),
         )
 
-    def start_chain(self, chat_id: str, segments: int, seconds: float, idea: str) -> None:
-        """Kick off the auto-chain: N short clips, each continued from the last."""
+    def start_chain(self, chat_id: str, durations: list[float], idea: str) -> None:
+        """Kick off the auto-chain: one clip per duration, each continued from the last."""
         if self.chain_active():
             self.send_safe(chat_id, "已有一個接力進行中（/chain off 可以停）。")
             return
@@ -12167,19 +12234,23 @@ class TelegramMenuBot(TelegramTurboBot):
                     chat_id, "目前有生成工作，請等它完成（或 /cancel）再開始接力。"
                 )
                 return
-        self.chain_total = int(segments)
-        self.chain_remaining = int(segments)
-        self.chain_seconds = float(seconds)
+        clean = [float(d) for d in durations if float(d) > 0]
+        if not clean:
+            self.send_safe(chat_id, "接力時長清單是空的。")
+            return
+        self.chain_durations = clean
+        self.chain_total = len(clean)
+        self.chain_remaining = len(clean)
         self.chain_idea = idea.strip()
         self.chain_done_paths = []
         self.chain_current_script = ""
         self.input_mode = INPUT_MODE_REF2VA
         self.save_settings()
+        plan_text = "、".join(f"{d:g}" for d in clean)
         self.send_safe(
             chat_id,
             "🔗 自動接力開始\n"
-            f"段數：{self.chain_total} 段 × 每段約 {self.chain_seconds:g} 秒"
-            f"（總約 {self.chain_total * self.chain_seconds:g} 秒）\n"
+            f"段數：{self.chain_total} 段（{plan_text} 秒；總約 {sum(clean):g} 秒）\n"
             f"腳本引擎：{script_llm_display_name()}｜模板：{script_template_display_name()}\n"
             f"想法：{self.chain_idea}\n\n"
             "流程：生成 → 自動抽尾帧 → LLM 續寫 → 再生成…（要停：/chain off）",
@@ -12245,8 +12316,9 @@ class TelegramMenuBot(TelegramTurboBot):
             except (BotError, OSError) as exc:
                 self.send_safe(chat_id, f"🔗 接力中止：{exc}")
                 return
-            total = int(self.chain_total)
-            for index in range(1, total + 1):
+            total = len(self.chain_durations)
+            self.chain_total = total
+            for index, clip_seconds in enumerate(list(self.chain_durations), start=1):
                 if not self.chain_active():
                     self.send_safe(
                         chat_id,
@@ -12258,16 +12330,19 @@ class TelegramMenuBot(TelegramTurboBot):
                     continuity = ""
                 else:
                     idea = (
-                        f"{self.chain_idea}\n（這是第 {index}/{total} 段：直接延續上一段的"
-                        "結尾動作，不要重複已經演過的內容，也不要重新介紹角色）"
+                        f"{self.chain_idea}\n（這是第 {index}/{total} 段、片長 {clip_seconds:g} 秒："
+                        "直接延續上一段的結尾動作，不要重複已經演過的內容，也不要重新介紹角色）"
                     )
                     continuity = self.script_continuity
                 if index > 1:
-                    self.send_safe(chat_id, f"🔗 第 {index}/{total} 段：LLM 正在續寫腳本…")
+                    self.send_safe(
+                        chat_id,
+                        f"🔗 第 {index}/{total} 段（{clip_seconds:g} 秒）：LLM 正在續寫腳本…",
+                    )
                 try:
                     script, log = generate_h3_script(
                         idea,
-                        float(self.chain_seconds),
+                        float(clip_seconds),
                         INPUT_MODE_REF2VA,
                         on_progress=None,
                         lang=self._script_lang(),
@@ -12286,7 +12361,7 @@ class TelegramMenuBot(TelegramTurboBot):
                         f"🔗 第 {index}/{total} 段腳本完成（{'；'.join(log) or '通過驗證'}），"
                         "生成中…",
                     )
-                if not self.chain_submit(chat_id, script, float(self.chain_seconds)):
+                if not self.chain_submit(chat_id, script, float(clip_seconds)):
                     self.send_safe(chat_id, "🔗 接力中止：無法送出生成工作。")
                     return
                 if not self.chain_wait_for_job():
