@@ -3609,6 +3609,78 @@ def tail_reference_frames(token: str) -> list[Path]:
         return []
 
 
+def promote_reference_frames(frames: list[Path], count: int = 2) -> list[Path]:
+    """Replace the reference images with the given frames (tail-frame handoff).
+
+    Deletes the old ref_image_* files and copies up to `count` frames in as
+    ref_image_01.jpg / ref_image_02.jpg. Shared by the ✅ offer button and the
+    🔗 auto-chain.
+    """
+    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    for old in REFERENCE_DIR.glob("ref_image_*"):
+        if old.is_file():
+            old.unlink(missing_ok=True)
+    new_paths: list[Path] = []
+    for index, frame in enumerate(frames[:count], start=1):
+        destination = REFERENCE_DIR / f"ref_image_{index:02d}.jpg"
+        shutil.copyfile(frame, destination)
+        new_paths.append(destination)
+    return new_paths
+
+
+def chain_merge_clips(paths: list[Path], output_path: Path) -> Path:
+    """Join equal-format clips with the ffmpeg concat demuxer (stream copy).
+
+    The 🔗 auto-chain produces short clips from the same pipeline (same codec,
+    size and rate), so a stream copy is lossless and fast - no crossfade pass.
+    """
+    if len(paths) < 2:
+        raise BotError("合併至少需要兩段影片。")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    list_file = output_path.with_suffix(".concat.txt")
+    try:
+        list_file.write_text(
+            "".join(f"file '{path.as_posix()}'\n" for path in paths),
+            encoding="utf-8",
+        )
+        command = [
+            FFMPEG_PATH,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1800,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BotError(f"合併失敗：{exc}") from exc
+    finally:
+        list_file.unlink(missing_ok=True)
+    if result.returncode != 0 or not output_path.is_file():
+        detail = (result.stderr or "").strip()
+        raise BotError("合併失敗：" + (detail[-300:] or "ffmpeg 沒有產出檔案"))
+    return output_path
+
+
 # Injected into the writer's system prompt once the tail frames of a finished
 # clip have been accepted as the new reference images: the next segment must
 # continue that story instead of drifting into a new person or a new place.
@@ -5631,6 +5703,7 @@ class TelegramTurboBot:
             "/lang zh|en 切換腳本語言（預設簡體中文）\n"
             "/scriptllm 切換腳本 LLM（本機 / Command Code）\n"
             "/scripttemplate 切換腳本模板（成人版 / 一般版）\n"
+            "/chain 段數 每段秒數 [想法] 自動接力：短段生成→尾帧接續→最後合併（/chain off 停）\n"
             "/prompt_file 查看／編輯自訂指令檔（存檔即生效，免重啟）\n"
             "/prompt_help 提示詞寫作精華\n"
             "/progress 查看即時生成進度\n"
@@ -6905,6 +6978,7 @@ class TelegramTurboBot:
             f"job start {job.config.width}x{job.config.height} "
             f"steps={job.config.steps} {job.config.actual_seconds:.2f}s"
         )
+        self.last_job_video_path = None
         try:
             self.ensure_comfyui_ready(job)
             video_path = self._run_segment_with_oom_fallback(job)
@@ -6916,7 +6990,9 @@ class TelegramTurboBot:
                 f"{job.config.steps} steps | {job.config.actual_seconds:.2f} 秒"
             )
             self.telegram.send_video(job.chat_id, video_path, caption)
-            self.offer_tail_reference(job.chat_id, video_path)
+            self.last_job_video_path = video_path
+            if not self.chain_active():
+                self.offer_tail_reference(job.chat_id, video_path)
             self.send_safe(
                 job.chat_id,
                 completion_report(job, time.time() - job.started_at),
@@ -7059,6 +7135,18 @@ class TelegramMenuBot(TelegramTurboBot):
         self.awaiting_script_idea = False
         self.script_busy = False
         self.script_draft: Optional[str] = None
+        # 🔗 auto-chain state (short clips chained by tail-frame handoff)
+        self.chain_remaining = 0
+        self.chain_total = 0
+        self.chain_seconds = 0.0
+        self.chain_idea = ""
+        self.chain_done_paths: list[Path] = []
+        self.chain_current_script = ""
+        self.chain_awaiting_idea = False
+        self.chain_pending_segments = 0
+        self.chain_pending_seconds = 0.0
+        self.awaiting_chain_setup = False
+        self.last_job_video_path: Optional[Path] = None
         self.script_idea = ""
         self.script_seconds = float(self.total_seconds)
         self.awaiting_custom_prompt = ""
@@ -8471,6 +8559,11 @@ class TelegramMenuBot(TelegramTurboBot):
 
     def on_job_finished(self, chat_id: str) -> None:
         try:
+            if self.chain_active():
+                # An auto-chain run owns the next step; don't wake or stop the
+                # LLM/ComfyUI between clips.
+                bot_log("on_job_finished: auto-chain running, LLM restart skipped")
+                return
             if self.start_next_queued_story(chat_id):
                 # A queued story is already running; don't start the LLM only to
                 # stop it again for the next job.
@@ -8728,6 +8821,9 @@ class TelegramMenuBot(TelegramTurboBot):
                     [
                         {"text": "🚀 生成影片", "callback_data": "generate"},
                         {"text": "♻️ 讀取上次設定", "callback_data": "last"},
+                    ],
+                    [
+                        {"text": "🔗 自動接力", "callback_data": "chain:start"},
                     ],
                     [
                         {
@@ -10804,6 +10900,17 @@ class TelegramMenuBot(TelegramTurboBot):
 
     def handle_script_idea(self, chat_id: str, text: str) -> None:
         """Kick off script generation in the background."""
+        if getattr(self, "chain_awaiting_idea", False):
+            # The text is the first-clip idea for a pending auto-chain run.
+            self.chain_awaiting_idea = False
+            self.awaiting_script_idea = False
+            self.start_chain(
+                chat_id,
+                int(self.chain_pending_segments or 0),
+                float(self.chain_pending_seconds or 0.0),
+                text.strip(),
+            )
+            return
         if self.script_busy:
             self.send_safe(chat_id, "上一個腳本還在生成中，請稍候。")
             return
@@ -11657,6 +11764,12 @@ class TelegramMenuBot(TelegramTurboBot):
                 return
             self.handle_custom_prompt_text(chat_id, text)
             return
+        if self.awaiting_chain_setup and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            self.handle_chain_setup(chat_id, text)
+            return
         if self.awaiting_script_idea and text.lower() != "/cancel":
             if text.startswith("/"):
                 self.handle_command(chat_id, text)
@@ -11920,15 +12033,7 @@ class TelegramMenuBot(TelegramTurboBot):
             return
 
         try:
-            REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
-            for old in REFERENCE_DIR.glob("ref_image_*"):
-                if old.is_file():
-                    old.unlink(missing_ok=True)
-            new_paths: list[Path] = []
-            for index, frame in enumerate(frames[:2], start=1):
-                destination = REFERENCE_DIR / f"ref_image_{index:02d}.jpg"
-                shutil.copyfile(frame, destination)
-                new_paths.append(destination)
+            new_paths = promote_reference_frames(frames)
         except OSError as exc:
             drop_keyboard()
             self.send_safe(chat_id, f"⚠️ 更新參考圖失敗：{exc}")
@@ -11968,6 +12073,290 @@ class TelegramMenuBot(TelegramTurboBot):
         ):
             note += "\n（提醒：目前唔係 Ref2VA 模式，參考圖要切去 Ref2VA 先會用到。）"
         self.request_script_idea(chat_id, note=note)
+
+    # --- 🔗 auto-chain (short clips chained by tail-frame handoff) ----------
+    def chain_active(self) -> bool:
+        """True while an auto-chain run still has clips left to generate."""
+        return bool(getattr(self, "chain_remaining", 0))
+
+    def request_chain_setup(self, chat_id: str) -> None:
+        """Ask for the one-line chain setup: 段數 每段秒數 [想法]."""
+        self.awaiting_chain_setup = True
+        self.awaiting_prompt = False
+        self.awaiting_script_idea = False
+        self.awaiting_duration = False
+        self.awaiting_queue_prompt = False
+        self.telegram.send_message(
+            chat_id,
+            "🔗 自動接力（短段生成 → 尾帧接續）\n\n"
+            "一次過設定：段數、每段秒數（2–15）、一句想法。之後 bot 會：\n"
+            "生成第 1 段 → 自動抽尾帧做新參考圖 → LLM 讀住上一段寫下一段 → 再生成…\n"
+            "（每段都會即刻傳返 Telegram；最後自動合併成一段）\n\n"
+            "格式：段數 每段秒數 [想法]\n"
+            "例：8 6 女生在浴室沖涼，之後慢慢走出客廳\n"
+            "（唔寫想法，下一步會問你）",
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "例：8 6 女生在浴室沖涼…",
+            },
+        )
+
+    def handle_chain_setup(self, chat_id: str, text: str) -> None:
+        """Parse "段數 每段秒數 [想法]" and start the chain (or ask for the idea)."""
+        self.awaiting_chain_setup = False
+        parts = text.strip().split(None, 2)
+        if len(parts) < 2:
+            self.send_safe(
+                chat_id, "格式：段數 每段秒數 [想法]，例如：8 6 女生在浴室沖涼"
+            )
+            return
+        try:
+            segments = int(parts[0])
+            seconds = float(parts[1])
+        except ValueError:
+            self.send_safe(
+                chat_id, "段數要整數、秒數要數字。例如：8 6 女生在浴室沖涼"
+            )
+            return
+        if not 1 <= segments <= 50:
+            self.send_safe(chat_id, "段數請在 1–50 之間。")
+            return
+        if not 2 <= seconds <= float(MAX_SEGMENT_SECONDS):
+            self.send_safe(chat_id, f"每段秒數請在 2–{MAX_SEGMENT_SECONDS:g} 秒之間。")
+            return
+        idea = parts[2].strip() if len(parts) > 2 else ""
+        self.chain_pending_segments = segments
+        self.chain_pending_seconds = seconds
+        if idea:
+            self.start_chain(chat_id, segments, seconds, idea)
+            return
+        self.chain_awaiting_idea = True
+        self.request_script_idea(
+            chat_id,
+            note=(
+                f"🔗 自動接力已設定：{segments} 段 × 每段 {seconds:g} 秒\n"
+                "請發一句「第 1 段」嘅想法；之後每段會自動接住上一段。"
+            ),
+        )
+
+    def start_chain(self, chat_id: str, segments: int, seconds: float, idea: str) -> None:
+        """Kick off the auto-chain: N short clips, each continued from the last."""
+        if self.chain_active():
+            self.send_safe(chat_id, "已有一個接力進行中（/chain off 可以停）。")
+            return
+        refs = [
+            path
+            for path in getattr(self, "reference_image_paths", [])
+            if path is not None and Path(path).is_file()
+        ]
+        if not refs:
+            self.send_safe(
+                chat_id,
+                "🔗 自動接力需要參考圖（每段尾帧會做下一段嘅新參考圖）："
+                "請先上傳一張參考圖再試。",
+            )
+            return
+        if not SCRIPT_GEN_ENABLED:
+            self.send_safe(
+                chat_id, "腳本生成器已停用（MINIMAX_SCRIPT_GEN=0），無法接力。"
+            )
+            return
+        with self.lock:
+            if self.job is not None:
+                self.send_safe(
+                    chat_id, "目前有生成工作，請等它完成（或 /cancel）再開始接力。"
+                )
+                return
+        self.chain_total = int(segments)
+        self.chain_remaining = int(segments)
+        self.chain_seconds = float(seconds)
+        self.chain_idea = idea.strip()
+        self.chain_done_paths = []
+        self.chain_current_script = ""
+        self.input_mode = INPUT_MODE_REF2VA
+        self.save_settings()
+        self.send_safe(
+            chat_id,
+            "🔗 自動接力開始\n"
+            f"段數：{self.chain_total} 段 × 每段約 {self.chain_seconds:g} 秒"
+            f"（總約 {self.chain_total * self.chain_seconds:g} 秒）\n"
+            f"腳本引擎：{script_llm_display_name()}｜模板：{script_template_display_name()}\n"
+            f"想法：{self.chain_idea}\n\n"
+            "流程：生成 → 自動抽尾帧 → LLM 續寫 → 再生成…（要停：/chain off）",
+        )
+        threading.Thread(
+            target=self._chain_worker,
+            args=(chat_id,),
+            name="h3-chain",
+            daemon=True,
+        ).start()
+
+    def chain_submit(self, chat_id: str, script: str, seconds: float) -> bool:
+        """Submit one chain clip as a Ref2VA single-shot job."""
+        config = parse_config(
+            [
+                str(self.settings.width),
+                str(self.settings.height),
+                str(self.settings.steps),
+                str(seconds),
+            ]
+        )
+        self.last_job_video_path = None
+        return self.start_generation(
+            chat_id,
+            config,
+            script,
+            reference_image_paths=[
+                path for path in self.reference_image_paths if path.is_file()
+            ],
+            reference_video_paths=[
+                path for path in self.reference_video_paths if path.is_file()
+            ],
+            reference_audio_paths=[
+                path for path in self.reference_audio_paths if path.is_file()
+            ],
+            generation_mode=INPUT_MODE_REF2VA,
+        )
+
+    def chain_wait_for_job(self, timeout: float = 5400.0) -> bool:
+        """Block until the submitted clip finishes. False on stop/timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.chain_active():
+                return False
+            with self.lock:
+                if self.job is not None:
+                    break
+            time.sleep(1.0)
+        else:
+            return False
+        while time.time() < deadline:
+            with self.lock:
+                if self.job is None:
+                    return True
+            time.sleep(2.0)
+        return False
+
+    def _chain_worker(self, chat_id: str) -> None:
+        """One clip at a time; each clip's tail frames become the next refs."""
+        try:
+            try:
+                self._ensure_llm_ready(chat_id)
+            except (BotError, OSError) as exc:
+                self.send_safe(chat_id, f"🔗 接力中止：{exc}")
+                return
+            total = int(self.chain_total)
+            for index in range(1, total + 1):
+                if not self.chain_active():
+                    self.send_safe(
+                        chat_id,
+                        f"🔗 接力已停止（完成 {len(self.chain_done_paths)}/{total} 段）。",
+                    )
+                    return
+                if index == 1:
+                    idea = self.chain_idea
+                    continuity = ""
+                else:
+                    idea = (
+                        f"{self.chain_idea}\n（這是第 {index}/{total} 段：直接延續上一段的"
+                        "結尾動作，不要重複已經演過的內容，也不要重新介紹角色）"
+                    )
+                    continuity = self.script_continuity
+                if index > 1:
+                    self.send_safe(chat_id, f"🔗 第 {index}/{total} 段：LLM 正在續寫腳本…")
+                try:
+                    script, log = generate_h3_script(
+                        idea,
+                        float(self.chain_seconds),
+                        INPUT_MODE_REF2VA,
+                        on_progress=None,
+                        lang=self._script_lang(),
+                        continuity=continuity,
+                    )
+                except (BotError, OSError) as exc:
+                    self.send_safe(
+                        chat_id,
+                        f"🔗 接力中止：第 {index}/{total} 段腳本生成失敗：{exc}",
+                    )
+                    return
+                self.chain_current_script = script
+                if index > 1:
+                    self.send_safe(
+                        chat_id,
+                        f"🔗 第 {index}/{total} 段腳本完成（{'；'.join(log) or '通過驗證'}），"
+                        "生成中…",
+                    )
+                if not self.chain_submit(chat_id, script, float(self.chain_seconds)):
+                    self.send_safe(chat_id, "🔗 接力中止：無法送出生成工作。")
+                    return
+                if not self.chain_wait_for_job():
+                    self.send_safe(chat_id, "🔗 接力中止：工作被取消或超時。")
+                    return
+                video = getattr(self, "last_job_video_path", None)
+                if video is None or not Path(video).is_file():
+                    self.send_safe(
+                        chat_id, f"🔗 接力中止：第 {index}/{total} 段沒有產出影片。"
+                    )
+                    return
+                self.chain_done_paths.append(Path(video))
+                self.chain_remaining = total - index
+                _token, frames = extract_tail_frames(Path(video), 2)
+                if not frames:
+                    self.send_safe(chat_id, "🔗 接力中止：抽不到尾帧（無法接續）。")
+                    return
+                try:
+                    self.reference_image_paths = promote_reference_frames(frames)
+                except OSError as exc:
+                    self.send_safe(chat_id, f"🔗 接力中止：更新參考圖失敗：{exc}")
+                    return
+                source = script[:4000]
+                if len(script) > 4000:
+                    source += "\n……（劇本太長，已截斷）"
+                self.continuity_source_script = self.chain_current_script
+                self.script_continuity = (
+                    TAIL_CONTINUITY_NOTE
+                    + "\n\n【上一段劇本（最新一條片用嘅；只寫之後發生嘅事）】\n"
+                    + source
+                    + "\n【上一段劇本完】"
+                )
+                self.save_settings()
+                if index < total:
+                    self.send_safe(
+                        chat_id,
+                        f"🔗 第 {index}/{total} 段完成 → 尾帧已成為新參考圖，"
+                        f"準備第 {index + 1} 段…",
+                    )
+                else:
+                    self.send_safe(chat_id, f"🔗 全部 {total} 段完成，正在合併…")
+            self.chain_finish(chat_id)
+        except Exception as exc:  # noqa: BLE001 - the chain must never kill the bot
+            bot_log(f"chain worker failed: {type(exc).__name__}: {exc}")
+            self.send_safe(chat_id, f"🔗 接力發生錯誤：{exc}")
+        finally:
+            self.chain_remaining = 0
+            self.chain_total = 0
+            try:
+                self.save_settings()
+            except (BotError, OSError, ValueError):
+                pass
+
+    def chain_finish(self, chat_id: str) -> None:
+        """Merge the finished clips and send the combined video."""
+        paths = [path for path in self.chain_done_paths if path.is_file()]
+        if len(paths) < 2:
+            return
+        try:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            merged = chain_merge_clips(paths, OUTPUT_DIR / f"chain_{stamp}.mp4")
+        except (BotError, OSError) as exc:
+            self.send_safe(chat_id, f"（合併成品失敗；上面各段仍可正常使用：{exc}）")
+            return
+        try:
+            self.telegram.send_video(
+                chat_id, merged, f"🔗 接力完成：{len(paths)} 段合併成一段"
+            )
+        except (BotError, OSError) as exc:
+            self.send_safe(chat_id, f"（合併成品傳送失敗：{exc}）")
 
     def handle_callback(self, callback: dict[str, Any]) -> None:
         query_id = str(callback.get("id", ""))
@@ -12432,6 +12821,9 @@ class TelegramMenuBot(TelegramTurboBot):
             if data == "bot_restart":
                 self.restart_bot(chat_id)
                 return
+            if data == "chain:start":
+                self.request_chain_setup(chat_id)
+                return
             if data == "generate":
                 if self.awaiting_duration:
                     self.send_safe(chat_id, "請先輸入自定義總片長秒數，或使用 /cancel 取消。")
@@ -12494,6 +12886,23 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.handle_script_idea(chat_id, remainder[1].strip())
             else:
                 self.request_script_idea(chat_id)
+            return
+        if command == "/chain":
+            rest = text.split(None, 1)
+            if len(rest) > 1 and rest[1].strip():
+                if rest[1].strip().lower() in {"off", "stop", "cancel", "停"}:
+                    was = self.chain_active()
+                    self.chain_remaining = 0
+                    self.send_safe(
+                        chat_id,
+                        "🔗 接力已停止（目前嗰段仍然會完成，之後唔會再接落去）。"
+                        if was
+                        else "目前冇接力進行中。",
+                    )
+                else:
+                    self.handle_chain_setup(chat_id, rest[1].strip())
+            else:
+                self.request_chain_setup(chat_id)
             return
         if command in {"/scripttemplate", "/template"}:
             if len(parts) > 1:
