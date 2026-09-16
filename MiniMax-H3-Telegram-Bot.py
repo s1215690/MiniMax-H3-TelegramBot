@@ -2426,13 +2426,22 @@ def seedvr2_usage_report(target_long_edge: int) -> str:
     )
 
 
-def json_request(url: str, payload: Optional[dict[str, Any]] = None, timeout: float = 45.0) -> Any:
+def json_request(
+    url: str,
+    payload: Optional[dict[str, Any]] = None,
+    timeout: float = 45.0,
+    headers: Optional[dict[str, str]] = None,
+) -> Any:
     data = None
-    headers = {"Accept": "application/json"}
+    request_headers = {"Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = Request(url, data=data, headers=headers, method="POST" if data else "GET")
+        request_headers["Content-Type"] = "application/json"
+    request = Request(
+        url, data=data, headers=request_headers, method="POST" if data else "GET"
+    )
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -4184,6 +4193,92 @@ SCRIPT_GEN_MAX_TOKENS = int(os.environ.get("MINIMAX_SCRIPT_GEN_MAX_TOKENS", "600
 SCRIPT_GEN_RETRY_TOKENS = int(
     os.environ.get("MINIMAX_SCRIPT_GEN_RETRY_TOKENS", "16000")
 )
+# Which LLM writes the scripts: the local llama.cpp server (default) or the
+# Command Code cloud API (OpenAI-compatible chat completions). Runtime-togglable
+# from Telegram (/scriptllm or the 🧠 button) and persisted in settings;
+# MINIMAX_SCRIPT_LLM sets the boot default.
+SCRIPT_LLM_LOCAL = "local"
+SCRIPT_LLM_COMMANDCODE = "commandcode"
+SCRIPT_LLM_PROVIDERS = (SCRIPT_LLM_LOCAL, SCRIPT_LLM_COMMANDCODE)
+SCRIPT_LLM_LABEL = {
+    SCRIPT_LLM_LOCAL: "本機",
+    SCRIPT_LLM_COMMANDCODE: "Command Code",
+}
+SCRIPT_LLM_DEFAULT = (
+    os.environ.get("MINIMAX_SCRIPT_LLM", SCRIPT_LLM_LOCAL).strip().lower()
+)
+if SCRIPT_LLM_DEFAULT not in SCRIPT_LLM_PROVIDERS:
+    SCRIPT_LLM_DEFAULT = SCRIPT_LLM_LOCAL
+COMMANDCODE_BASE_URL = os.environ.get(
+    "MINIMAX_COMMANDCODE_BASE_URL", "https://api.commandcode.ai/provider/v1"
+).rstrip("/")
+COMMANDCODE_MODEL = os.environ.get(
+    "MINIMAX_COMMANDCODE_MODEL", "deepseek/deepseek-v4.1-flash"
+)
+# Cloudflare sits in front of the API and blocks unknown browser signatures
+# (error 1010), so requests must carry a normal browser User-Agent.
+COMMANDCODE_USER_AGENT = os.environ.get(
+    "MINIMAX_COMMANDCODE_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+)
+COMMANDCODE_API_KEY_ENV = "COMMANDCODE_API_KEY"
+# The key normally comes from the environment; when it is absent there it is
+# read from the Hermes .env that already holds it on this machine (override the
+# path with MINIMAX_COMMANDCODE_ENV_FILE). The value is never logged.
+_COMMANDCODE_ENV_FILE = Path(
+    os.environ.get(
+        "MINIMAX_COMMANDCODE_ENV_FILE",
+        str(Path(os.environ.get("LOCALAPPDATA", "C:/")) / "hermes" / ".env"),
+    )
+)
+_script_llm_active = SCRIPT_LLM_DEFAULT
+
+
+def normalize_script_llm(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"cc", "command-code", "command_code", "cloud", "api"}:
+        return SCRIPT_LLM_COMMANDCODE
+    if text in SCRIPT_LLM_PROVIDERS:
+        return text
+    return SCRIPT_LLM_DEFAULT
+
+
+def get_script_llm_provider() -> str:
+    """The engine that will answer the next script-generation call."""
+    return _script_llm_active
+
+
+def set_script_llm_provider(value: str) -> str:
+    global _script_llm_active
+    _script_llm_active = normalize_script_llm(value)
+    return _script_llm_active
+
+
+def script_llm_display_name() -> str:
+    """User-facing name of the active script engine."""
+    if _script_llm_active == SCRIPT_LLM_COMMANDCODE:
+        return f"Command Code（{COMMANDCODE_MODEL}）"
+    return "本機 LLM"
+
+
+def commandcode_api_key() -> str:
+    """Resolve the Command Code API key (env first, then the Hermes .env)."""
+    key = (os.environ.get(COMMANDCODE_API_KEY_ENV) or "").strip()
+    if key:
+        return key
+    try:
+        for line in _COMMANDCODE_ENV_FILE.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            line = line.strip()
+            if line.startswith(COMMANDCODE_API_KEY_ENV + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
 # Output language for generated scripts. The H3 model was trained mostly on
 # English, so English action/camera phrasing is the most stable; Simplified
 # Chinese is fully supported and is the default here because it is what the user
@@ -4745,31 +4840,59 @@ def _llama_chat_once(
     timeout: float,
 ) -> tuple[str, str, int]:
     """One chat completion. Returns (content, finish_reason, completion_tokens)."""
-    payload = {
-        "model": "local",
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": 0.95,
-        "stream": False,
-    }
-    try:
-        data = json_request(f"{LLAMA_URL}/v1/chat/completions", payload, timeout=timeout)
-    except BotError as exc:
-        detail = str(exc)
-        if "Loading model" in detail:
+    if get_script_llm_provider() == SCRIPT_LLM_COMMANDCODE:
+        key = commandcode_api_key()
+        if not key:
             raise BotError(
-                "本機 LLM 還在載入模型（開機後約需一分鐘），請稍候再試。"
+                f"Command Code API key 未設定（環境變數 {COMMANDCODE_API_KEY_ENV}）。"
+            )
+        payload = {
+            "model": COMMANDCODE_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
+        try:
+            data = json_request(
+                f"{COMMANDCODE_BASE_URL}/chat/completions",
+                payload,
+                timeout=timeout,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "User-Agent": COMMANDCODE_USER_AGENT,
+                },
+            )
+        except BotError as exc:
+            raise BotError(
+                f"Command Code 沒有回應（{COMMANDCODE_BASE_URL}）：{exc}"
             ) from exc
-        raise BotError(
-            f"本機 LLM 沒有回應（{LLAMA_URL}）：{exc}\n"
-            "請確認 llama-server 正在執行，或在面板按「啟動 LLM」。"
-        ) from exc
+    else:
+        payload = {
+            "model": "local",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": 0.95,
+            "stream": False,
+        }
+        try:
+            data = json_request(f"{LLAMA_URL}/v1/chat/completions", payload, timeout=timeout)
+        except BotError as exc:
+            detail = str(exc)
+            if "Loading model" in detail:
+                raise BotError(
+                    "本機 LLM 還在載入模型（開機後約需一分鐘），請稍候再試。"
+                ) from exc
+            raise BotError(
+                f"本機 LLM 沒有回應（{LLAMA_URL}）：{exc}\n"
+                "請確認 llama-server 正在執行，或在面板按「啟動 LLM」。"
+            ) from exc
     if not isinstance(data, dict):
-        raise BotError("本機 LLM 回傳了非預期的格式。")
+        raise BotError(f"{script_llm_display_name()}回傳了非預期的格式。")
     choices = data.get("choices") or []
     if not choices:
-        raise BotError("本機 LLM 沒有產生任何內容。")
+        raise BotError(f"{script_llm_display_name()}沒有產生任何內容。")
     choice = choices[0]
     message = choice.get("message") or {}
     content = str(message.get("content") or "").strip()
@@ -4827,11 +4950,11 @@ def llama_chat(
 
     if last_finish == "length":
         raise BotError(
-            f"本機 LLM 的思考用光了 {budgets[-1]} token 預算，還沒開始寫正文。\n"
+            f"{script_llm_display_name()}的思考用光了 {budgets[-1]} token 預算，還沒開始寫正文。\n"
             "請縮短想法，或把 MINIMAX_SCRIPT_GEN_MAX_TOKENS 調更高。"
         )
     raise BotError(
-        f"本機 LLM 沒有回傳正文（finish_reason={last_finish or '未知'}，"
+        f"{script_llm_display_name()}沒有回傳正文（finish_reason={last_finish or '未知'}，"
         f"{last_tokens} tokens）。請重試。"
     )
 
@@ -5382,6 +5505,7 @@ class TelegramTurboBot:
             "   例如：/make 60秒 下雨的車站，女生錯過末班車\n"
             "   也可直接打 /make 再依提示輸入\n"
             "/lang zh|en 切換腳本語言（預設簡體中文）\n"
+            "/scriptllm 切換腳本 LLM（本機 / Command Code）\n"
             "/prompt_file 查看／編輯自訂指令檔（存檔即生效，免重啟）\n"
             "/prompt_help 提示詞寫作精華\n"
             "/progress 查看即時生成進度\n"
@@ -6793,6 +6917,8 @@ class TelegramMenuBot(TelegramTurboBot):
         self.script_lang = self.load_saved_script_lang()
         self.script_continuity = self.load_saved_script_continuity()
         self.continuity_source_script = self.load_saved_continuity_source()
+        self.script_llm = self.load_saved_script_llm()
+        set_script_llm_provider(self.script_llm)
         self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
         self._shutdown_pending = False
         self.awaiting_prompt = False
@@ -6983,6 +7109,19 @@ class TelegramMenuBot(TelegramTurboBot):
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
         return ""
+
+    @staticmethod
+    def load_saved_script_llm() -> str:
+        """Which engine writes the scripts: local llama.cpp or Command Code."""
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("script_llm")
+            if isinstance(value, str):
+                return normalize_script_llm(value)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return SCRIPT_LLM_DEFAULT
 
     @staticmethod
     def load_saved_shutdown_after_generation() -> bool:
@@ -7229,6 +7368,9 @@ class TelegramMenuBot(TelegramTurboBot):
                     ),
                     "continuity_source_script": str(
                         getattr(self, "continuity_source_script", "")
+                    ),
+                    "script_llm": normalize_script_llm(
+                        getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
                     ),
                     "shutdown_after_generation": bool(
                         getattr(self, "shutdown_after_generation", False)
@@ -8393,7 +8535,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
                     {"text": "🧹 清除提示詞", "callback_data": "clear"},
                 ],
-                [{"text": "✨ 一句話生成腳本（本機 LLM）", "callback_data": "script:new"}],
+                [{"text": "✨ 一句話生成腳本", "callback_data": "script:new"}],
                 [
                     {
                         "text": "🌐 腳本語言："
@@ -8403,6 +8545,15 @@ class TelegramMenuBot(TelegramTurboBot):
                             )
                         ],
                         "callback_data": "script_lang:toggle",
+                    },
+                    {
+                        "text": "🧠 LLM："
+                        + SCRIPT_LLM_LABEL[
+                            normalize_script_llm(
+                                getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_llm:toggle",
                     },
                     {"text": "📝 自訂指令", "callback_data": "script_file"},
                 ],
@@ -8475,7 +8626,7 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
                     {"text": "🧹 清除提示詞", "callback_data": "clear"},
                 ],
-                [{"text": "✨ 一句話生成腳本（本機 LLM）", "callback_data": "script:new"}],
+                [{"text": "✨ 一句話生成腳本", "callback_data": "script:new"}],
                 [
                     {
                         "text": "🌐 腳本語言："
@@ -8485,6 +8636,15 @@ class TelegramMenuBot(TelegramTurboBot):
                             )
                         ],
                         "callback_data": "script_lang:toggle",
+                    },
+                    {
+                        "text": "🧠 LLM："
+                        + SCRIPT_LLM_LABEL[
+                            normalize_script_llm(
+                                getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_llm:toggle",
                     },
                     {"text": "📝 自訂指令", "callback_data": "script_file"},
                 ],
@@ -10294,6 +10454,7 @@ class TelegramMenuBot(TelegramTurboBot):
             "  • 30秒 貓在窗邊發呆，午後陽光\n"
             "  • 2分鐘 賽博龐克機車追逐\n\n"
             f"沒寫秒數就用目前的 {self.duration_label(self.total_seconds)}。\n"
+            f"腳本 LLM：{script_llm_display_name()}（輸入 /scriptllm 可切換）\n"
             f"腳本語言：{SCRIPT_LANG_LABEL[normalize_script_lang(getattr(self, 'script_lang', SCRIPT_LANG_DEFAULT))]}"
             "（輸入 /lang 可切換）\n"
             "生成約需 20–60 秒，完成後可一鍵採用或重新生成。"
@@ -10320,6 +10481,31 @@ class TelegramMenuBot(TelegramTurboBot):
             else "\n（英文是 H3 訓練語料的主要語言，動態與運鏡描述最穩定。）"
         )
         notice = f"腳本語言已切換為：{label}{extra}"
+        if message_id is not None:
+            self.show_menu(chat_id, message_id, notice)
+        else:
+            self.show_menu(chat_id, notice=notice)
+
+    def switch_script_llm(self, chat_id: str, value: str, message_id: Optional[int] = None) -> None:
+        """Switch which LLM writes the scripts and persist it."""
+        self.script_llm = normalize_script_llm(value)
+        set_script_llm_provider(self.script_llm)
+        self.save_settings()
+        if self.script_llm == SCRIPT_LLM_COMMANDCODE:
+            extra = (
+                f"\n雲端引擎：Command Code，模型 {COMMANDCODE_MODEL}"
+                "（不佔本機顯存、不需要啟動 llama-server）。"
+            )
+            if not commandcode_api_key():
+                extra += (
+                    f"\n⚠️ 未找到 API key：請設定環境變數 {COMMANDCODE_API_KEY_ENV}。"
+                )
+        else:
+            extra = (
+                "\n本機引擎：llama.cpp（127.0.0.1:19092）；"
+                "生成腳本前 Bot 會自動確保它已啟動。"
+            )
+        notice = f"🧠 腳本 LLM 已切換為：{script_llm_display_name()}{extra}"
         if message_id is not None:
             self.show_menu(chat_id, message_id, notice)
         else:
@@ -10447,10 +10633,16 @@ class TelegramMenuBot(TelegramTurboBot):
         self.script_draft = None
         self.script_history = []
 
+        if get_script_llm_provider() == SCRIPT_LLM_COMMANDCODE:
+            lead = f"✨ 正在用 Command Code（{COMMANDCODE_MODEL}）生成"
+            wait = "約 5–30 秒"
+        else:
+            lead = "✨ 正在用本機 LLM 生成"
+            wait = "首次約需 20–60 秒"
         self.send_safe(
             chat_id,
-            f"✨ 正在用本機 LLM 生成 {self.duration_label(seconds)} 腳本…\n"
-            f"想法：{idea}\n\n首次約需 20–60 秒，請稍候。",
+            f"{lead} {self.duration_label(seconds)} 腳本…\n"
+            f"想法：{idea}\n\n{wait}，請稍候。",
         )
         thread = threading.Thread(
             target=self._script_worker,
@@ -10468,6 +10660,10 @@ class TelegramMenuBot(TelegramTurboBot):
         "not started, starting it" during that window is both wrong and alarming,
         so the two states are reported separately.
         """
+        if get_script_llm_provider() == SCRIPT_LLM_COMMANDCODE:
+            # Cloud engine selected: there is nothing local to start or wait
+            # for, and the llama.cpp process must not be woken up for this.
+            return
         if llama_is_online():
             return
         # NOTE: the VRAM guard against a model-holding ComfyUI lives inside
@@ -11644,6 +11840,21 @@ class TelegramMenuBot(TelegramTurboBot):
                     target = normalize_script_lang(action)
                 self.set_script_lang(chat_id, target, message_id)
                 return
+            if data.startswith("script_llm:"):
+                action = data.removeprefix("script_llm:")
+                current = normalize_script_llm(
+                    getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
+                )
+                if action in {"", "toggle"}:
+                    target = (
+                        SCRIPT_LLM_COMMANDCODE
+                        if current == SCRIPT_LLM_LOCAL
+                        else SCRIPT_LLM_LOCAL
+                    )
+                else:
+                    target = normalize_script_llm(action)
+                self.switch_script_llm(chat_id, target, message_id)
+                return
             if data.startswith("script:"):
                 action = data.removeprefix("script:")
                 if action == "new":
@@ -12078,6 +12289,21 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.handle_script_idea(chat_id, remainder[1].strip())
             else:
                 self.request_script_idea(chat_id)
+            return
+        if command in {"/scriptllm", "/script_llm"}:
+            if len(parts) > 1:
+                self.switch_script_llm(chat_id, parts[1])
+            else:
+                current = normalize_script_llm(
+                    getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
+                )
+                self.send_safe(
+                    chat_id,
+                    f"🧠 目前腳本 LLM：{script_llm_display_name()}\n\n"
+                    "/scriptllm local — 本機 llama.cpp（127.0.0.1:19092）\n"
+                    f"/scriptllm cc — Command Code 雲端（{COMMANDCODE_MODEL}）\n\n"
+                    "也可以在面板按「🧠 LLM」切換。",
+                )
             return
         if command in {"/lang", "/language"}:
             if len(parts) >= 2:
