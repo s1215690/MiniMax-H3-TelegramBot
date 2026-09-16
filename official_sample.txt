@@ -1,0 +1,7 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] A woman in a beige trench coat stands under a station clock at a rainy platform, <Picture 1> keeps her exact appearance. She looks down the empty platform. The camera slowly pushes in from a wide shot. [Shot 2] A train arrives with a long whistle, steam flooding the platform. She watches the doors open but nobody gets off. [Shot 3] She boards the train and walks down the empty aisle, her footsteps echoing. The camera follows her from behind until she sits by the window.
+
+overall_soundscape: Steady rain on the platform canopy, a distant train whistle, echoing footsteps on wet concrete.
+
+non_diegetic_music: A slow melancholic solo piano, sparse and quiet.

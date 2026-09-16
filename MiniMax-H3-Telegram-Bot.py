@@ -9,6 +9,7 @@ variables and are never written to this workspace.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import asyncio
 import math
@@ -25,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -90,6 +91,14 @@ COMFYUI_STATE_DIR = Path(
 COMFYUI_USER_DIR = COMFYUI_STATE_DIR / "user"
 COMFYUI_DATABASE = COMFYUI_STATE_DIR / "comfyui.db"
 DEFAULT_COMFYUI_VRAM_MODE = "lowvram"
+# NOTE (2026-09-15): a full dual-GPU investigation was run and then reverted.
+# Both RTX 3080s are visible to ComfyUI just fine, but every generation path
+# aborts: comfy-aimdo's multi-device hostbuf copy kills the process inside its
+# native DLL ("hostbuf_read_file_slice: device copy failed", uncatchable from
+# Python), and H3VM - which does correctly detect the pair and split the model -
+# either access-violates in ModelPatcher.deepclone_multigpu() or stalls with the
+# second GPU idle. Details, evidence and the conditions that would make a retry
+# worthwhile are in 雙卡調查報告.md. ComfyUI runs single-GPU by design here.
 FFMPEG_PATH = os.environ.get("MINIMAX_FFMPEG", shutil.which("ffmpeg") or "ffmpeg")
 FFPROBE_PATH = os.environ.get("MINIMAX_FFPROBE", shutil.which("ffprobe") or "ffprobe")
 NVIDIA_SMI_PATH = os.environ.get(
@@ -101,22 +110,39 @@ NVIDIA_SMI_PATH = os.environ.get(
 # Preset parameters captured from the running Qwen3.8-27B server (2026-09-05),
 # so the Telegram panel can start/stop the model with the exact same settings
 # as the local Llama dashboard.
+#
+# 2026-09-11: re-captured from the live EfficientThink + MTP-draft server so the
+# Bot brings back the SAME model the user actually runs, instead of the older
+# UD-Q6_K_XL preset. The two differed in build (10448 vs 10830), model, mmproj,
+# context window, and speculative-decoding strategy.
 LLAMA_URL = os.environ.get("MINIMAX_LLAMA_URL", "http://127.0.0.1:19092").rstrip("/")
 LLAMA_PORT = int(os.environ.get("MINIMAX_LLAMA_PORT", "19092"))
 LLAMA_HOST = os.environ.get("MINIMAX_LLAMA_HOST", "127.0.0.1")
+# llama.cpp now ships a thin llama-server.exe launcher plus llama-server-impl.dll,
+# so a ~9 KB executable here is expected, not a broken download.
 LLAMA_EXE = Path(
-    os.environ.get("MINIMAX_LLAMA_EXE", r"D:\llama.cpp\bin\llama-server.exe")
+    os.environ.get(
+        "MINIMAX_LLAMA_EXE", r"D:\llama.cpp-b10830\llama-server.exe"
+    )
 )
 LLAMA_MODEL = Path(
     os.environ.get(
         "MINIMAX_LLAMA_MODEL",
-        r"D:\models\qwen38-unsloth\Qwen3.8-27B-UD-Q6_K_XL.gguf",
+        r"D:\models\qwen38-efficientthink-q6\Qwen3.8-27B-EfficientThink-SimPO-Q6_K.gguf",
     )
 )
 LLAMA_MMPROJ = Path(
     os.environ.get(
         "MINIMAX_LLAMA_MMPROJ",
-        r"D:\models\qwen38-unsloth\mmproj-F16.gguf",
+        r"D:\models\qwen38-efficientthink-q6\mmproj-Qwen3.8-27B-Q8_0.gguf",
+    )
+)
+# MTP draft head for speculative decoding. `--spec-type draft-mtp` is useless
+# without it, so it is validated next to the main model in start_llama_process().
+LLAMA_DRAFT_MODEL = Path(
+    os.environ.get(
+        "MINIMAX_LLAMA_DRAFT_MODEL",
+        r"D:\models\qwen38-mtp\mtp-Qwen3.8-27B-Q4_0.gguf",
     )
 )
 LLAMA_SLOT_CACHE = Path(
@@ -128,11 +154,23 @@ LLAMA_LOG = Path(
         r"E:\MiniMax-H3-Telegram\runtime\bot\llama-server.log",
     )
 )
+# Machine-specific placement for this 2 x RTX 3080 (20 GB) box. The main model is
+# split across both cards and the small MTP draft head lives on the second one.
+LLAMA_CTX = int(os.environ.get("MINIMAX_LLAMA_CTX", "230000"))
+LLAMA_DEVICE = os.environ.get("MINIMAX_LLAMA_DEVICE", "CUDA0,CUDA1")
+LLAMA_DRAFT_DEVICE = os.environ.get("MINIMAX_LLAMA_DRAFT_DEVICE", "CUDA1")
+LLAMA_TENSOR_SPLIT = os.environ.get("MINIMAX_LLAMA_TENSOR_SPLIT", "1,1")
+# The bot stops the local LLM before every job to free VRAM. By default it puts
+# the LLM back once the job is done, so Hermes/DSH local models work again.
+# MINIMAX_LLM_RESTART_AFTER_JOB=0 leaves it down until started by hand.
+RESTART_LLM_AFTER_GENERATION = os.environ.get(
+    "MINIMAX_LLM_RESTART_AFTER_JOB", "1"
+).strip().lower() not in {"0", "false", "off", "no"}
 LLAMA_PRESET_ARGS: list[str] = [
     "-m", str(LLAMA_MODEL),
     "--jinja",
     "--metrics",
-    "-c", "198144",
+    "-c", str(LLAMA_CTX),
     "--parallel", "1",
     "-ngl", "99",
     "--host", LLAMA_HOST,
@@ -141,19 +179,29 @@ LLAMA_PRESET_ARGS: list[str] = [
     "--temp", "1",
     "--top-p", "0.95",
     "--top-k", "20",
-    "--spec-draft-n-max", "2",
+    # Speculative decoding. The MTP draft head must be named explicitly: with
+    # `--spec-type draft-mtp` alone llama.cpp has no draft model to run, so the
+    # acceleration is silently lost. The ngram-mod fallback the old preset used
+    # is NOT part of the live EfficientThink setup and has been dropped.
+    "--spec-type", "draft-mtp",
+    "--spec-draft-model", str(LLAMA_DRAFT_MODEL),
+    "--spec-draft-n-max", "3",
     "--spec-draft-ngl", "99",
-    "--spec-ngram-mod-n-match", "24",
-    "--spec-ngram-mod-n-min", "48",
-    "--spec-ngram-mod-n-max", "64",
-    "--spec-type", "draft-mtp,ngram-mod",
+    "--spec-draft-device", LLAMA_DRAFT_DEVICE,
     "--mmproj", str(LLAMA_MMPROJ),
+    "--image-min-tokens", "1024",
     "--reasoning", "on",
     "--reasoning-effort", "low",
     "--flash-attn", "on",
     "--cache-type-k", "q8_0",
     "--cache-type-v", "q8_0",
     "--split-mode", "tensor",
+    # Pin GPU placement explicitly so a driver enumeration change cannot quietly
+    # move the model or the draft head onto the wrong card.
+    "--device", LLAMA_DEVICE,
+    "--tensor-split", LLAMA_TENSOR_SPLIT,
+    "--fit", "off",
+    "--no-warmup",
 ]
 SHUTDOWN_DELAY_SECONDS = 60
 MAX_TELEGRAM_IMAGE_BYTES = 20 * 1024 * 1024
@@ -188,9 +236,10 @@ Bot 會自動加入「只鎖人物外貌、不帶走參考圖的場景/背景/�
 
 【長片時間軸】
 標題格式：場景名（開始秒-結束秒）：例如 開頭（0-5秒）：
-• 必須由 0 秒開始、連續寫到所選總片長；缺口、重疊、只寫到 50 秒卻選 60 秒都會被拒絕
+• 必須由 0 秒開始、連續寫到腳本最大秒數；缺口、重疊都會被拒絕
 • 每一幕 2–15 秒（Bot 自動拆成 ≤8 秒鏡頭）
 • 第一個時間標題之前的文字 = 全局設定（人物外貌／場景／風格／音樂，只寫一次，每鏡自動附上）
+• Bot 會自動讀取時間軸的最大結束秒數，不需要每次手動選片長
 
 【長片 GLOBAL／SEGMENT】
 GLOBAL: 人物外貌、場景、光線、風格、音樂
@@ -215,7 +264,72 @@ AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 CLIP_NAME = "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
 UNET_NAME = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 LORA_NAME = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+# ---- model profiles for the stock (non-YUPI) path --------------------------
+# classic: the split FL2VA / Ref2VA checkpoints + the turbo LoRA (original
+#          behaviour, untouched).
+# fused:   MATLOWAI's single fused checkpoint — pruned fl2va with a rank-1024
+#          (ref2va - fl2va) delta, lightx2v turbo-8 @1.0 and Mystic v2.0 @0.7
+#          all baked into the weights. One file serves T2VA/I2VA/FL2VA/Ref2VA,
+#          needs NO LoRA loader (and therefore no ~21GB unpatch backup), and is
+#          built to run at 4 steps. H3 SLA sparse attention is inserted when
+#          the pack is installed.
+H3_PROFILE_CLASSIC = "classic"
+H3_PROFILE_FUSED = "fused"
+H3_PROFILES = (H3_PROFILE_CLASSIC, H3_PROFILE_FUSED)
+H3_PROFILE_DEFAULT = H3_PROFILE_FUSED
+FUSED_UNET_NAME = os.environ.get(
+    "MINIMAX_H3_FUSED_UNET",
+    "minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors",
+).strip()
+FUSED_PROFILE_STEPS = 6
+
+
+def _fused_profile_steps() -> int:
+    """Sampler steps for the fused bake (4 = the step count it was built for).
+
+    Set MINIMAX_H3_FUSED_STEPS to override (e.g. 6) when comparing speed vs
+    quality without editing this file.
+    """
+    try:
+        value = int(os.environ.get("MINIMAX_H3_FUSED_STEPS", "").strip())
+    except ValueError:
+        value = 0
+    return value if value > 0 else 4
+
+
+FUSED_PROFILE_STEPS = _fused_profile_steps()
+SLA_NODE_CLASS = "H3SLAAttention"
+SLA_NODE_ID = "900"
 OUTPUT_PREFIX = "MiniMaxH3/Telegram_Turbo"
+# ---- YUPI workflow (isolated NSFW Ref2VA path) -----------------------------
+# A separate, self-contained generation path that does NOT touch the stock
+# Turbo pipeline. It loads yupi_nsfw_api.json (Ref2VA + AfterMidnight NSFW
+# LoRA, euler/beta) and is triggered by the "YUPI工作流" button.
+YUPI_API_TEMPLATE = Path(__file__).resolve().parent / "yupi_nsfw_api.json"
+YUPI_OUTPUT_PREFIX = "MiniMaxH3/YUPI_NSFW"
+YUPI_BUTTON = "🌙 YUPI工作流（6步）"
+YUPI_TASK_TYPE = "yupi"
+YUPI_LORA_NAME = os.environ.get(
+    "MINIMAX_YUPI_LORA",
+    "Vagina_minimax-h3_epoch20.safetensors",
+).strip()
+# Anatomy adapters (stills-trained) sit under the action adapter. Trigger
+# tokens live in the prompt: 'pussy' for HMPussy, 'hmmotion' for HMNSFW.
+YUPI_ACTION_LORA_NAME = os.environ.get(
+    "MINIMAX_YUPI_ACTION_LORA",
+    "HMNSFW-AIO-V2.5.safetensors",
+).strip()
+# ---- YUPI_FAST variant (FastH3 6-step distill, still euler/beta) -----------
+# YUPI now runs this variant by default (it replaced the 20-step YUPI graph).
+# It loads yupi_fast_api.json, which chains anatomy -> action -> FastH3 and
+# runs the scheduler at 6 steps. The 20-step graph (yupi_nsfw_api.json) and the
+# stock Turbo pipeline are both untouched.
+YUPI_FAST_API_TEMPLATE = Path(__file__).resolve().parent / "yupi_fast_api.json"
+YUPI_FAST_OUTPUT_PREFIX = "MiniMaxH3/YUPI_FAST"
+YUPI_FAST_LORA_NAME = os.environ.get(
+    "MINIMAX_YUPI_FAST_LORA",
+    "fasth3_6step.safetensors",
+).strip()
 STATE_PATH = Path(
     os.environ.get(
         "MINIMAX_TELEGRAM_STATE",
@@ -246,6 +360,9 @@ BOT_LOG = STATE_PATH.parent / "bot.log"
 LONG_CONTINUITY_MODE = os.environ.get(
     "MINIMAX_H3_LONG_CONTINUITY", "motion_context"
 ).strip().lower()
+# User-facing long-video continuation modes: pin the previous shot's AV latent
+# (motion_context) or fall back to a plain tail-frame handoff (tail_frame).
+LONG_CONTINUITY_MODES = ("motion_context", "tail_frame")
 MOTION_CONTEXT_LENGTH = 22
 # The pinned *audio* window is a separate setting from the pinned *video*
 # window. The H3 Motion Context README recommends exactly 24 frames: that is
@@ -261,11 +378,15 @@ INPUT_MODE_TEXT = "text"
 INPUT_MODE_IMAGE = "image"
 INPUT_MODE_FL2VA = "fl2va"
 INPUT_MODE_REF2VA = "ref2va"
+# YUPI is a real input mode, not an action button: selecting it only stages the
+# mode (the user uploads a reference image and then presses 🚀 生成影片).
+INPUT_MODE_YUPI = "yupi"
 INPUT_MODES = {
     INPUT_MODE_TEXT,
     INPUT_MODE_IMAGE,
     INPUT_MODE_FL2VA,
     INPUT_MODE_REF2VA,
+    INPUT_MODE_YUPI,
 }
 MENU_MAIN = "main"
 MENU_INPUT = "input"
@@ -325,9 +446,23 @@ def normalize_model_mode(value: Any) -> str:
     return MODEL_H3
 
 
+def normalize_task_type(value: Any) -> str:
+    """Keep the isolated YUPI path distinguishable from the stock H3 path."""
+    return (
+        YUPI_TASK_TYPE
+        if str(value or "").strip().lower() == YUPI_TASK_TYPE
+        else normalize_model_mode(value)
+    )
+
+
 def normalize_input_mode(value: Any) -> str:
     mode = str(value or INPUT_MODE_TEXT).strip().lower()
     return mode if mode in INPUT_MODES else INPUT_MODE_TEXT
+
+
+def is_ref2va_like(value: Any) -> bool:
+    """True for modes that stage Ref2VA-style reference media (Ref2VA, YUPI)."""
+    return normalize_input_mode(value) in {INPUT_MODE_REF2VA, INPUT_MODE_YUPI}
 
 
 def normalize_menu_section(value: Any) -> str:
@@ -562,6 +697,10 @@ class JobState:
     progress_tracker: Any = field(default=None, repr=False, compare=False)
     task_type: str = "h3"
     generation_mode: str = INPUT_MODE_TEXT
+    # True when this job is the YUPI_FAST variant (FastH3 6-step distill chain).
+    # Kept separate from task_type so every existing YUPI task_type check still
+    # applies unchanged; only the template/prefix/name-hint differ.
+    yupi_fast: bool = False
     upscale_source_path: Optional[Path] = None
     upscale_target_width: int = 0
     upscale_target_height: int = 0
@@ -611,8 +750,9 @@ class QueuedStory:
 class ComfyProgressTracker:
     """Listen to ComfyUI's WebSocket progress events for one prompt."""
 
-    def __init__(self, job: JobState):
+    def __init__(self, job: JobState, client_id: str = "telegram-turbo-bot"):
         self.job = job
+        self.client_id = str(client_id or "telegram-turbo-bot")
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
 
@@ -646,7 +786,7 @@ class ComfyProgressTracker:
         ws_base = COMFY_URL.replace("https://", "wss://", 1).replace(
             "http://", "ws://", 1
         )
-        ws_url = f"{ws_base}/ws?clientId=telegram-turbo-bot"
+        ws_url = f"{ws_base}/ws?clientId={quote(self.client_id, safe='')}"
         timeout = aiohttp.ClientTimeout(total=None, connect=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
@@ -1016,16 +1156,167 @@ SEGMENT_HEADER_RE = re.compile(
 TIMELINE_HEADER_RE = re.compile(
     r"(?im)^[ \t]*(?P<label>[^\n:：()（）]{0,40}?)[ \t]*"
     r"[（(][ \t]*(?P<start>[0-9]+(?:\.[0-9]+)?)[ \t]*"
-    r"(?:-|–|—|~|～|至|到)[ \t]*(?P<end>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+    # LLMs often emit typographic/non-breaking hyphens (for example `0‑15`)
+    # when copying a timeline from formatted text. Treat all common dash
+    # variants as the same time-range separator.
+    r"(?:-|‐|‑|‒|–|—|−|~|～|至|到)[ \t]*(?P<end>[0-9]+(?:\.[0-9]+)?)[ \t]*"
     r"(?:秒|s|sec|seconds?)?[ \t]*[）)][ \t]*[:：]?[ \t]*(?P<inline>.*)$"
 )
 SHARED_TAIL_SEPARATOR_RE = re.compile(
     r"(?m)^[ \t]*(?:-{3,}|─{3,}|={3,})[ \t]*$"
 )
+# A heading may carry its time range WITHOUT parentheses, e.g.
+# `Segment 3 5-8 秒：`, `Act 2 20-40 s:` or `第一幕 0-20 秒：`. Both header
+# regexes above require the parenthesised form (or `SEGMENT n:`), so this third
+# spelling needs its own pattern. It is deliberately anchored on a heading word
+# plus a time unit, so ordinary prose ("走了 2-3 步") is never taken for a scene.
+# The English spelling carries its own index (`Segment 3`) while the CJK one
+# already contains it (`第三幕`), and the filler between heading and range may
+# not contain digits — otherwise `第二幕 20-40 秒` would eat the leading `2`.
+_HEADING_WORD = (
+    r"(?:(?:SEGMENT|SCENE|SHOT|ACT|PART)[ \t]*[0-9]*"
+    r"|第[ \t]*[0-9０-９一二三四五六七八九十百千]+[ \t]*(?:幕|段|場景|场景|部分))"
+)
+_TIME_PAIR_CORE = (
+    r"[0-9]+(?:\.[0-9]+)?[ \t]*(?:-|‐|‑|‒|–|—|−|~|～|至|到)[ \t]*"
+    r"[0-9]+(?:\.[0-9]+)?[ \t]*(?:秒|s|sec|seconds?)"
+)
+_BARE_HEADER_CORE = (
+    rf"{_HEADING_WORD}[ \t]*[^\n:：()（）0-9]{{0,24}}?[ \t]*{_TIME_PAIR_CORE}"
+)
+BARE_TIMELINE_HEADER_RE = re.compile(
+    rf"(?im)^[ \t]*(?P<label>{_HEADING_WORD}[ \t]*[^\n:：()（）0-9]{{0,24}}?)[ \t]*"
+    rf"(?P<start>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+    rf"(?:-|‐|‑|‒|–|—|−|~|～|至|到)[ \t]*(?P<end>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+    rf"(?:秒|s|sec|seconds?)[ \t]*[:：]?[ \t]*(?P<inline>.*)$"
+)
+# The simplest spelling of all: the line IS just a time range, no heading word.
+#   `0-2 秒：…`   `2-5s: …`   `5-8秒 …`   `10-16：…`
+# Accepts 秒 / s / sec / seconds, with or without a colon after a unit. A bare
+# `2-3 个人` (no unit, no colon) is still prose and never matches.
+_RANGE_START_CORE = (
+    r"[0-9]+(?:\.[0-9]+)?[ \t]*(?:-|‐|‑|‒|–|—|−|~|～|至|到)[ \t]*"
+    r"[0-9]+(?:\.[0-9]+)?[ \t]*"
+)
+NAKED_RANGE_HEADER_RE = re.compile(
+    rf"(?im)^[ \t]*(?P<start>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+    rf"(?:-|‐|‑|‒|–|—|−|~|～|至|到)[ \t]*(?P<end>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+    rf"(?:(?:秒|s|sec|seconds?)[ \t]*[:：]?|[:：])[ \t]*(?P<inline>.*)$"
+)
+# Telegram users routinely paste a whole script as ONE paragraph, which the
+# anchored header regexes above cannot see (`^` never matches mid-line). This
+# finds headings that are not already at the start of a line so they can be
+# broken onto their own line before parsing. Every branch sits INSIDE the
+# lookahead so sub() only ever replaces the leading whitespace, never the
+# heading text itself.
+INLINE_HEADER_BREAK_RE = re.compile(
+    r"(?im)(?<!\n)(?<![0-9])[ \t]*(?="
+    r"(?:GLOBAL[ \t]*[:：])"
+    r"|(?:SEGMENT[ \t]*[1-9][0-9]*[ \t]*(?:[（(][^（()）]{0,24}[）)]|[：:]))"
+    r"|(?:第[ \t]*[0-9０-９一二三四五六七八九十百千]+[ \t]*"
+    r"(?:幕|段|場景|场景|部分)[ \t]*[（(])"
+    rf"|(?:{_BARE_HEADER_CORE})"
+    rf"|(?:{_RANGE_START_CORE}(?:秒|s|sec|seconds?)[ \t]*[:：])"
+    r")"
+)
+
+
+def _parenthesise_bare_range(match: "re.Match[str]") -> str:
+    """Rewrite `Segment 3 5-8 秒：…` as `Segment 3（5-8秒）：…`."""
+    label = match.group("label").strip()
+    inline = match.group("inline").strip()
+    head = f"{label}（{match.group('start')}-{match.group('end')}秒）："
+    return f"{head}{inline}" if inline else head
+
+
+def _parenthesise_naked_range(match: "re.Match[str]") -> str:
+    """Rewrite a bare `5-8 秒：…` line as `（5-8秒）：…`.
+
+    The timeline parser names an unlabelled scene automatically, so no heading
+    word is needed at all.
+    """
+    inline = match.group("inline").strip()
+    head = f"（{match.group('start')}-{match.group('end')}秒）："
+    return f"{head}{inline}" if inline else head
+
+
+def normalize_inline_headers(prompt: str) -> str:
+    """Put GLOBAL / SEGMENT / act headings on their own line before parsing.
+
+    Without this, a one-paragraph prompt never matches the anchored header
+    regexes and long videos fail with "必須提供時間軸" even though the script
+    is correctly structured. Existing line breaks are left untouched. Headings
+    whose range has no parentheses are rewritten into the parenthesised form so
+    every downstream parser sees one shape.
+    """
+    if not prompt:
+        return prompt
+    prompt = INLINE_HEADER_BREAK_RE.sub("\n", prompt)
+    prompt = BARE_TIMELINE_HEADER_RE.sub(_parenthesise_bare_range, prompt)
+    return NAKED_RANGE_HEADER_RE.sub(_parenthesise_naked_range, prompt)
+
+# A prompt can state its total duration in GLOBAL text when it uses the
+# SEGMENT format instead of explicit time ranges.  Keep these expressions
+# deliberately narrow so ages, years, and ordinary numbers are not mistaken
+# for the requested video length.
+PROMPT_DURATION_HINT_RES = (
+    re.compile(
+        r"(?i)\b(?:total\s+)?(?:duration|length|runtime|video\s+length)"
+        r"[ \t]*[:：=]?[ \t]*(?P<seconds>[0-9]+(?:\.[0-9]+)?)"
+        r"[ \t]*(?:seconds?|secs?|sec|s)\b"
+    ),
+    re.compile(
+        r"(?i)(?:總片長|總時長|總長度|影片長度|視頻長度|片長|時長|全片長度)"
+        r"[ \t]*[:：=]?[ \t]*(?P<seconds>[0-9]+(?:\.[0-9]+)?)"
+        r"[ \t]*(?:秒|秒鐘|s)"
+    ),
+    re.compile(
+        r"(?i)(?P<seconds>[0-9]+(?:\.[0-9]+)?)[ \t]*"
+        r"(?:秒|秒鐘|seconds?|secs?|sec|s)[ \t]*"
+        r"(?:長片|長視頻|影片|視頻|video)"
+    ),
+)
+
+
+def detect_prompt_total_seconds(prompt: str) -> Optional[float]:
+    """Return the script's declared total duration, if it has one.
+
+    Explicit timeline headings are authoritative: their largest end time is
+    the script duration.  SEGMENT prompts may not carry ranges, so fall back
+    to a clearly labelled GLOBAL duration such as ``Total duration 60
+    seconds`` or ``總片長：60秒``.
+    """
+    normalized = str(prompt or "").replace("\u00a0", " ").strip()
+    if not normalized:
+        return None
+
+    try:
+        timeline = parse_timeline_prompt(normalized)
+    except BotError:
+        # Leave malformed prompts for build_long_video_plan() to report when
+        # the user presses Generate; detection should not hide that error.
+        timeline = None
+    if timeline is not None and timeline.scenes:
+        candidate = max(scene.end_seconds for scene in timeline.scenes)
+        if MIN_TOTAL_SECONDS <= candidate <= MAX_TOTAL_SECONDS:
+            return round(candidate, 3)
+
+    for pattern in PROMPT_DURATION_HINT_RES:
+        match = pattern.search(normalized)
+        if not match:
+            continue
+        try:
+            candidate = float(match.group("seconds"))
+        except (TypeError, ValueError):
+            continue
+        if MIN_TOTAL_SECONDS <= candidate <= MAX_TOTAL_SECONDS:
+            return round(candidate, 3)
+    return None
 
 
 def parse_segmented_prompt(prompt: str) -> Optional[SegmentedPrompt]:
     """Parse GLOBAL/SEGMENT headings while preserving multiline prompt text."""
+    prompt = normalize_inline_headers(prompt)
     matches = list(SEGMENT_HEADER_RE.finditer(prompt))
     if not any(match.group(2) for match in matches):
         return None
@@ -1075,6 +1366,7 @@ def parse_segmented_prompt(prompt: str) -> Optional[SegmentedPrompt]:
 
 def parse_timeline_prompt(prompt: str) -> Optional[TimelinePrompt]:
     """Parse headings such as `第一幕（5-15秒）：` into ordered scenes."""
+    prompt = normalize_inline_headers(prompt)
     matches = list(TIMELINE_HEADER_RE.finditer(prompt))
     if not matches:
         return None
@@ -1218,12 +1510,11 @@ def build_long_video_plan(prompt: str, total_seconds: float) -> LongVideoPlan:
                 f"{total_seconds:g} seconds; each SEGMENT must be at least "
                 f"{MIN_TOTAL_SECONDS:g} seconds."
             )
-        if segment_duration > MAX_SEGMENT_SECONDS:
-            raise BotError(
-                f"{segment_total} SEGMENT blocks are too few for "
-                f"{total_seconds:g} seconds; each SEGMENT can be at most "
-                f"{MAX_SEGMENT_SECONDS:g} seconds. Add more SEGMENT blocks."
-            )
+        # A SEGMENT is a story beat, not necessarily one model clip. Longer
+        # beats are split into <=8-second shots below, just like explicit
+        # timeline scenes. This lets a natural three-beat 60-second script
+        # (three 20-second SEGMENT blocks) work without forcing users to add
+        # artificial SEGMENT headings.
 
         shots: list[ShotSpec] = []
         for position, number in enumerate(segment_numbers):
@@ -1369,6 +1660,36 @@ def segment_prompt(job: JobState, motion_context: bool = False) -> str:
     return f"{rule}\n\n{base}" if rule else base
 
 
+# H3 renders picture and sound jointly, so a GLOBAL block that mentions
+# dialogue lines makes EVERY shot try to speak. Shots that carry no line then
+# invent words, and with Motion Context pinning the previous shot's audio the
+# babble continues from shot to shot — which is exactly the "someone muttering
+# in an alien language" defect. This marker also tells
+# apply_speech_language_rule() to skip the spoken-language clause.
+NO_DIALOGUE_MARKER = "NO SPOKEN DIALOGUE IN THIS SEGMENT"
+_QUOTED_SPEECH_RE = re.compile(
+    # A complete quoted line, or an opening quote left unterminated because the
+    # per-shot splitter cut the sentence at the full stop inside the quote
+    # (`她低声说："……怎么现在才回来呀。` — the closing mark lands in the
+    # next chunk). Both spellings mean this shot does speak.
+    r"[\"“「『][^\"“”「」『』\n]{1,300}[\"“”」』]"
+    r"|[\"“「『][^\"“”「」『』\n]{2,300}"
+)
+
+
+def segment_dialogue_rule(action_text: str) -> str:
+    """Return a silence clause when this shot's own text has no spoken line."""
+    if _QUOTED_SPEECH_RE.search(action_text or ""):
+        return ""
+    return (
+        f"{NO_DIALOGUE_MARKER}: nobody speaks, whispers or murmurs. This "
+        "overrides any dialogue line, spoken-language rule or pinned audio "
+        "stated earlier — do not continue or echo any speech from the pinned "
+        "context. The audio is room tone, foley, cloth, footsteps and "
+        "breathing only: no words and no vocalisations in any language."
+    )
+
+
 def _segment_prompt_core(job: JobState, motion_context: bool = False) -> str:
     """Core per-segment prompt assembly (no Ref2VA reference scoping)."""
     if job.shot_plan:
@@ -1391,6 +1712,9 @@ def _segment_prompt_core(job: JobState, motion_context: bool = False) -> str:
                 f"CURRENT SHOT ACTION — {shot.label}:\n{shot.action}",
             ]
         )
+        silence = segment_dialogue_rule(shot.action)
+        if silence:
+            blocks.append(silence)
         return "\n\n".join(blocks)
 
     parsed = parse_segmented_prompt(job.prompt)
@@ -1417,6 +1741,9 @@ def _segment_prompt_core(job: JobState, motion_context: bool = False) -> str:
                 f"CURRENT SEGMENT ACTION:\n{current}",
             ]
         )
+        silence = segment_dialogue_rule(current)
+        if silence:
+            blocks.append(silence)
         return "\n\n".join(blocks)
 
     if job.segment_total <= 1:
@@ -1584,6 +1911,10 @@ def apply_speech_language_rule(prompt: str) -> str:
     """
     if not any("\u4e00" <= ch <= "\u9fff" for ch in prompt):
         return prompt
+    if NO_DIALOGUE_MARKER in prompt:
+        # This shot was explicitly marked silent; a spoken-language clause here
+        # would only invite the model to invent dialogue.
+        return prompt
     lowered = prompt.lower()
     explicit = (
         "普通话" in prompt
@@ -1624,6 +1955,7 @@ def build_workflow(
     save_latent_prefix: Optional[str] = None,
     save_latent_clip_index: Optional[int] = None,
     latent_upscale: Optional[bool] = None,
+    h3_profile: str = H3_PROFILE_DEFAULT,
 ) -> dict[str, Any]:
     """Build the stock-core MiniMax H3 graph (no T8 nodes).
 
@@ -1648,17 +1980,48 @@ def build_workflow(
     workflow["2"]["inputs"]["vae_name"] = AUDIO_VAE
     workflow["3"]["inputs"]["clip_name"] = CLIP_NAME
     mode = normalize_input_mode(generation_mode)
-    workflow["4"]["inputs"]["unet_name"] = (
-        REF2VA_UNET_NAME if mode == INPUT_MODE_REF2VA else UNET_NAME
-    )
+    profile = str(h3_profile or H3_PROFILE_DEFAULT).strip().lower()
+    if profile not in H3_PROFILES:
+        profile = H3_PROFILE_DEFAULT
+    fused = profile == H3_PROFILE_FUSED
+    if fused:
+        # The fused file covers every conditioning mode, so the FL2VA/Ref2VA
+        # split and the separate turbo LoRA both go away (and with them the
+        # ~21GB of pristine-weight backups ComfyUI keeps for a patched model).
+        workflow["4"]["inputs"]["unet_name"] = FUSED_UNET_NAME
+        workflow.pop("5", None)
+        model_source: list[Any] = ["4", 0]
+    else:
+        workflow["4"]["inputs"]["unet_name"] = (
+            REF2VA_UNET_NAME if mode == INPUT_MODE_REF2VA else UNET_NAME
+        )
+        # Official Lightning mode: standard model-only LoRA loading (matches
+        # YZ_金鱼's R2V template). The 4-step Turbo LoRA is trained for the
+        # pruned INT8 ConvRot model and loads without bypass.
+        workflow["5"]["class_type"] = "LoraLoaderModelOnly"
+        workflow["5"]["inputs"]["lora_name"] = LORA_NAME
+        workflow["5"]["inputs"]["strength_model"] = 1.0
+        model_source = ["5", 0]
+    effective_steps = FUSED_PROFILE_STEPS if fused else max(4, config.steps)
+    if fused and h3_sla_available():
+        # SLA block-sparse attention: ~40% faster and audibly cleaner than
+        # dense at 4 steps. Omitted when the pack is missing so the fused
+        # profile still runs (just slower and with a duller soundtrack).
+        workflow[SLA_NODE_ID] = {
+            "inputs": {
+                "model": model_source,
+                "sparsity_ratio": 0.9,
+                "block_size": "64",
+                "min_seq_len": 8192,
+                "dense_last_steps": 0,
+                "protect_audio": True,
+                "enabled": True,
+            },
+            "class_type": SLA_NODE_CLASS,
+            "_meta": {"title": "H3 SLA sparse attention (fused profile)"},
+        }
+        model_source = [SLA_NODE_ID, 0]
     prompt = apply_speech_language_rule(prompt)
-
-    # Official Lightning mode: standard model-only LoRA loading (matches
-    # YZ_金鱼's R2V template). The 4-step Turbo LoRA is trained for the
-    # pruned INT8 ConvRot model and loads without bypass.
-    workflow["5"]["class_type"] = "LoraLoaderModelOnly"
-    workflow["5"]["inputs"]["lora_name"] = LORA_NAME
-    workflow["5"]["inputs"]["strength_model"] = 1.0
 
     reference_image_names = list(reference_image_names or [])
     reference_video_names = list(reference_video_names or [])
@@ -1740,7 +2103,7 @@ def build_workflow(
     }
     workflow["9"] = {
         "class_type": "BasicGuider",
-        "inputs": {"model": ["5", 0], "conditioning": ["6", 0]},
+        "inputs": {"model": model_source, "conditioning": ["6", 0]},
         "_meta": {"title": "Basic guider"},
     }
     workflow["10"] = {
@@ -1758,9 +2121,9 @@ def build_workflow(
         "class_type": "BasicScheduler",
         "inputs": {
             "scheduler": "simple",
-            "steps": max(4, config.steps),
+            "steps": effective_steps,
             "denoise": 1.0,
-            "model": ["5", 0],
+            "model": model_source,
         },
         "_meta": {"title": "Scheduler (official core)"},
     }
@@ -1880,15 +2243,15 @@ def build_workflow(
         }
         workflow["107"] = {
             "class_type": "BasicGuider",
-            "inputs": {"model": ["5", 0], "conditioning": ["106", 0]},
+            "inputs": {"model": model_source, "conditioning": ["106", 0]},
         }
         workflow["104"] = {
             "class_type": "BasicScheduler",
             "inputs": {
                 "scheduler": "simple",
-                "steps": max(4, config.steps),
+                "steps": effective_steps,
                 "denoise": 0.5,
-                "model": ["5", 0],
+                "model": model_source,
             },
         }
         workflow["105"] = {
@@ -2077,6 +2440,18 @@ def json_request(url: str, payload: Optional[dict[str, Any]] = None, timeout: fl
         raise BotError(f"連線失敗：{http_error_detail(exc)}") from exc
     except (URLError, TimeoutError) as exc:
         raise BotError(f"連線失敗：{exc}") from exc
+    except OSError as exc:
+        # A connection reset/abort can surface while reading the body, and those
+        # are plain OSError subclasses that neither URLError nor TimeoutError
+        # covers. Callers rely on BotError to distinguish "the service said no"
+        # from a crash, so an uncaught OSError here used to escape all the way
+        # up and abort multi-step cleanup (notably stopping ComfyUI to restart
+        # the LLM). Normalise it here so every caller is safe.
+        raise BotError(f"連線中斷：{exc}") from exc
+    if not raw:
+        # ComfyUI's interrupt and a few control endpoints legitimately return
+        # an empty 2xx body. Treat that as a successful empty response.
+        return {}
     try:
         return json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
@@ -2085,6 +2460,236 @@ def json_request(url: str, payload: Optional[dict[str, Any]] = None, timeout: fl
 
 def comfy_post(path: str, payload: Optional[dict[str, Any]] = None) -> Any:
     return json_request(f"{COMFY_URL}{path}", payload)
+
+
+def yupi_lora_name() -> str:
+    """Verify the YUPI LoRA is visible to the running ComfyUI instance."""
+    try:
+        object_info = json_request(f"{COMFY_URL}/object_info", timeout=15.0)
+    except BotError as exc:
+        raise BotError(f"無法檢查 YUPI LoRA：{exc}") from exc
+    node_info = object_info.get("LoraLoaderModelOnly", {})
+    choices = (
+        node_info.get("input", {})
+        .get("required", {})
+        .get("lora_name", [[]])[0]
+    )
+    if YUPI_LORA_NAME in choices:
+        return YUPI_LORA_NAME
+    raise BotError(
+        "YUPI LoRA 尚未被 ComfyUI 載入："
+        f"{YUPI_LORA_NAME}。請確認檔案位於 ComfyUI\\models\\loras，"
+        "然後重啟 ComfyUI。"
+    )
+
+
+def yupi_action_lora_name() -> str:
+    """Verify the HMNSFW action adapter is visible to ComfyUI."""
+    try:
+        object_info = json_request(f"{COMFY_URL}/object_info", timeout=15.0)
+    except BotError as exc:
+        raise BotError(f"無法檢查 HMNSFW LoRA：{exc}") from exc
+    node_info = object_info.get("LoraLoaderModelOnly", {})
+    choices = (
+        node_info.get("input", {})
+        .get("required", {})
+        .get("lora_name", [[]])[0]
+    )
+    if YUPI_ACTION_LORA_NAME in choices:
+        return YUPI_ACTION_LORA_NAME
+    raise BotError(
+        "HMNSFW 動作 LoRA 尚未被 ComfyUI 載入："
+        f"{YUPI_ACTION_LORA_NAME}。請從 "
+        "https://huggingface.co/Hearmeman/minimax-h3-loras 下載後放到 "
+        "ComfyUI\\models\\loras，再重啟 ComfyUI。"
+    )
+
+
+def yupi_fast_lora_name() -> str:
+    """Verify the FastH3 6-step distill LoRA is visible to ComfyUI."""
+    try:
+        object_info = json_request(f"{COMFY_URL}/object_info", timeout=15.0)
+    except BotError as exc:
+        raise BotError(f"無法檢查 FastH3 LoRA：{exc}") from exc
+    node_info = object_info.get("LoraLoaderModelOnly", {})
+    choices = (
+        node_info.get("input", {})
+        .get("required", {})
+        .get("lora_name", [[]])[0]
+    )
+    if YUPI_FAST_LORA_NAME in choices:
+        return YUPI_FAST_LORA_NAME
+    raise BotError(
+        "FastH3 LoRA 尚未被 ComfyUI 載入："
+        f"{YUPI_FAST_LORA_NAME}。請先用 ComfyUI-FastH3-Lora-Converter 轉檔，"
+        "把產出的 .safetensors 放到 ComfyUI\\models\\loras，再重啟 ComfyUI。"
+    )
+
+
+def load_yupi_workflow(fast: bool = False) -> dict[str, Any]:
+    """Load the isolated YUPI API workflow template (or its FAST variant)."""
+    template = YUPI_FAST_API_TEMPLATE if fast else YUPI_API_TEMPLATE
+    try:
+        with template.open("r", encoding="utf-8") as handle:
+            workflow = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BotError(f"找不到或無法讀取 YUPI 工作流：{exc}") from exc
+    if not isinstance(workflow, dict):
+        raise BotError("YUPI 工作流格式錯誤：頂層必須是物件。")
+    return workflow
+
+
+def yupi_generation_config(workflow: dict[str, Any]) -> GenerationConfig:
+    """Build progress metadata from the actual YUPI workflow settings."""
+    try:
+        inputs = workflow["6"]["inputs"]
+        width = int(inputs["width"])
+        height = int(inputs["height"])
+        length = int(inputs["length"])
+        steps = int(workflow["13"]["inputs"]["steps"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BotError("YUPI 工作流缺少有效的解析度、影格數或 steps 設定。") from exc
+    if width < 32 or height < 32 or length < 1 or steps < 1:
+        raise BotError("YUPI 工作流的解析度、影格數或 steps 設定無效。")
+    return GenerationConfig(
+        width=width,
+        height=height,
+        steps=steps,
+        requested_seconds=length / 24.0,
+        length=length,
+    )
+
+
+def configure_yupi_workflow(
+    workflow: dict[str, Any],
+    config: GenerationConfig,
+    prompt: str,
+    reference_name: str,
+    output_prefix: str,
+) -> tuple[dict[str, Any], str]:
+    """Inject one YUPI shot's settings into a fresh API workflow."""
+    try:
+        lora_name = yupi_lora_name()
+        conditioning_inputs = workflow["6"]["inputs"]
+        conditioning_inputs["prompt"] = prompt
+        conditioning_inputs["width"] = config.width
+        conditioning_inputs["height"] = config.height
+        conditioning_inputs["length"] = config.length
+        conditioning_inputs["ref_images"]["ref_image_0"] = ["14", 0]
+        workflow["14"]["inputs"]["image"] = reference_name
+        workflow["5"]["inputs"]["lora_name"] = lora_name
+        if "16" in workflow:
+            # Anatomy -> action: the HMNSFW adapter sits above the stills-
+            # trained anatomy file (node 16 -> node 5 -> node 4).
+            action_lora = yupi_action_lora_name()
+            workflow["16"]["inputs"]["lora_name"] = action_lora
+            lora_name = f"{lora_name} + {action_lora}"
+        if "15" in workflow:
+            # YUPI_FAST: the FastH3 6-step distill LoRA is chained last
+            # (node 15 -> node 16 -> node 5 -> node 4). Validate it is present.
+            fast_lora = yupi_fast_lora_name()
+            workflow["15"]["inputs"]["lora_name"] = fast_lora
+            lora_name = f"{lora_name} + {fast_lora}"
+        workflow["8"]["inputs"]["noise_seed"] = secrets.randbits(63)
+        workflow["13"]["inputs"]["steps"] = config.steps
+        workflow["12"]["inputs"]["filename_prefix"] = output_prefix
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BotError("YUPI 工作流缺少必要的節點或輸入欄位。") from exc
+    return workflow, lora_name
+
+
+def attach_yupi_motion_context(
+    workflow: dict[str, Any],
+    context_video_name: Optional[str],
+    context_latent_path: Optional[str],
+    load_latent_clip_index: int = 0,
+) -> dict[str, Any]:
+    """Inject the H3 Motion Context chain into an isolated YUPI API graph.
+
+    The stock graph reserves ids 15-20 for Motion Context, but the YUPI_FAST
+    graph already uses id 15 for the FastH3 LoRA, so this uses 31-35 instead.
+    Wiring mirrors build_workflow(): the guider's conditioning is re-pointed at
+    the context node and CreateVideo takes the trimmed output rather than the
+    raw decode. The latent save node is added separately by
+    attach_yupi_save_latent(), because shot 1 needs to save without loading.
+    """
+    if not context_video_name or not context_latent_path:
+        raise BotError("YUPI Motion Context 需要上一段影片和上一段 AV latent。")
+    try:
+        workflow["31"] = {
+            "inputs": {"file": context_video_name},
+            "class_type": "LoadVideo",
+            "_meta": {"title": "YUPI: previous segment for Motion Context"},
+        }
+        workflow["32"] = {
+            "inputs": {"video": ["31", 0]},
+            "class_type": "GetVideoComponents",
+            "_meta": {"title": "YUPI: previous segment frames and audio"},
+        }
+        workflow["33"] = {
+            "inputs": {
+                "latent_path": context_latent_path,
+                "clip_index": max(0, int(load_latent_clip_index)),
+            },
+            "class_type": "MiniMaxH3MotionContextLoadLatent",
+            "_meta": {"title": "YUPI: previous H3 AV latent"},
+        }
+        workflow["34"] = {
+            "inputs": {
+                "conditioning": ["6", 0],
+                "vae": ["1", 0],
+                "latent": ["6", 1],
+                "context_frames": ["32", 0],
+                "context_length": str(MOTION_CONTEXT_LENGTH),
+                "audio_context_length": MOTION_CONTEXT_AUDIO_LENGTH,
+                "context_latent": ["33", 0],
+            },
+            "class_type": "MiniMaxH3MotionContext",
+            "_meta": {"title": "YUPI: AV latent continuation"},
+        }
+        workflow["9"]["inputs"]["conditioning"] = ["34", 0]
+        workflow["35"] = {
+            "inputs": {
+                "images": ["21", 0],
+                "audio": ["22", 0],
+                "trim_frames": ["34", 1],
+                "fps": 24.0,
+                "match_tail": True,
+            },
+            "class_type": "MiniMaxH3MotionContextTrim",
+            "_meta": {"title": "YUPI: trim duplicated context audio and frames"},
+        }
+        workflow["23"]["inputs"]["images"] = ["35", 0]
+        workflow["23"]["inputs"]["audio"] = ["35", 1]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BotError(f"YUPI Motion Context 接線失敗：{exc}") from exc
+    return workflow
+
+
+def attach_yupi_save_latent(
+    workflow: dict[str, Any],
+    save_latent_prefix: Optional[str],
+    save_latent_clip_index: Optional[int] = None,
+) -> dict[str, Any]:
+    """Add the latent-save node so the NEXT YUPI shot can continue from it.
+
+    This must be attached on EVERY shot of a motion-context run, including the
+    first one — the first shot has no context to load, but it still has to
+    write the latent that shot 2 reads. build_workflow() does the same: its
+    save node is outside the ``if motion_context`` block.
+    """
+    if not save_latent_prefix:
+        return workflow
+    workflow["36"] = {
+        "inputs": {
+            "latent": ["10", 0],
+            "filename_prefix": save_latent_prefix,
+            "clip_index": int(save_latent_clip_index or 0),
+        },
+        "class_type": "MiniMaxH3MotionContextSaveLatent",
+        "_meta": {"title": "YUPI: save H3 AV latent for next segment"},
+    }
+    return workflow
 
 
 def unload_comfy_models() -> None:
@@ -2112,46 +2717,39 @@ def motion_context_nodes_available() -> bool:
         return False
 
 
-def motion_context_layout_compatible() -> Optional[bool]:
-    """Detect whether the active ComfyUI H3 layout accepts interior anchors.
+_sla_available_cache: Optional[bool] = None
+_sla_check_failed_at: float = 0.0
 
-    H3 Motion Context 0.4+ requires the ComfyUI layout whose
-    ``PackedLayout.__init__`` no longer has ``frame_count``.  The Bot starts
-    the Turbo checkout with ``--base-directory`` pointing at the shared
-    ComfyUI tree, so check both locations without importing ComfyUI into the
-    Bot process.  ``None`` means the source could not be inspected; in that
-    case the normal node probe and the runtime fallback remain the safety net.
+
+def h3_sla_available() -> bool:
+    """True when the H3 SLA sparse-attention node pack is loaded.
+
+    The fused profile inserts the node only when it exists, so a missing pack
+    degrades to dense attention instead of failing the whole generation.
+
+    A positive result is cached for the life of the process. A failure is NOT:
+    the first check often runs before ComfyUI has finished starting (the Bot
+    launches ComfyUI on demand), and caching that miss permanently disabled SLA
+    for every later run in the same process. Failures now retry after a short
+    cooldown instead.
     """
-    candidates = (
-        COMFYUI_DIR / "comfy" / "ldm" / "minimax" / "model.py",
-        COMFYUI_BASE_DIR / "comfy" / "ldm" / "minimax" / "model.py",
-    )
-    seen: set[str] = set()
-    for path in candidates:
-        key = str(path).lower()
-        if key in seen or not path.is_file():
-            continue
-        seen.add(key)
-        try:
-            source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        class_match = re.search(
-            r"^class\s+PackedLayout\b(?P<body>.*?)(?=^class\s+|\Z)",
-            source,
-            flags=re.MULTILINE | re.DOTALL,
+    global _sla_available_cache, _sla_check_failed_at
+    if _sla_available_cache:
+        return True
+    now = time.time()
+    if now - _sla_check_failed_at < 60.0:
+        return False
+    try:
+        info = json_request(
+            f"{COMFY_URL}/object_info/{SLA_NODE_CLASS}", timeout=10.0
         )
-        if not class_match:
-            continue
-        init_match = re.search(
-            r"^\s+def\s+__init__\s*\((?P<args>[^)]*)\)",
-            class_match.group("body"),
-            flags=re.MULTILINE,
-        )
-        if not init_match:
-            continue
-        return "frame_count" not in init_match.group("args")
-    return None
+        if isinstance(info, dict) and SLA_NODE_CLASS in info:
+            _sla_available_cache = True
+            return True
+    except Exception:
+        pass
+    _sla_check_failed_at = now
+    return False
 
 
 def is_motion_context_layout_error(error: BaseException) -> bool:
@@ -2340,7 +2938,10 @@ def comfyui_is_online() -> bool:
     try:
         json_request(f"{COMFY_URL}/system_stats", timeout=4)
         return True
-    except BotError:
+    except (BotError, OSError):
+        # OSError is listed for the same reason as llama_is_online(): a server
+        # shutting down can reset the socket, and that must read as "offline"
+        # rather than escaping as a crash.
         return False
 
 
@@ -2424,7 +3025,6 @@ def start_comfyui_process(vram_mode: Optional[str] = None) -> str:
         else:
             # Try to find the GPU with most free memory
             try:
-                import subprocess
                 result = subprocess.run(
                     ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=5
@@ -2586,6 +3186,103 @@ def llama_is_online() -> bool:
         return False
 
 
+def llama_server_responding() -> bool:
+    """Whether the server process answers at all, even while loading weights.
+
+    /health returns 503 with `{"error":{"message":"Loading model"}}` while the
+    ~22GB of weights are being read, which takes about a minute. During that
+    window llama_is_online() is False, so a request arriving right after a
+    generation used to be reported as "the LLM is not running" and then
+    "starting it" - both wrong and confusing, since the Bot had just started it
+    itself. This separates "still loading" from "not started".
+    """
+    request = Request(f"{LLAMA_URL}/health", headers={"Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=4):
+            return True
+    except HTTPError:
+        # Any HTTP status means something is listening and serving.
+        return True
+    except (URLError, TimeoutError, OSError):
+        return False
+
+
+# --- guard: never start the LLM on top of a VRAM-hungry ComfyUI -------------
+# ComfyUI keeps its models resident after a run, so on this 2 x 20GB box the
+# ~35GB llama-server cannot fit alongside them. Starting it anyway does not
+# produce a working LLM, it produces an OOM, so the start is refused with an
+# explanation instead. Set MINIMAX_LLM_START_GUARD=0 to disable, or tune the
+# required headroom with MINIMAX_LLM_START_MIN_FREE_MB.
+LLM_START_GUARD = os.environ.get(
+    "MINIMAX_LLM_START_GUARD", "1"
+).strip().lower() not in {"0", "false", "off", "no"}
+LLM_START_MIN_FREE_MB = int(
+    os.environ.get("MINIMAX_LLM_START_MIN_FREE_MB", "34000")
+)
+
+
+def gpu_vram_snapshot() -> Optional[list[tuple[int, int]]]:
+    """Per-GPU (used_mb, total_mb) from nvidia-smi, or None when unavailable."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=6,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    snapshot: list[tuple[int, int]] = []
+    for line in result.stdout.splitlines():
+        if "," not in line:
+            continue
+        try:
+            used, total = (int(part.strip()) for part in line.split(",", 1))
+        except ValueError:
+            continue
+        snapshot.append((used, total))
+    return snapshot or None
+
+
+def llm_start_blocker() -> str:
+    """Explain why starting the LLM now would OOM, or return "" when it fits.
+
+    ComfyUI reports only the single device the Bot exposed to it, so the check
+    is based on the whole-machine picture from nvidia-smi rather than on
+    ComfyUI's own /system_stats.
+    """
+    if not LLM_START_GUARD:
+        return ""
+    if not comfyui_is_online():
+        return ""
+    snapshot = gpu_vram_snapshot()
+    if snapshot is None:
+        return ""  # Cannot tell; do not block on a missing probe.
+    total_vram = sum(total for _, total in snapshot)
+    free = sum(total - used for used, total in snapshot)
+    # Never demand more than the machine physically has, so a bad config value
+    # cannot make the LLM permanently unstartable.
+    required = min(LLM_START_MIN_FREE_MB, int(total_vram * 0.85))
+    if free >= required:
+        return ""
+    per_gpu = "、".join(f"GPU{i} 剩 {total - used:,}MB" for i, (used, total) in enumerate(snapshot))
+    return (
+        f"ComfyUI 正在佔用顯存，現在啟動本機 LLM 會直接 OOM。\n\n"
+        f"可用顯存：{free:,} MB（共 {total_vram:,} MB）\n"
+        f"啟動 LLM 約需：{required:,} MB\n"
+        f"{per_gpu}\n\n"
+        "ComfyUI 跑完不會自動釋放模型，請先擇一：\n"
+        "  • 按面板的「🛑 關閉 ComfyUI」釋放顯存，再重試\n"
+        "  • 或先在 ComfyUI 裡卸載模型（Free model and node cache）\n\n"
+        "（可用 MINIMAX_LLM_START_GUARD=0 停用這道檢查，但不建議。）"
+    )
+
+
 def _running_llama_process_ids() -> set[int]:
     """Find only the configured local llama-server processes on Windows."""
     pids: set[int] = set()
@@ -2662,6 +3359,17 @@ def start_llama_process() -> str:
         raise BotError(f"找不到模型檔案：{LLAMA_MODEL}")
     if not LLAMA_MMPROJ.is_file():
         raise BotError(f"找不到 mmproj 檔案：{LLAMA_MMPROJ}")
+    if not LLAMA_DRAFT_MODEL.is_file():
+        raise BotError(f"找不到 MTP 草稿模型：{LLAMA_DRAFT_MODEL}")
+
+    # VRAM guard, placed here so EVERY entry point is covered in one place:
+    # the panel buttons, /llm_start, /llm_restart, restart_llama_process() and
+    # the script generator. restart_llm_after_job() stops ComfyUI before calling
+    # this, so it is unaffected. Checked outside the start lock so a refusal
+    # cannot be mistaken for "already starting".
+    blocker = llm_start_blocker()
+    if blocker:
+        raise BotError(blocker)
 
     with _llama_start_lock:
         if llama_is_online():
@@ -2804,7 +3512,112 @@ def restart_bot_process() -> None:
     subprocess.Popen(command, **kwargs)
 
 
-def multipart_request(url: str, fields: dict[str, str], file_field: str, file_path: Path) -> Any:
+# --- tail-frame reference handoff -------------------------------------------
+# After a generation finishes, the last two frames are sent back to Telegram and
+# can be promoted to the new reference images with one tap. That is how a story
+# is chained: the tail of one segment becomes the look-lock for the next one.
+TAIL_REF_OFFER_ENABLED = os.environ.get(
+    "MINIMAX_TAIL_REF_OFFER", "1"
+).strip().lower() not in {"0", "false", "off", "no"}
+TAIL_FRAME_DIR = Path(
+    os.environ.get("MINIMAX_TAIL_FRAME_DIR", str(STATE_PATH.parent / "tail_frames"))
+)
+
+
+def extract_tail_frames(
+    video_path: Path, count: int = 2, spacing: float = 0.5
+) -> tuple[str, list[Path]]:
+    """Save the last `count` frames of a video as JPEGs.
+
+    Frames are sampled `spacing` seconds apart ending on the video's final
+    frame (the very last two frames are usually identical, which makes the
+    second one useless as a reference image). Identical outputs are dropped.
+
+    Returns (token, frames), frames ordered oldest-to-newest. The token is
+    embedded in the Telegram callback data so the button handler can find the
+    frames on disk later without keeping per-message state in memory.
+    """
+    if not video_path.is_file():
+        return "", []
+    try:
+        duration, _, _ = probe_video_info(video_path)
+    except Exception:
+        return "", []
+    if duration <= 0:
+        return "", []
+
+    token = uuid.uuid4().hex[:10]
+    try:
+        TAIL_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return "", []
+    frames: list[Path] = []
+    seen_hashes: set[str] = set()
+    for index in range(count, 0, -1):
+        # `-sseof` seeks from the end of the file; seeking to `duration` with
+        # `-ss` lands past the last video frame (the audio track is usually a
+        # bit longer than the video one) and yields nothing at all.
+        offset = -(0.1 + (index - 1) * spacing)
+        destination = TAIL_FRAME_DIR / f"tail_{token}_{count - index + 1}.jpg"
+        command = [
+            FFMPEG_PATH,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-sseof",
+            f"{offset:.3f}",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(destination),
+        ]
+        try:
+            subprocess.run(command, capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if not destination.is_file() or destination.stat().st_size == 0:
+            continue
+        digest = hashlib.md5(destination.read_bytes()).hexdigest()
+        if digest in seen_hashes:
+            destination.unlink(missing_ok=True)
+            continue
+        seen_hashes.add(digest)
+        frames.append(destination)
+    return token, frames
+
+
+def tail_reference_frames(token: str) -> list[Path]:
+    """Frames previously saved by extract_tail_frames for a callback token."""
+    if not token:
+        return []
+    try:
+        return sorted(TAIL_FRAME_DIR.glob(f"tail_{token}_*.jpg"))
+    except OSError:
+        return []
+
+
+# Injected into the writer's system prompt once the tail frames of a finished
+# clip have been accepted as the new reference images: the next segment must
+# continue that story instead of drifting into a new person or a new place.
+TAIL_CONTINUITY_NOTE = """【接續規則 — 這段是上一段影片的直接延續，不是新故事】
+- 參考圖是上一段影片的最後畫面：人物（臉、髮型、身材、膚色）和衣著／裸露狀態必須完全一致，不可以換人。
+- 場景、環境、光線、時間、天氣都要跟上一段一致，不可以換地方、不可以加人。
+- 開頭／第一幕要從上一段最後的姿勢與動作直接接下去；不可以重新開始、不可以重新介紹角色、不要 recap。
+- 運鏡與視覺風格維持和上一段一致。
+- 只寫接下來發生的事。"""
+
+
+def multipart_request(
+    url: str,
+    fields: dict[str, str],
+    file_field: str,
+    file_path: Path,
+    content_type: str = "video/mp4",
+) -> Any:
     boundary = f"----MiniMaxH3Telegram{uuid.uuid4().hex}"
     boundary_bytes = boundary.encode("ascii")
     chunks: list[bytes] = []
@@ -2824,7 +3637,7 @@ def multipart_request(url: str, fields: dict[str, str], file_field: str, file_pa
                 f'Content-Disposition: form-data; name="{file_field}"; '
                 f'filename="{file_path.name}"\r\n'
             ).encode("utf-8"),
-            b"Content-Type: video/mp4\r\n\r\n",
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
             file_path.read_bytes(),
             b"\r\n--" + boundary_bytes + b"--\r\n",
         ]
@@ -3350,6 +4163,900 @@ def merge_completed_segments(
     )
 
 
+# --- In-Bot script generator (local llama.cpp) -----------------------------
+# Turns a one-line idea plus a duration into a complete, format-legal H3 script
+# without leaving Telegram. The reply is validated with the SAME parser that
+# gates generation (build_long_video_plan), so a script the generator accepts is
+# one the Bot will actually run; when the model breaks a rule, the exact parser
+# error is fed back and it is asked to repair itself.
+SCRIPT_GEN_ENABLED = os.environ.get(
+    "MINIMAX_SCRIPT_GEN", "1"
+).strip().lower() not in {"0", "false", "off", "no"}
+SCRIPT_GEN_TIMEOUT = float(os.environ.get("MINIMAX_SCRIPT_GEN_TIMEOUT", "600"))
+SCRIPT_GEN_ATTEMPTS = int(os.environ.get("MINIMAX_SCRIPT_GEN_ATTEMPTS", "3"))
+SCRIPT_GEN_TEMPERATURE = float(os.environ.get("MINIMAX_SCRIPT_GEN_TEMP", "0.85"))
+# Reasoning and the answer share the completion budget. 6000 leaves comfortable
+# room for the observed ~500-1500 thinking tokens plus a full script, while
+# keeping the model from over-thinking (a larger allowance measurably made it
+# think longer for no better output). The retry budget is only used when the
+# first attempt comes back empty.
+SCRIPT_GEN_MAX_TOKENS = int(os.environ.get("MINIMAX_SCRIPT_GEN_MAX_TOKENS", "6000"))
+SCRIPT_GEN_RETRY_TOKENS = int(
+    os.environ.get("MINIMAX_SCRIPT_GEN_RETRY_TOKENS", "16000")
+)
+# Output language for generated scripts. The H3 model was trained mostly on
+# English, so English action/camera phrasing is the most stable; Simplified
+# Chinese is fully supported and is the default here because it is what the user
+# asked for. Switch at runtime with /lang or the 🌐 toggle.
+SCRIPT_LANG_ZH = "zh"
+SCRIPT_LANG_EN = "en"
+SCRIPT_LANGS = (SCRIPT_LANG_ZH, SCRIPT_LANG_EN)
+SCRIPT_LANG_DEFAULT = (
+    os.environ.get("MINIMAX_SCRIPT_LANG", SCRIPT_LANG_ZH).strip().lower()
+)
+if SCRIPT_LANG_DEFAULT not in SCRIPT_LANGS:
+    SCRIPT_LANG_DEFAULT = SCRIPT_LANG_ZH
+
+SCRIPT_LANG_LABEL = {
+    SCRIPT_LANG_ZH: "簡體中文",
+    SCRIPT_LANG_EN: "English",
+}
+
+_SCRIPT_GEN_LANGUAGE_BLOCK = {
+    SCRIPT_LANG_ZH: (
+        "LANGUAGE - this applies to EVERYTHING you write:\n"
+        "- Write the GLOBAL block and every scene's action, camera and sound\n"
+        "  description in SIMPLIFIED CHINESE (简体中文). Use simplified characters\n"
+        "  only. Never write Traditional Chinese characters.\n"
+        "- Do not write English sentences. English is acceptable only for a proper\n"
+        "  noun that has no common Chinese form.\n"
+        "- Write camera movement as natural Chinese prose, e.g. 镜头缓慢推近 or\n"
+        "  镜头横移跟随.\n"
+        "- Write dialogue directly in Chinese inside quotes, e.g. 她说：“等我。”\n"
+        "  The Bot locks Mandarin pronunciation automatically.\n"
+        "- Keep the timeline headings exactly as given; they are already Chinese."
+    ),
+    SCRIPT_LANG_EN: (
+        "LANGUAGE - this applies to EVERYTHING you write:\n"
+        "- Write the GLOBAL block and every scene description in English.\n"
+        "- Write camera movement as natural English prose, e.g. \"the camera slowly\n"
+        "  pushes in\"."
+    ),
+}
+
+_SCRIPT_GEN_EXAMPLES = {
+    SCRIPT_LANG_ZH: {
+        "vague": "跳舞",
+        "concrete": "她举起左手转了半圈，裙摆扬起",
+        "camera": "镜头缓慢推近",
+        "short_length": "150 到 260 個中文字",
+    },
+    SCRIPT_LANG_EN: {
+        "vague": "dances",
+        "concrete": "she raises her left hand and turns half a circle, her skirt lifting",
+        "camera": "the camera slowly pushes in",
+        "short_length": "90 to 140 words",
+    },
+}
+
+# Timeline heading labels by language. Only 开/開 and 结/結 differ; 第一幕 is
+# identical in both scripts. The Bot's parser accepts either form.
+_SCRIPT_GEN_HEAD_LABELS = {
+    SCRIPT_LANG_ZH: ("开头", "结尾"),
+    SCRIPT_LANG_EN: ("開頭", "結尾"),
+}
+
+# Operator-editable extra instructions. This file is re-read on EVERY generation,
+# so editing it takes effect immediately with no Bot restart. It is appended to
+# the system prompt after the built-in templates (see build_script_messages), so
+# the operator's wording can override the general style guidance without ever
+# touching the machine-parsed STRUCTURE / heading rules.
+SCRIPT_GEN_PROMPT_FILE = Path(
+    os.environ.get(
+        "MINIMAX_SCRIPT_PROMPT_FILE",
+        r"E:\MiniMax-H3-Telegram\runtime\bot\script_prompt.txt",
+    )
+)
+# Generous but bounded: custom guidance is meant to be a few sentences, and an
+# accidentally huge file must not crowd out the script itself.
+SCRIPT_GEN_PROMPT_MAX_CHARS = int(
+    os.environ.get("MINIMAX_SCRIPT_PROMPT_MAX_CHARS", "4000")
+)
+
+SCRIPT_GEN_PROMPT_TEMPLATE = """\
+# ============================================================================
+# 自訂指令 — 在這裡加任何你想套用到每次生成的規則。
+# 存檔後「立即生效」，不需要重啟 Bot。
+#
+# 規則：
+#   • 以 # 開頭的行是註解，不會送給模型。
+#   • 其餘文字會原樣附加到系統提示的後段。
+#   • 適合寫「風格偏好」；結構與時間軸由 Bot 控制，這裡改不動（也不該改）。
+#
+# 建議一次只加 1-3 條，方便判斷哪一條造成變化。
+# ============================================================================
+
+# --- 範例（把前面的 # 拿掉就會生效）-----------------------------------------
+
+# 運鏡一律緩慢，不要快速甩鏡或手持晃動。
+# 每個場景至少要有一個明確的燈光來源或光線變化。
+# 人物服裝與髮型在全片保持一致，不要中途改變。
+# 不要出現文字、字幕、商標或浮水印。
+
+# --- 你的規則寫在下面這條線之後 ---------------------------------------------
+"""
+
+
+def load_custom_script_instructions() -> tuple[str, str]:
+    """Read the operator's custom instruction file.
+
+    Returns (text, status) where status is a short human-readable note. The file
+    is read on every call so edits apply without restarting the Bot.
+
+    Lines starting with `#` are treated as comments and dropped, which lets the
+    shipped template document itself without those notes reaching the model.
+    """
+    path = SCRIPT_GEN_PROMPT_FILE
+    try:
+        # utf-8-sig also tolerates the BOM that Windows editors add silently.
+        raw = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return "", "檔案不存在"
+    except OSError as exc:
+        bot_log(f"script prompt file unreadable: {exc}")
+        return "", f"讀取失敗：{exc}"
+    except UnicodeDecodeError as exc:
+        bot_log(f"script prompt file not UTF-8: {exc}")
+        return "", "不是 UTF-8 編碼，請另存為 UTF-8"
+
+    kept: list[str] = []
+    for line in raw.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+
+    if not text:
+        return "", "沒有內容（全部都是註解或空白）"
+    if len(text) > SCRIPT_GEN_PROMPT_MAX_CHARS:
+        bot_log(
+            f"script prompt file truncated "
+            f"({len(text)} > {SCRIPT_GEN_PROMPT_MAX_CHARS} chars)"
+        )
+        text = (
+            text[: SCRIPT_GEN_PROMPT_MAX_CHARS].rstrip()
+            + "\n[自訂指令過長，已截斷]"
+        )
+        return text, f"過長已截斷（上限 {SCRIPT_GEN_PROMPT_MAX_CHARS} 字元）"
+    return text, f"已載入 {len(text)} 字元"
+
+
+def ensure_script_prompt_file() -> str:
+    """Create the template file on first use so there is something to edit."""
+    path = SCRIPT_GEN_PROMPT_FILE
+    if path.is_file():
+        return ""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(SCRIPT_GEN_PROMPT_TEMPLATE, encoding="utf-8")
+    except OSError as exc:
+        return f"無法建立自訂指令檔：{exc}"
+    return f"已建立預設自訂指令檔：{path}"
+
+
+# Keep one previous revision so a mistaken edit made from Telegram can be undone
+# without the user having to remember what the text used to be.
+SCRIPT_GEN_PROMPT_BACKUP = SCRIPT_GEN_PROMPT_FILE.with_suffix(".prev.txt")
+
+
+def _custom_prompt_header(note: str) -> str:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        "# MiniMax H3 自訂指令\n"
+        f"# {note}（{stamp}）\n"
+        "# 以 # 開頭的行是註解，不會送給模型。\n"
+        "\n"
+    )
+
+
+def save_custom_script_instructions(text: str, note: str) -> tuple[bool, str]:
+    """Write the custom instruction file, keeping the previous revision.
+
+    The file is what the generator reads on every request, so this takes effect
+    on the very next generation with no restart. Comments are written back as a
+    short header purely so the file stays self-explanatory when opened in a text
+    editor later.
+    """
+    path = SCRIPT_GEN_PROMPT_FILE
+    body = (text or "").strip()
+    if len(body) > SCRIPT_GEN_PROMPT_MAX_CHARS:
+        body = (
+            body[: SCRIPT_GEN_PROMPT_MAX_CHARS].rstrip() + "\n[自訂指令過長，已截斷]"
+        )
+    payload = _custom_prompt_header(note)
+    if body:
+        payload += body + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            current = path.read_text(encoding="utf-8", errors="replace")
+            SCRIPT_GEN_PROMPT_BACKUP.write_text(current, encoding="utf-8")
+        path.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        bot_log(f"custom prompt save failed: {exc}")
+        return False, f"寫入失敗：{exc}"
+    return True, f"已儲存 {len(body)} 字元" if body else "已清空"
+
+
+def restore_custom_script_instructions() -> tuple[bool, str]:
+    """Roll the custom instruction file back to the previous revision."""
+    path = SCRIPT_GEN_PROMPT_FILE
+    if not SCRIPT_GEN_PROMPT_BACKUP.is_file():
+        return False, "沒有可還原的上一版。"
+    try:
+        previous = SCRIPT_GEN_PROMPT_BACKUP.read_text(encoding="utf-8")
+        # Swap so the restore is itself undoable.
+        if path.is_file():
+            current = path.read_text(encoding="utf-8", errors="replace")
+            SCRIPT_GEN_PROMPT_BACKUP.write_text(current, encoding="utf-8")
+        path.write_text(previous, encoding="utf-8")
+    except OSError as exc:
+        bot_log(f"custom prompt restore failed: {exc}")
+        return False, f"還原失敗：{exc}"
+    text, _ = load_custom_script_instructions()
+    return True, f"已還原上一版（{len(text)} 字元）"
+
+
+def normalize_script_lang(value: Any) -> str:
+    """Clamp a language request to a supported code."""
+    candidate = str(value or "").strip().lower()
+    if candidate in {"zh", "cn", "zh-cn", "chs", "简体", "簡體", "中文"}:
+        return SCRIPT_LANG_ZH
+    if candidate in {"en", "eng", "english", "英文"}:
+        return SCRIPT_LANG_EN
+    return SCRIPT_LANG_DEFAULT
+# The hard ceiling the Bot enforces on one scene; the writer must respect it or
+# the plan builder refuses the script.
+SCRIPT_GEN_MAX_SCENE = 15.0
+
+_SCRIPT_GEN_LONG_SYSTEM = """You write prompts for the MiniMax H3 video model.
+
+Write ONE script. Output the script itself only - no commentary, no markdown
+code fences, no headings other than the timeline headings described below.
+
+{language}
+
+STRUCTURE (strict, this is machine-parsed):
+1. Everything BEFORE the first timeline heading is the GLOBAL block. State there,
+   once: the main character's visible appearance and clothing, the setting and its
+   lighting, the overall visual style, and the audio of the whole film - state
+   explicitly that there is NO music of any kind: no melody, no singing, no
+   humming, only her voice and natural sounds. Never repeat the character
+   description later.
+2. After the GLOBAL block, write EXACTLY these headings, in this order, copying
+   every number character for character. Do not add, remove, rename, reorder or
+   re-time them. Put the scene text on the line after each heading:
+
+{skeleton}
+
+   Do NOT invent your own timings. These ranges are already correct and
+   contiguous; your only job is to write the scene text under each one.
+3. Put one blank line between scenes.
+
+SCENE TEXT RULES:
+- Chronological, concrete, visibly observable actions. Never write a vague verb
+  like "{vague}"; write "{concrete}".
+- Include the camera as natural prose, e.g. "{camera}".
+- End every scene with one short sound sentence covering ambience, physical
+  sounds, her voice or dialogue - never music, melody, singing or humming.
+  Picture and audio are generated jointly, so a scene with no sound description
+  will get random audio.
+- No music and no singing anywhere in the film: never write song lyrics, never
+  describe singing, humming or a soundtrack.
+- Describe ONLY what happens inside that scene. Never describe future events.
+- Never write media tags such as <Picture 1>, <Video 1> or <Audio 1>.
+"""
+
+_SCRIPT_GEN_SHORT_SYSTEM = """You write prompts for the MiniMax H3 video model.
+
+The requested clip is short, so write ONE single flowing paragraph of
+{short_length}. No headings, no timeline, no markdown, no commentary.
+
+{language}
+
+Cover, in this order: the subject's visible appearance and clothing, the setting
+and lighting, the action unfolding over the clip, the camera movement written as
+natural prose ("{camera}"), and finally the sound - ambience, physical sounds,
+her voice or dialogue, and never music, melody, singing or humming. Picture and
+audio are generated together, so the sound must be described or it will be
+random.
+
+Be concrete and visibly observable. Never write a vague verb like "{vague}";
+write "{concrete}". Never write media tags such as <Picture 1> or <Video 1>.
+"""
+
+_SCRIPT_GEN_MODE_NOTES = {
+    INPUT_MODE_IMAGE: (
+        "The user supplies a first frame image. Do NOT re-describe the subject's "
+        "static appearance - the image already carries it. Describe only what "
+        "happens next, the camera, and the sound."
+    ),
+    INPUT_MODE_FL2VA: (
+        "The user supplies a first AND a last frame. Describe only the motion "
+        "that carries the first frame into the last frame. Do not restate either "
+        "end pose."
+    ),
+    INPUT_MODE_REF2VA: (
+        "The user supplies reference media. Open the GLOBAL block with a single "
+        "line keeping the exact appearance of the reference. Borrow only the "
+        "person or style - the setting, background, light and camera must be "
+        "written out explicitly in the GLOBAL block."
+    ),
+}
+
+_SCRIPT_GEN_REPAIR = """The script you produced was rejected by the validator.
+
+Validator error: {error}
+
+Rewrite the whole script and fix exactly that problem, keeping everything that
+was already valid. Copy the required headings verbatim - do not retime them:
+
+{skeleton}
+
+Keep the same output language as before. Output the corrected script only.
+"""
+
+
+def _strip_script_wrappers(text: str) -> str:
+    """Remove markdown fences and stray leading chatter from a model reply."""
+    body = (text or "").strip()
+    fence = re.match(r"(?s)^```[a-zA-Z0-9_-]*\s*\n(.*?)\n?```\s*$", body)
+    if fence:
+        body = fence.group(1).strip()
+    # A model that ignores "no commentary" often prefixes one line of it. The
+    # first real line of a script is either a timeline heading or a sentence of
+    # the GLOBAL block, so anything else short and unterminated is chatter.
+    #
+    # The terminator test must include CJK punctuation: a short single-line
+    # GLOBAL block ends with "。" (or ！？), not ".", and testing only for "."
+    # silently deleted that line - losing the character/setting description that
+    # every scene depends on.
+    lines = body.splitlines()
+    while lines and lines[0].strip() and not _SCRIPT_HEADING_OR_RANGE_RE.search(lines[0]):
+        stripped = lines[0].strip()
+        if len(stripped) < 120 and not stripped.endswith(_SENTENCE_ENDINGS):
+            lines.pop(0)
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
+# Colons are deliberately excluded: chatter such as "Here is your script:" ends
+# with one and must still be stripped.
+_SENTENCE_ENDINGS = (".", "。", "！", "？", "…", "!", "?")
+
+
+_SCRIPT_HEADING_OR_RANGE_RE = re.compile(
+    r"（\s*[0-9]+(?:\.[0-9]+)?\s*[-‐‑‒–—−~～至到]\s*[0-9]+(?:\.[0-9]+)?\s*秒\s*）"
+)
+
+_CN_DIGITS = "零一二三四五六七八九"
+
+
+def _cn_number(value: int) -> str:
+    """Render 1-99 as Chinese numerals for scene labels; 100+ as digits.
+
+    Labels are free text to the parser, so falling back to Arabic numerals past
+    99 is safe and avoids an out-of-range glyph lookup on very long skeletons.
+    """
+    if value <= 0 or value > 99:
+        return str(value)
+    if value < 10:
+        return _CN_DIGITS[value]
+    if value < 20:
+        return "十" + (_CN_DIGITS[value % 10] if value % 10 else "")
+    tens, ones = divmod(value, 10)
+    return _CN_DIGITS[tens] + "十" + (_CN_DIGITS[ones] if ones else "")
+
+
+# A deliberately irregular rhythm for scene lengths. Uniform scenes (every one
+# the same length) read as mechanical; the operator explicitly asked for short
+# and long shots to alternate. Values stay inside the Bot's per-scene window
+# (MIN_TOTAL_SECONDS..SCRIPT_GEN_MAX_SCENE) and are whole seconds so the model
+# can copy the headings exactly.
+_SCRIPT_GEN_RHYTHM = (4.0, 9.0, 6.0, 12.0, 7.0, 5.0, 10.0, 3.0, 8.0, 11.0)
+
+
+def _script_scene_lengths(total: float, varied: bool = True) -> list[float]:
+    """Split a duration into scene lengths that sum to exactly `total`.
+
+    Every length lands in [MIN_TOTAL_SECONDS, SCRIPT_GEN_MAX_SCENE] so the Bot's
+    plan builder always accepts the result. With `varied` the lengths cycle
+    through an irregular rhythm, which is what produces a natural long/short
+    cutting pace; without it every scene is equal.
+    """
+    total = float(total)
+    floor = MIN_TOTAL_SECONDS
+    ceiling = SCRIPT_GEN_MAX_SCENE
+    if total <= ceiling:
+        return [total]
+
+    lengths: list[float] = []
+    remaining = total
+    index = 0
+    # Bounded so a pathological duration cannot spin forever.
+    for _ in range(400):
+        if remaining <= ceiling:
+            lengths.append(round(remaining, 2))
+            remaining = 0.0
+            break
+        want = _SCRIPT_GEN_RHYTHM[index % len(_SCRIPT_GEN_RHYTHM)] if varied else ceiling
+        want = min(want, ceiling)
+        # Never leave a tail that is too short to be a legal scene: shrink this
+        # scene so the remainder is either nothing or at least the floor.
+        tail = remaining - want
+        if 0 < tail < floor:
+            want = remaining - floor
+        if want < floor:
+            want = floor
+        if want > remaining:
+            want = remaining
+        lengths.append(round(want, 2))
+        remaining = round(remaining - want, 2)
+        index += 1
+    if remaining > 1e-6:
+        lengths.append(round(remaining, 2))
+    return lengths
+
+
+def script_timeline_skeleton(
+    total: float,
+    lang: str = SCRIPT_LANG_DEFAULT,
+    target_scene: float = 10.0,
+    varied: bool = True,
+) -> list[tuple[str, float, float]]:
+    """Build an exactly-contiguous heading plan for a given duration.
+
+    The writer model is told to copy these headings verbatim rather than invent
+    timings. That matters because an example-based instruction was previously
+    self-contradictory (a hard-coded example ending at 50-60s while the scenes
+    before it already reached 55s), and the model faithfully reproduced the
+    overlap. Computing the skeleton here makes the arithmetic correct by
+    construction, so contiguity is guaranteed before the model writes a word.
+
+    Scene lengths alternate through an irregular rhythm by default (see
+    _script_scene_lengths) because uniform 10s/20s blocks read as mechanical;
+    set `varied=False` for equal scenes. Returns [(label, start, end), ...]
+    covering 0..total with no gap or overlap.
+    """
+    total = float(total)
+    head_label, tail_label = _SCRIPT_GEN_HEAD_LABELS.get(
+        normalize_script_lang(lang), _SCRIPT_GEN_HEAD_LABELS[SCRIPT_LANG_ZH]
+    )
+    if total <= 0:
+        return [(head_label, 0.0, max(0.0, total))]
+
+    lengths = _script_scene_lengths(total, varied=varied)
+    n = len(lengths)
+
+    plan: list[tuple[str, float, float]] = []
+    cursor = 0.0
+    for index, length in enumerate(lengths):
+        start = cursor
+        end = total if index == n - 1 else round(cursor + length, 2)
+        if index == 0:
+            label = head_label
+        elif index == n - 1:
+            label = tail_label
+        else:
+            label = f"第{_cn_number(index)}幕"
+        plan.append((label, round(start, 2), round(end, 2)))
+        cursor = end
+    return plan
+
+
+def format_skeleton(plan: list[tuple[str, float, float]]) -> str:
+    """Render the skeleton as the literal heading block the model must copy."""
+    lines = []
+    for label, start, end in plan:
+        lines.append(f"   {label}（{start:g}-{end:g}秒）：")
+    return "\n".join(lines)
+
+
+def _script_seconds_from_text(script: str) -> Optional[float]:
+    try:
+        return detect_prompt_total_seconds(script)
+    except (BotError, ValueError):
+        return None
+
+
+def parse_idea_duration(text: str) -> tuple[Optional[float], str]:
+    """Split a one-line request into (seconds, idea).
+
+    Accepts `60秒`, `60s`, `60 seconds`, `2分鐘`, `2min`, `1分30秒`, `半分鐘`,
+    and a trailing or leading placement of that expression. Returns None for the
+    duration when the request carries none, so the caller can fall back to the
+    current setting.
+
+    Note on the trailing guard: `\\b` cannot be used after `秒`. CJK characters
+    are Unicode word characters, so there is no word boundary between `秒` and a
+    following `的`, and a perfectly ordinary request such as
+    `30秒的影片 下雨的車站` would silently fail to parse. Because the duration is
+    then dropped, the Bot quietly falls back to the previously selected length -
+    the user asks for 30 seconds and gets 15. A negative lookahead that only
+    rejects a following ASCII alphanumeric (so `30something` still cannot match)
+    accepts CJK punctuation and particles while keeping that protection.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, ""
+
+    tail = r"(?![0-9A-Za-z])"
+    # `1分30秒` is one duration, not two. It must be tried before the
+    # minutes-only pattern, which would otherwise read it as a flat 1 minute and
+    # leave a stray `30秒` in the idea text.
+    mixed = re.compile(
+        r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(?:分鐘|分钟|分)\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:秒鐘|秒钟|秒)" + tail
+    )
+    half = re.compile(r"(?:半)\s*(?:分鐘|分钟|分)" + tail)
+    minutes = re.compile(
+        r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(?:分鐘|分钟|分|min(?:ute)?s?|m)" + tail
+    )
+    seconds = re.compile(
+        r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(?:秒鐘|秒钟|秒|sec(?:ond)?s?|s)" + tail
+    )
+
+    found: Optional[float] = None
+    match = mixed.search(raw)
+    if match:
+        found = float(match.group(1)) * 60.0 + float(match.group(2))
+    else:
+        match = half.search(raw)
+        if match:
+            found = 30.0
+        else:
+            match = minutes.search(raw)
+            if match:
+                found = float(match.group(1)) * 60.0
+            else:
+                match = seconds.search(raw)
+                if match:
+                    found = float(match.group(1))
+
+    span = match.span() if match else None
+    idea = raw
+    if span is not None:
+        idea = idea[: span[0]] + " " + idea[span[1] :]
+    # Drop the punctuation and empty brackets left where the duration was, so
+    # `[30秒] 下雨` and `（30秒）下雨` do not leave `[ ]` / `（ ）` in the idea.
+    idea = re.sub(r"[\[【（(]\s*[\]】）)]", " ", idea)
+    idea = re.sub(r"^[\s,，、:：。.！!？?\-–—]+", "", idea)
+    idea = re.sub(r"\s{2,}", " ", idea).strip()
+    if found is not None and not (MIN_TOTAL_SECONDS <= found <= MAX_TOTAL_SECONDS):
+        found = None
+    return found, idea
+
+
+def _llama_chat_once(
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> tuple[str, str, int]:
+    """One chat completion. Returns (content, finish_reason, completion_tokens)."""
+    payload = {
+        "model": "local",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": 0.95,
+        "stream": False,
+    }
+    try:
+        data = json_request(f"{LLAMA_URL}/v1/chat/completions", payload, timeout=timeout)
+    except BotError as exc:
+        detail = str(exc)
+        if "Loading model" in detail:
+            raise BotError(
+                "本機 LLM 還在載入模型（開機後約需一分鐘），請稍候再試。"
+            ) from exc
+        raise BotError(
+            f"本機 LLM 沒有回應（{LLAMA_URL}）：{exc}\n"
+            "請確認 llama-server 正在執行，或在面板按「啟動 LLM」。"
+        ) from exc
+    if not isinstance(data, dict):
+        raise BotError("本機 LLM 回傳了非預期的格式。")
+    choices = data.get("choices") or []
+    if not choices:
+        raise BotError("本機 LLM 沒有產生任何內容。")
+    choice = choices[0]
+    message = choice.get("message") or {}
+    content = str(message.get("content") or "").strip()
+    finish = str(choice.get("finish_reason") or "")
+    usage = data.get("usage") or {}
+    try:
+        tokens = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        tokens = 0
+    return content, finish, tokens
+
+
+def llama_chat(
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int = SCRIPT_GEN_MAX_TOKENS,
+    temperature: float = SCRIPT_GEN_TEMPERATURE,
+    timeout: float = SCRIPT_GEN_TIMEOUT,
+) -> str:
+    """Send a chat completion to the local llama.cpp server and return the text.
+
+    Only `message.content` is returned. The server runs with reasoning enabled,
+    so chain-of-thought arrives in a separate `reasoning_content` field and is
+    deliberately discarded - it must never leak into an H3 prompt.
+
+    Reasoning and the answer share one token budget. When the model thinks for
+    too long it can spend the whole allowance and emit an empty answer with
+    finish_reason `length`. That is not a hard failure, so the call is retried
+    once with a larger budget before giving up. (Disabling thinking entirely is
+    NOT the fix: measurements showed the model needs it to respect the timeline;
+    without it, output was consistently malformed.)
+    """
+    budgets = [max_tokens]
+    if max_tokens < SCRIPT_GEN_RETRY_TOKENS:
+        budgets.append(SCRIPT_GEN_RETRY_TOKENS)
+
+    last_finish = ""
+    last_tokens = 0
+    for budget in budgets:
+        content, finish, tokens = _llama_chat_once(
+            messages, budget, temperature, timeout
+        )
+        if content:
+            if finish == "length":
+                bot_log(
+                    f"script generator: reply hit the {budget}-token ceiling "
+                    f"({tokens} tokens) but still produced content"
+                )
+            return content
+        last_finish, last_tokens = finish, tokens
+        bot_log(
+            f"script generator: empty content at max_tokens={budget} "
+            f"(finish={finish}, {tokens} tokens)"
+        )
+
+    if last_finish == "length":
+        raise BotError(
+            f"本機 LLM 的思考用光了 {budgets[-1]} token 預算，還沒開始寫正文。\n"
+            "請縮短想法，或把 MINIMAX_SCRIPT_GEN_MAX_TOKENS 調更高。"
+        )
+    raise BotError(
+        f"本機 LLM 沒有回傳正文（finish_reason={last_finish or '未知'}，"
+        f"{last_tokens} tokens）。請重試。"
+    )
+
+
+def build_script_messages(
+    idea: str,
+    seconds: float,
+    input_mode: str,
+    lang: str = SCRIPT_LANG_DEFAULT,
+    continuity: str = "",
+) -> list[dict[str, str]]:
+    """Compose the system/user pair that asks for a complete H3 script."""
+    lang = normalize_script_lang(lang)
+    long_form = seconds > MAX_SEGMENT_SECONDS
+    language = _SCRIPT_GEN_LANGUAGE_BLOCK[lang]
+    examples = _SCRIPT_GEN_EXAMPLES[lang]
+    if long_form:
+        skeleton = format_skeleton(script_timeline_skeleton(seconds, lang))
+        system = _SCRIPT_GEN_LONG_SYSTEM.format(
+            language=language, skeleton=skeleton, **examples
+        )
+    else:
+        system = _SCRIPT_GEN_SHORT_SYSTEM.format(language=language, **examples)
+    note = _SCRIPT_GEN_MODE_NOTES.get(input_mode)
+    if note:
+        system = system + "\nMODE NOTE: " + note + "\n"
+
+    # Operator overrides are appended AFTER .format() on purpose: the custom text
+    # is arbitrary user input, and running it through str.format() would crash on
+    # any stray brace. It also has to come last so it can refine style, while the
+    # STRUCTURE and heading rules above stay authoritative.
+    custom, _status = load_custom_script_instructions()
+    if custom:
+        system = (
+            system
+            + "\nCUSTOM INSTRUCTIONS (from the operator; follow these for style "
+            "and content - they take priority over the general style guidance "
+            "above, but never override the STRUCTURE section or the exact "
+            "timeline headings):\n"
+            + custom
+            + "\n"
+        )
+
+    # Continuity block (set when the new reference images are the tail frames of
+    # the previous clip). Appended last so the "same person, same place" contract
+    # outranks every generic style rule above it.
+    if continuity:
+        system = system + "\n" + continuity.strip() + "\n"
+
+    if long_form:
+        user = (
+            f"Total duration: {seconds:g} seconds exactly.\n"
+            f"Idea: {idea}\n"
+            "Write the complete script now, using exactly the headings given. "
+            f"The final heading ends at {seconds:g} seconds."
+        )
+    else:
+        user = (
+            f"Clip duration: {seconds:g} seconds.\n"
+            f"Idea: {idea}\n"
+            "Write the prompt paragraph now."
+        )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _script_accepts(script: str, seconds: float) -> tuple[bool, str]:
+    """Run the Bot's own validator over a draft.
+
+    Returns (ok, message). When ok the message describes what passed; otherwise
+    it is the exact parser error, which is what both the self-repair loop and the
+    user-facing warnings need.
+    """
+    if seconds <= MAX_SEGMENT_SECONDS:
+        if len(script) < 40:
+            return False, "產出的提示詞太短。"
+        return True, f"{len(script)} 字元（短片散文格式）"
+    try:
+        plan = build_long_video_plan(script, float(seconds))
+    except (BotError, ValueError) as exc:
+        return False, str(exc)
+    return True, f"通過驗證，{len(plan.shots)} 個鏡頭"
+
+
+_SCRIPT_GEN_REFINE_USER = """Here is the CURRENT script:
+
+--- CURRENT ---
+{draft}
+--- END ---
+
+Revise it according to this instruction:
+{instruction}
+
+Rewrite the WHOLE script with that change applied. Keep everything that is not
+affected by the instruction exactly as good as it already is, and return the
+complete script in the same format and the same language.{headings_note}
+"""
+
+
+def refine_h3_script(
+    draft: str,
+    instruction: str,
+    seconds: float,
+    input_mode: str = INPUT_MODE_TEXT,
+    *,
+    on_progress: Optional[Any] = None,
+    attempts: int = SCRIPT_GEN_ATTEMPTS,
+    lang: str = SCRIPT_LANG_DEFAULT,
+    continuity: str = "",
+) -> tuple[str, list[str]]:
+    """Revise an existing script from a natural-language instruction.
+
+    Used for the second, third and every later round of editing, so it must be
+    repeatable without degrading the result. The same structure contract and the
+    same validator apply as for a first draft, which is what keeps repeated
+    LLM edits from drifting into an ungeneratable prompt.
+    """
+    lang = normalize_script_lang(lang)
+    long_form = seconds > MAX_SEGMENT_SECONDS
+    # Reuse the generation system prompt verbatim so every structural rule,
+    # language rule, mode note and operator override still applies on an edit.
+    system = build_script_messages(instruction, seconds, input_mode, lang, continuity)[0]["content"]
+    skeleton = format_skeleton(script_timeline_skeleton(float(seconds), lang))
+    headings_note = (
+        "\nThe timeline headings must stay EXACTLY as they are - do not add, "
+        "remove, rename or re-time any of them."
+        if long_form
+        else ""
+    )
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": _SCRIPT_GEN_REFINE_USER.format(
+                draft=draft,
+                instruction=instruction,
+                headings_note=headings_note,
+            ),
+        },
+    ]
+
+    log: list[str] = []
+    last_error = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        if on_progress is not None:
+            on_progress(attempt, max(1, attempts), last_error)
+        reply = llama_chat(messages, timeout=SCRIPT_GEN_TIMEOUT)
+        script = _strip_script_wrappers(reply)
+        messages.append({"role": "assistant", "content": script})
+        ok, message = _script_accepts(script, seconds)
+        if ok:
+            log.append(f"第 {attempt} 次嘗試：{message}")
+            return script, log
+        last_error = message
+        log.append(f"第 {attempt} 次嘗試：驗證失敗 — {last_error}")
+        if attempt < attempts:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _SCRIPT_GEN_REPAIR.format(
+                        error=last_error,
+                        skeleton=skeleton,
+                    ),
+                }
+            )
+
+    raise BotError(
+        f"連續 {attempts} 次都無法產出符合格式的修改結果。\n最後錯誤：{last_error}"
+    )
+
+
+def generate_h3_script(
+    idea: str,
+    seconds: float,
+    input_mode: str = INPUT_MODE_TEXT,
+    *,
+    on_progress: Optional[Any] = None,
+    attempts: int = SCRIPT_GEN_ATTEMPTS,
+    lang: str = SCRIPT_LANG_DEFAULT,
+    continuity: str = "",
+) -> tuple[str, list[str]]:
+    """Generate a script and self-repair it until the Bot's validator accepts.
+
+    Returns the script plus a human-readable log of what happened. Raises
+    BotError when every attempt still fails validation, and includes the last
+    parser error so the failure is diagnosable from Telegram alone.
+    """
+    lang = normalize_script_lang(lang)
+    messages = build_script_messages(idea, seconds, input_mode, lang, continuity)
+    skeleton = format_skeleton(script_timeline_skeleton(float(seconds), lang))
+    log: list[str] = []
+    last_error = ""
+
+    for attempt in range(1, max(1, attempts) + 1):
+        if on_progress is not None:
+            on_progress(attempt, max(1, attempts), last_error)
+        reply = llama_chat(messages, timeout=SCRIPT_GEN_TIMEOUT)
+        script = _strip_script_wrappers(reply)
+        messages.append({"role": "assistant", "content": script})
+
+        ok, message = _script_accepts(script, seconds)
+        if ok:
+            log.append(f"第 {attempt} 次嘗試：{message}")
+            return script, log
+        last_error = message
+        log.append(f"第 {attempt} 次嘗試：驗證失敗 — {last_error}")
+
+        if attempt < attempts:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _SCRIPT_GEN_REPAIR.format(
+                        error=last_error,
+                        skeleton=skeleton,
+                    ),
+                }
+            )
+
+    raise BotError(
+        f"連續 {attempts} 次都無法產出符合格式的腳本。\n最後錯誤：{last_error}"
+    )
+
+
 class TelegramClient:
     def __init__(self, token: str):
         self.base_url = f"https://api.telegram.org/bot{token}"
@@ -3450,6 +5157,18 @@ class TelegramClient:
             params["text"] = text
         self.call("answerCallbackQuery", params, timeout=30)
 
+    def send_chat_action(self, chat_id: str, action: str = "typing") -> None:
+        """Show Telegram's progress indicator while a slow local task runs."""
+        try:
+            self.call(
+                "sendChatAction",
+                {"chat_id": chat_id, "action": action},
+                timeout=15,
+            )
+        except BotError:
+            # Purely cosmetic; never let it break the work it is decorating.
+            pass
+
     def edit_message_text(
         self,
         chat_id: str,
@@ -3549,6 +5268,41 @@ class TelegramClient:
                 except OSError:
                     pass
 
+    def send_photo(
+        self,
+        chat_id: str,
+        photo_path: Path,
+        caption: str = "",
+        reply_markup: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Send one image with an optional inline keyboard."""
+        if not photo_path.is_file():
+            raise BotError(f"找不到要傳送的圖片：{photo_path}")
+        fields: dict[str, str] = {"chat_id": chat_id}
+        if caption:
+            fields["caption"] = caption
+        if reply_markup is not None:
+            fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        multipart_request(
+            f"{self.base_url}/sendPhoto",
+            fields,
+            "photo",
+            photo_path,
+            content_type="image/jpeg",
+        )
+
+    def clear_inline_keyboard(self, chat_id: str, message_id: int) -> None:
+        """Remove the inline buttons from a message (photo or text)."""
+        self.call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": json.dumps({"inline_keyboard": []}),
+            },
+            timeout=30,
+        )
+
 
 class TelegramTurboBot:
     def __init__(self, token: str, allowed_chat_id: str):
@@ -3624,6 +5378,12 @@ class TelegramTurboBot:
             "也可同一則訊息輸入：\n"
             "/gen 1344 768 4 5\n你的提示詞\n\n"
             "/status 查看狀態\n"
+            "/make [秒數] 一句話想法 → 本機 LLM 生成完整腳本\n"
+            "   例如：/make 60秒 下雨的車站，女生錯過末班車\n"
+            "   也可直接打 /make 再依提示輸入\n"
+            "/lang zh|en 切換腳本語言（預設簡體中文）\n"
+            "/prompt_file 查看／編輯自訂指令檔（存檔即生效，免重啟）\n"
+            "/prompt_help 提示詞寫作精華\n"
             "/progress 查看即時生成進度\n"
             "/pause 暫停長片（在目前鏡頭完成後）\n"
             "/resume 或 /play 繼續長片\n"
@@ -3643,7 +5403,7 @@ class TelegramTurboBot:
             "/cancel_shutdown 取消已排程的自動關機\n"
             "/comfy_restart 重啟 ComfyUI\n"
             "/comfy_stop 關閉 ComfyUI\n"
-            "/comfy_start 啟動 ComfyUI（閒置 5 分鐘會自動關閉）\n"
+            "/comfy_start 啟動 ComfyUI（閒置自動關閉見 MINIMAX_COMFY_IDLE_SHUTDOWN_SECONDS）\n"
             "/bot_restart 重啟 Telegram Bot\n"
             "/cancel 取消目前生成\n"
             "/help 查看說明"
@@ -3946,22 +5706,52 @@ class TelegramTurboBot:
             overall = percent
             segment_line = f"進度：{self.progress_bar(overall)} {overall:.1f}%"
 
-        node_labels = {
-            "1": "載入影片 VAE",
-            "2": "載入音訊 VAE",
-            "3": "載入文字／視覺編碼器",
-            "4": "載入 H3 模型",
-            "5": "套用 Turbo",
-            "6": "建立條件",
-            "7": "設定採樣器",
-            "8": "準備噪聲",
-            "9": "引導",
-            "10": "採樣",
-            "11": "VAE 解碼",
-            "12": "儲存影片",
+        if job.task_type == YUPI_TASK_TYPE:
+            node_labels = {
+                "1": "載入影片 VAE",
+                "2": "載入音訊 VAE",
+                "3": "載入 H3 視覺編碼器",
+                "4": "載入 Ref2VA 模型",
+                "5": "套用 AfterMidnight LoRA",
+                "6": "建立參考條件",
+                "7": "設定 Euler 採樣器",
+                "8": "準備噪聲",
+                "9": "建立引導",
+                "10": "採樣",
+                "12": "儲存影片",
+                "13": "設定 Beta 排程",
+                "14": "載入參考圖片",
+                "15": "套用 FastH3 蒸餾 LoRA",
+                "16": "套用 HMNSFW 動作 LoRA",
+                "21": "影片 VAE 解碼",
+                "22": "音訊 VAE 解碼",
+                "23": "建立同步影片",
+            }
+        else:
+            node_labels = {
+                "1": "載入影片 VAE",
+                "2": "載入音訊 VAE",
+                "3": "載入文字／視覺編碼器",
+                "4": "載入 H3 模型",
+                "5": "套用 Turbo",
+                "6": "建立條件",
+                "7": "設定採樣器",
+                "8": "準備噪聲",
+                "9": "引導",
+                "10": "採樣",
+                "11": "VAE 解碼",
+                "12": "儲存影片",
+            }
+        task_labels = {
+            "seedvr2": "SeedVR2 放大",
+            YUPI_TASK_TYPE: (
+                "🌙 YUPI（6步）"
+                if job.yupi_fast
+                else "🌙 YUPI Ref2VA"
+            ),
         }
         lines = [
-            f"📊 {'SeedVR2 放大' if job.task_type == 'seedvr2' else 'MiniMax H3'} 進度",
+            f"📊 {task_labels.get(job.task_type, 'MiniMax H3')} 進度",
             segment_line,
             f"狀態：{phase_text}",
             f"已用時間：{elapsed_text}",
@@ -3993,6 +5783,35 @@ class TelegramTurboBot:
             lines.append(f"Prompt ID：{job.prompt_id}")
         return "\n".join(lines)
 
+    def _send_progress_message(self, chat_id: str) -> None:
+        """Create the single Telegram message that the refresh thread edits."""
+        text = self.progress_text()
+        with self.progress_message_lock:
+            old_message_id = self.progress_message_id
+            old_chat_id = self.progress_message_chat_id
+            self.progress_message_id = None
+            self.progress_message_chat_id = None
+            self.progress_message_text = ""
+
+        if old_message_id is not None and old_chat_id:
+            try:
+                self.telegram.delete_message(old_chat_id, old_message_id)
+            except BotError:
+                pass
+
+        try:
+            result = self.telegram.send_message(chat_id, text)
+            new_message_id = (
+                result.get("message_id") if isinstance(result, dict) else None
+            )
+            if new_message_id:
+                with self.progress_message_lock:
+                    self.progress_message_id = int(new_message_id)
+                    self.progress_message_chat_id = chat_id
+                    self.progress_message_text = text
+        except BotError as exc:
+            self.send_safe(chat_id, f"顯示生成進度失敗：{exc}")
+
     def handle_message(self, message: dict[str, Any]) -> None:
         chat_id = str(message.get("chat", {}).get("id", ""))
         if chat_id != self.allowed_chat_id:
@@ -4021,6 +5840,9 @@ class TelegramTurboBot:
 
         if command in {"/start", "/help"}:
             self.send_safe(chat_id, self.help_text())
+            return
+        if command == "/progress":
+            self._send_progress_message(chat_id)
             return
         if command == "/status":
             with self.lock:
@@ -4138,7 +5960,7 @@ class TelegramTurboBot:
                 reference_image_paths=list(reference_image_paths or []),
                 reference_video_paths=list(reference_video_paths or []),
                 reference_audio_paths=list(reference_audio_paths or []),
-                task_type=normalize_model_mode(task_type),
+                task_type=normalize_task_type(task_type),
                 generation_mode=mode,
             )
             job.resume_event.set()
@@ -4147,6 +5969,272 @@ class TelegramTurboBot:
         thread = threading.Thread(target=self.run_job, args=(job,), daemon=True)
         thread.start()
         return True
+
+    def run_yupi_generation(self, chat_id: str, fast: bool = False) -> None:
+        """🌙 YUPI工作流：isolated NSFW generation (Ref2VA + AfterMidnight LoRA,
+        euler/beta). Loads yupi_nsfw_api.json, injects the staged prompt and a
+        reference image, submits to ComfyUI, and sends the MP4 back. This path
+        is separate from the stock Turbo workflow, but still uses the shared
+        JobState so progress, cancel, idle-shutdown, and queue controls work.
+        fast=True selects the YUPI_FAST variant (yupi_fast_api.json: the FastH3
+        6-step distill LoRA chained after AfterMidnight, scheduler at 6 steps)."""
+        prompt = (self.prompt or "").strip()
+        if not prompt:
+            self.send_safe(
+                chat_id,
+                "🌙 YUPI工作流：請先輸入提示詞（按「📝 提示詞」或 /prompt），"
+                "再按「🚀 生成影片」。",
+            )
+            return
+        ref_path: Optional[Path] = None
+        for candidate in list(self.reference_image_paths or []) + (
+            [self.image_path] if self.image_path else []
+        ):
+            if candidate is not None and Path(candidate).is_file():
+                ref_path = Path(candidate)
+                break
+        if ref_path is None:
+            self.send_safe(
+                chat_id,
+                "🌙 YUPI工作流：請先上傳一張參考圖（直接傳圖片即可），"
+                "再按「🚀 生成影片」。",
+            )
+            return
+        try:
+            workflow = load_yupi_workflow(fast)
+            template_config = yupi_generation_config(workflow)
+            requested_total = validate_total_seconds(
+                float(
+                    getattr(
+                        self,
+                        "total_seconds",
+                        template_config.actual_seconds,
+                    )
+                )
+            )
+        except BotError as exc:
+            self.send_safe(chat_id, f"🌙 YUPI 工作流設定錯誤：{exc}")
+            return
+        # Resolution follows the panel selection (self.settings) instead of the
+        # template default, so YUPI honours what the user picked. Steps stay as
+        # the workflow requires: 20 for YUPI, 6 for the FastH3 distill chain
+        # (running more steps than the distill was trained for degrades it).
+        selected = getattr(self, "settings", None)
+        width = int(getattr(selected, "width", 0) or template_config.width)
+        height = int(getattr(selected, "height", 0) or template_config.height)
+        if width < 32 or height < 32:
+            width, height = template_config.width, template_config.height
+        is_long = requested_total > MAX_SEGMENT_SECONDS
+        # valid_length() only accepts a single 2-15s shot. A long request is
+        # planned into <=15s shots later, so cap this base config at one shot;
+        # passing e.g. 60 here would raise "秒數目前只允許 2 到 15 秒".
+        base_seconds = (
+            min(requested_total, MAX_SEGMENT_SECONDS) if is_long else requested_total
+        )
+        config = GenerationConfig(
+            width=width,
+            height=height,
+            steps=template_config.steps,
+            requested_seconds=base_seconds,
+            length=valid_length(base_seconds),
+        )
+        if is_long:
+            # The standalone YUPI graph is intentionally short (the model can
+            # only process one small H3 clip safely). Reuse the long-video
+            # planner so a selected 60/120/... seconds becomes real clips,
+            # then merge them into one MP4 while preserving the YUPI graph.
+            self.start_long_generation(
+                chat_id,
+                config,
+                prompt,
+                requested_total,
+                input_image_path=ref_path,
+                reference_image_paths=[ref_path],
+                generation_mode=INPUT_MODE_REF2VA,
+                task_type=YUPI_TASK_TYPE,
+                yupi_fast=fast,
+            )
+            return
+        workflow["6"]["inputs"]["length"] = config.length
+        with self.lock:
+            if self.job is not None:
+                self.send_safe(
+                    chat_id,
+                    "目前已有工作在生成，請先完成或 /cancel 後再跑 YUPI工作流。",
+                )
+                return
+            job = JobState(
+                chat_id=chat_id,
+                config=config,
+                prompt=prompt,
+                started_at=time.time(),
+                output_prefix=(
+                    YUPI_FAST_OUTPUT_PREFIX if fast else YUPI_OUTPUT_PREFIX
+                ),
+                total_seconds=config.actual_seconds,
+                input_image_path=ref_path,
+                reference_image_paths=[ref_path],
+                task_type=YUPI_TASK_TYPE,
+                generation_mode=INPUT_MODE_REF2VA,
+                yupi_fast=fast,
+            )
+            self.job = job
+        self.touch_comfy_activity()
+        bot_log("YUPI workflow requested")
+        # YUPI used to bypass JobState entirely, so the progress button had no
+        # job to display. Create the live message immediately; the refresh
+        # thread will replace the queued text once ComfyUI emits progress.
+        self._send_progress_message(chat_id)
+        thread = threading.Thread(
+            target=self._yupi_worker,
+            args=(chat_id, prompt, ref_path, job, workflow),
+            name="yupi-generation",
+            daemon=True,
+        )
+        thread.start()
+
+    def _ensure_comfyui_for_yupi(self, chat_id: str) -> None:
+        """Bring ComfyUI online before the isolated YUPI path touches it.
+        Mirrors ensure_comfyui_ready() so YUPI works even when the idle loop
+        has already shut ComfyUI down to save VRAM. Reuses the same module
+        helpers; still fully separate from the stock job pipeline."""
+        if llama_is_online():
+            try:
+                self.send_safe(
+                    chat_id,
+                    "🧠 先關閉本地 LLM，釋放顯存避免 OOM。\n" + stop_llama_process(),
+                )
+            except (BotError, OSError):
+                pass
+        if comfyui_is_online():
+            self.touch_comfy_activity()
+            return
+        self.send_safe(chat_id, start_comfyui_process(self.comfyui_vram_mode()))
+        self.touch_comfy_activity()
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if comfyui_is_online():
+                self.touch_comfy_activity()
+                self.send_safe(chat_id, "ComfyUI 已就緒，開始 YUPI 工作流。")
+                return
+            time.sleep(3)
+        raise BotError(f"ComfyUI 在 180 秒內沒有就緒，請查看日誌：{COMFYUI_LOG}")
+
+    def _yupi_worker(
+        self,
+        chat_id: str,
+        prompt: str,
+        ref_path: Path,
+        job: JobState,
+        workflow: dict[str, Any],
+    ) -> None:
+        """Background worker for the isolated YUPI NSFW workflow."""
+        started_at = job.started_at
+        progress_tracker: Optional[ComfyProgressTracker] = None
+        try:
+            if job.cancel_event.is_set():
+                raise BotError("生成已取消。")
+            self._ensure_comfyui_for_yupi(chat_id)
+            ref_name = upload_image_to_comfy(ref_path)
+            workflow, lora_name = configure_yupi_workflow(
+                workflow,
+                job.config,
+                prompt,
+                ref_name,
+                job.output_prefix,
+            )
+            self.send_safe(
+                chat_id,
+                ("🌙 YUPI工作流（6步）開始\n" if job.yupi_fast else "🌙 YUPI工作流（20步）開始\n")
+                + f"{prompt[:120]}\n"
+                + f"(Ref2VA + {lora_name}, euler/beta, {job.config.steps} steps)",
+            )
+            response = comfy_post(
+                "/prompt",
+                {"prompt": workflow, "client_id": "telegram-yupi-bot"},
+            )
+            prompt_id = response.get("prompt_id")
+            if not prompt_id:
+                raise BotError(f"ComfyUI 沒回傳 prompt_id：{response}")
+            job.prompt_id = str(prompt_id)
+            with job.progress_lock:
+                job.progress_percent = 0.0
+                job.progress_node_id = None
+                job.progress_node_state = "queued"
+                job.progress_node_value = 0.0
+                job.progress_node_max = 1.0
+                job.progress_node_index = 0
+                job.progress_node_total = 0
+                job.progress_queue_remaining = None
+                job.progress_phase = "waiting"
+            progress_tracker = ComfyProgressTracker(
+                job, client_id="telegram-yupi-bot"
+            )
+            job.progress_tracker = progress_tracker
+            progress_tracker.start()
+            history: Optional[dict[str, Any]] = None
+            while True:
+                if job.cancel_event.is_set():
+                    raise BotError("生成已取消。")
+                try:
+                    history_all = comfy_post(f"/history/{prompt_id}")
+                    history = (
+                        history_all.get(str(prompt_id))
+                        if isinstance(history_all, dict)
+                        else None
+                    )
+                except BotError:
+                    history = None
+                if history:
+                    status = history.get("status", {})
+                    if status.get("status_str") == "error":
+                        raise BotError(self.execution_error(history))
+                    if status.get("completed") or status.get("status_str") == "success":
+                        break
+                time.sleep(3)
+            video_path = self.find_video(
+                history or {},
+                started_at,
+                name_hint="YUPI_FAST" if job.yupi_fast else "YUPI_NSFW",
+            )
+            if video_path is None:
+                raise BotError(
+                    "YUPI 完成但找不到輸出 MP4，請到 ComfyUI output 資料夾查看。"
+                )
+            with job.progress_lock:
+                job.progress_percent = 100.0
+                job.progress_phase = "uploading"
+                job.progress_node_state = "finished"
+            self.telegram.send_video(
+                chat_id,
+                video_path,
+                (
+                    "🌙 YUPI工作流（6步）完成\n"
+                    if job.yupi_fast
+                    else "🌙 YUPI工作流完成\n"
+                )
+                + prompt[:120],
+            )
+            self.offer_tail_reference(chat_id, video_path)
+            bot_log(f"YUPI workflow finished: {video_path}")
+        except BotError as exc:
+            if not job.cancel_event.is_set():
+                self.send_safe(chat_id, f"🌙 YUPI 工作流失敗：{exc}")
+            bot_log(f"YUPI workflow error: {exc}")
+        except Exception as exc:  # noqa: BLE001 - surface any worker failure
+            if not job.cancel_event.is_set():
+                self.send_safe(chat_id, f"🌙 YUPI 工作流未預期錯誤：{exc}")
+            bot_log(f"YUPI workflow unexpected error: {exc}")
+        finally:
+            if progress_tracker is not None:
+                progress_tracker.stop()
+            if job.progress_tracker is progress_tracker:
+                job.progress_tracker = None
+            self.touch_comfy_activity()
+            with self.lock:
+                if self.job is job:
+                    self.job = None
+            self.on_job_finished(chat_id)
 
     def ensure_comfyui_ready(self, job: JobState) -> None:
         """Hook for a subclass to start or wait for ComfyUI before queuing."""
@@ -4188,6 +6276,132 @@ class TelegramTurboBot:
             return
         bot_log("Bot restart requested from Telegram")
 
+    def run_yupi_segment(
+        self,
+        job: JobState,
+        announce: bool = True,
+        motion_context: bool = False,
+        context_video_name: Optional[str] = None,
+        context_latent_path: Optional[str] = None,
+        load_latent_clip_index: int = 0,
+        save_latent_prefix: Optional[str] = None,
+        save_latent_clip_index: Optional[int] = None,
+        **_: Any,
+    ) -> Path:
+        """Run one short YUPI clip for the shared long-video planner."""
+        segment_started_at = time.time()
+        reference_path: Optional[Path] = None
+        if job.segment_index > 1 and job.continuation_image_path is not None:
+            if job.continuation_image_path.is_file():
+                reference_path = job.continuation_image_path
+        if reference_path is None:
+            candidates = ([job.input_image_path] if job.input_image_path else [])
+            candidates.extend(job.reference_image_paths)
+            reference_path = next(
+                (path for path in candidates if path.is_file()),
+                None,
+            )
+        if reference_path is None:
+            raise BotError("YUPI 長片找不到參考圖片或上一鏡尾幀。")
+
+        reference_name = upload_image_to_comfy(reference_path)
+        workflow = load_yupi_workflow(job.yupi_fast)
+        workflow, lora_name = configure_yupi_workflow(
+            workflow,
+            job.config,
+            segment_prompt(job),
+            reference_name,
+            job.output_prefix,
+        )
+        if motion_context:
+            # YUPI now honours Motion Context: the previous segment's AV latent
+            # and tail frames are pinned onto this shot's head, then trimmed.
+            workflow = attach_yupi_motion_context(
+                workflow,
+                context_video_name=context_video_name,
+                context_latent_path=context_latent_path,
+                load_latent_clip_index=load_latent_clip_index,
+            )
+        # Always write this shot's latent when the planner asked for it: the
+        # first shot has no context to load, but it must still produce the file
+        # that shot 2 reads (otherwise shot 2 fails with "is neither a file nor
+        # a folder").
+        workflow = attach_yupi_save_latent(
+            workflow,
+            save_latent_prefix,
+            save_latent_clip_index,
+        )
+        response = comfy_post(
+            "/prompt",
+            {"prompt": workflow, "client_id": "telegram-yupi-bot"},
+        )
+        prompt_id = response.get("prompt_id")
+        if not prompt_id:
+            raise BotError(f"ComfyUI 沒有回傳 YUPI prompt_id：{response}")
+        job.prompt_id = str(prompt_id)
+        with job.progress_lock:
+            job.progress_percent = 0.0
+            job.progress_node_id = None
+            job.progress_node_state = "queued"
+            job.progress_node_value = 0.0
+            job.progress_node_max = 1.0
+            job.progress_node_index = 0
+            job.progress_node_total = 0
+            job.progress_queue_remaining = None
+            job.progress_phase = "waiting"
+        progress_tracker = ComfyProgressTracker(
+            job,
+            client_id="telegram-yupi-bot",
+        )
+        job.progress_tracker = progress_tracker
+        progress_tracker.start()
+        if announce:
+            self.send_safe(
+                job.chat_id,
+                ("🌙 YUPI（6步）" if job.yupi_fast else "🌙 YUPI")
+                + f" 鏡頭開始：{job.config.actual_seconds:.2f} 秒 | "
+                f"{lora_name}\nPrompt ID：{prompt_id}",
+            )
+
+        try:
+            history: Optional[dict[str, Any]] = None
+            while True:
+                if job.cancel_event.is_set():
+                    raise BotError("生成已取消。")
+                try:
+                    history_all = comfy_post(f"/history/{prompt_id}")
+                    history = (
+                        history_all.get(str(prompt_id))
+                        if isinstance(history_all, dict)
+                        else None
+                    )
+                except BotError:
+                    history = None
+                if history:
+                    status = history.get("status", {})
+                    status_name = status.get("status_str")
+                    if status_name == "error":
+                        raise BotError(self.execution_error(history))
+                    if status.get("completed") or status_name == "success":
+                        break
+                time.sleep(3)
+            video_path = self.find_video(
+                history or {},
+                segment_started_at,
+                name_hint="YUPI_FAST" if job.yupi_fast else "YUPI_NSFW",
+            )
+            if video_path is None:
+                raise BotError("YUPI 鏡頭完成但找不到輸出 MP4。")
+            with job.progress_lock:
+                job.progress_percent = 100.0
+                job.progress_phase = "completed"
+                job.progress_node_state = "finished"
+            return video_path
+        finally:
+            progress_tracker.stop()
+            if job.progress_tracker is progress_tracker:
+                job.progress_tracker = None
+
     def run_segment(
         self,
         job: JobState,
@@ -4199,6 +6413,17 @@ class TelegramTurboBot:
         save_latent_prefix: Optional[str] = None,
         save_latent_clip_index: Optional[int] = None,
     ) -> Path:
+        if job.task_type == YUPI_TASK_TYPE:
+            return self.run_yupi_segment(
+                job,
+                announce=announce,
+                motion_context=motion_context,
+                context_video_name=context_video_name,
+                context_latent_path=context_latent_path,
+                load_latent_clip_index=load_latent_clip_index,
+                save_latent_prefix=save_latent_prefix,
+                save_latent_clip_index=save_latent_clip_index,
+            )
         segment_started_at = time.time()
         image_name: Optional[str] = None
         last_image_name: Optional[str] = None
@@ -4308,6 +6533,9 @@ class TelegramTurboBot:
             save_latent_prefix=save_latent_prefix,
             save_latent_clip_index=save_latent_clip_index,
             latent_upscale=bool(getattr(self, "latent_upscale", LATENT_UPSCALE_ENABLED)),
+            h3_profile=str(
+                getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
+            ),
         )
         usage_report = workflow_usage_report(workflow, self.comfyui_vram_mode())
         if usage_report not in job.workflow_reports:
@@ -4439,6 +6667,7 @@ class TelegramTurboBot:
                 f"{job.config.steps} steps | {job.config.actual_seconds:.2f} 秒"
             )
             self.telegram.send_video(job.chat_id, video_path, caption)
+            self.offer_tail_reference(job.chat_id, video_path)
             self.send_safe(
                 job.chat_id,
                 completion_report(job, time.time() - job.started_at),
@@ -4558,6 +6787,12 @@ class TelegramMenuBot(TelegramTurboBot):
         self.reference_audio_paths = saved_media("reference_audio_paths")
         self.vram_mode = self.load_saved_vram_mode()
         self.latent_upscale = self.load_saved_latent_upscale()
+        self.long_continuity = self.load_saved_long_continuity()
+        self.h3_profile = self.load_saved_h3_profile()
+        self.restart_llm_after_generation = self.load_saved_restart_llm()
+        self.script_lang = self.load_saved_script_lang()
+        self.script_continuity = self.load_saved_script_continuity()
+        self.continuity_source_script = self.load_saved_continuity_source()
         self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
         self._shutdown_pending = False
         self.awaiting_prompt = False
@@ -4567,11 +6802,28 @@ class TelegramMenuBot(TelegramTurboBot):
         self.awaiting_queue_prompt = False
         self.extension_seconds: Optional[float] = None
         self.extension_checkpoint_id: Optional[str] = None
+        # ✨ script generator state
+        self.awaiting_script_idea = False
+        self.script_busy = False
+        self.script_draft: Optional[str] = None
+        self.script_idea = ""
+        self.script_seconds = float(self.total_seconds)
+        self.awaiting_custom_prompt = ""
+        # Multi-round draft editing: script_history holds every previous revision
+        # so the user can step back after any number of manual or AI edits.
+        self.script_history: list[str] = []
+        self.script_last_action = ""
+        self.awaiting_script_edit = ""
+        self.awaiting_script_refine = False
+        self.script_refine_instruction = ""
         self.story_queue: list[QueuedStory] = self.load_story_queue()
         self._queue_starting = False
         self.menu_message_id: Optional[int] = None
         self.menu_section = MENU_MAIN
         self.control_keyboard_sent = False
+        # Restore the saved prompt's duration from its own script on startup,
+        # so a restart cannot silently bring back the previous manual value.
+        self.auto_detect_prompt_duration(self.prompt, persist=True)
 
     @staticmethod
     def default_settings() -> GenerationConfig:
@@ -4641,6 +6893,96 @@ class TelegramMenuBot(TelegramTurboBot):
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
         return LATENT_UPSCALE_ENABLED
+
+    @staticmethod
+    def load_saved_long_continuity() -> str:
+        """Long-video continuation mode: 'motion_context' or 'tail_frame'.
+
+        The saved preference wins; the MINIMAX_H3_LONG_CONTINUITY env var is
+        only the first-run default.
+        """
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("long_continuity")
+            if isinstance(value, str) and value.strip().lower() in LONG_CONTINUITY_MODES:
+                return value.strip().lower()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return (
+            "motion_context"
+            if LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
+            else "tail_frame"
+        )
+
+    @staticmethod
+    def load_saved_h3_profile() -> str:
+        """Stock-path model profile: 'fused' (default) or 'classic' (fallback).
+
+        The fused bake is the standard now; classic stays selectable in case a
+        specific clip needs the split FL2VA/Ref2VA checkpoints + LoRA.
+        """
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("h3_profile")
+            if isinstance(value, str) and value.strip().lower() in H3_PROFILES:
+                return value.strip().lower()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return H3_PROFILE_FUSED
+
+    @staticmethod
+    def load_saved_restart_llm() -> bool:
+        """Whether to start the local LLM again after each generation."""
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("restart_llm_after_generation")
+            if isinstance(value, bool):
+                return value
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return RESTART_LLM_AFTER_GENERATION
+
+    @staticmethod
+    def load_saved_script_lang() -> str:
+        """Output language for generated scripts (zh = Simplified Chinese)."""
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("script_lang")
+            if isinstance(value, str) and value.strip().lower() in SCRIPT_LANGS:
+                return value.strip().lower()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return SCRIPT_LANG_DEFAULT
+
+    @staticmethod
+    def load_saved_script_continuity() -> str:
+        """Continuity block injected into the writer prompt, when one is active."""
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("script_continuity")
+            if isinstance(value, str):
+                return value
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return ""
+
+    @staticmethod
+    def load_saved_continuity_source() -> str:
+        """The script of the last generated clip (fed to the writer on a handoff)."""
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("continuity_source_script")
+            if isinstance(value, str):
+                return value
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return ""
 
     @staticmethod
     def load_saved_shutdown_after_generation() -> bool:
@@ -4866,6 +7208,28 @@ class TelegramMenuBot(TelegramTurboBot):
                     "latent_upscale": bool(
                         getattr(self, "latent_upscale", LATENT_UPSCALE_ENABLED)
                     ),
+                    "long_continuity": str(
+                        getattr(self, "long_continuity", "motion_context")
+                    ),
+                    "h3_profile": str(
+                        getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
+                    ),
+                    "restart_llm_after_generation": bool(
+                        getattr(
+                            self,
+                            "restart_llm_after_generation",
+                            RESTART_LLM_AFTER_GENERATION,
+                        )
+                    ),
+                    "script_lang": normalize_script_lang(
+                        getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
+                    ),
+                    "script_continuity": str(
+                        getattr(self, "script_continuity", "")
+                    ),
+                    "continuity_source_script": str(
+                        getattr(self, "continuity_source_script", "")
+                    ),
                     "shutdown_after_generation": bool(
                         getattr(self, "shutdown_after_generation", False)
                     ),
@@ -5052,8 +7416,9 @@ class TelegramMenuBot(TelegramTurboBot):
             "version": LONG_CHECKPOINT_VERSION,
             "checkpoint_id": self._checkpoint_id(job.checkpoint_path),
             "chat_id": str(job.chat_id),
-            "task_type": normalize_model_mode(job.task_type),
+            "task_type": normalize_task_type(job.task_type),
             "generation_mode": normalize_input_mode(job.generation_mode),
+            "yupi_fast": bool(getattr(job, "yupi_fast", False)),
             "status": status,
             "last_error": error[-4000:] if error else "",
             "created_at": float(job.started_at),
@@ -5655,7 +8020,7 @@ class TelegramMenuBot(TelegramTurboBot):
         self.telegram.send_message(
             chat_id,
             "請貼上要排隊的故事提示詞。\n"
-            "一次輸入多個故事時，請用獨立一行的 --- 分隔；每個故事會使用目前的解析度、steps 和片長設定。",
+            "一次輸入多個故事時，請用獨立一行的 --- 分隔；每個故事會自動讀取自己的腳本片長。",
             reply_markup={
                 "force_reply": True,
                 "input_field_placeholder": "故事 1...\n---\n故事 2...",
@@ -5700,22 +8065,32 @@ class TelegramMenuBot(TelegramTurboBot):
         reference_audio_paths = tuple(
             path for path in self.reference_audio_paths if path.is_file()
         )
-        new_items = [
-            QueuedStory(
-                item_id=f"q_{secrets.token_hex(4)}",
-                prompt=prompt,
-                config=config,
-                total_seconds=total_seconds,
-                input_image_path=input_image_path,
-                last_image_path=last_image_path,
-                reference_image_paths=reference_image_paths,
-                reference_video_paths=reference_video_paths,
-                reference_audio_paths=reference_audio_paths,
-                generation_mode=self.input_mode,
-                model_mode=self.model_mode,
+        new_items: list[QueuedStory] = []
+        for prompt in prompts:
+            prompt_total = detect_prompt_total_seconds(prompt) or total_seconds
+            prompt_config = parse_config(
+                [
+                    str(config.width),
+                    str(config.height),
+                    str(config.steps),
+                    str(min(prompt_total, MAX_SEGMENT_SECONDS)),
+                ]
             )
-            for prompt in prompts
-        ]
+            new_items.append(
+                QueuedStory(
+                    item_id=f"q_{secrets.token_hex(4)}",
+                    prompt=prompt,
+                    config=prompt_config,
+                    total_seconds=prompt_total,
+                    input_image_path=input_image_path,
+                    last_image_path=last_image_path,
+                    reference_image_paths=reference_image_paths,
+                    reference_video_paths=reference_video_paths,
+                    reference_audio_paths=reference_audio_paths,
+                    generation_mode=self.input_mode,
+                    model_mode=self.model_mode,
+                )
+            )
         with self.lock:
             self.story_queue.extend(new_items)
         self.save_story_queue()
@@ -5810,7 +8185,70 @@ class TelegramMenuBot(TelegramTurboBot):
         self.send_safe(chat_id, f"已移除 {item_id}。" if removed else "找不到這個排隊項目。")
 
     def on_job_finished(self, chat_id: str) -> None:
-        self.start_next_queued_story(chat_id)
+        try:
+            if self.start_next_queued_story(chat_id):
+                # A queued story is already running; don't start the LLM only to
+                # stop it again for the next job.
+                bot_log("on_job_finished: queued story started, LLM restart skipped")
+                return
+            self.restart_llm_after_job(chat_id)
+        except Exception as exc:  # noqa: BLE001 - never kill the job thread
+            bot_log(f"on_job_finished failed: {type(exc).__name__}: {exc}")
+
+    def restart_llm_after_job(self, chat_id: str) -> None:
+        """Start the local LLM again once a generation has finished.
+
+        The bot stops the LLM before every job to free VRAM, so this puts it
+        back for Hermes / the DSH local models. ComfyUI is shut down FIRST:
+        the LLM needs ~20GB and cannot share the card with a loaded H3 model,
+        so starting the LLM while ComfyUI still holds its model would OOM.
+        Toggle with the 🧠 button in the system menu
+        (or MINIMAX_LLM_RESTART_AFTER_JOB=0 for the default).
+        """
+        enabled = bool(getattr(self, "restart_llm_after_generation", True))
+        try:
+            llama_up = llama_is_online()
+            comfy_up = comfyui_is_online()
+        except OSError as exc:
+            # Probe failures must never block the restore below.
+            bot_log(f"restart_llm_after_job: probe failed {type(exc).__name__}: {exc}")
+            llama_up, comfy_up = False, True
+        bot_log(
+            f"restart_llm_after_job: enabled={enabled} llama_online={llama_up} "
+            f"comfy_online={comfy_up}"
+        )
+        if not enabled:
+            return
+        if llama_up:
+            return
+        notes: list[str] = []
+        # Free the GPU before the LLM loads. stop_comfyui_process() kills the
+        # server and waits for port 8191 to go quiet, so the VRAM is really
+        # released by the time we return.
+        #
+        # This step is best-effort on purpose: the entire point of this method is
+        # to bring the LLM back, so a ComfyUI hiccup (including a raw socket
+        # error such as ConnectionResetError) must not abort it. OSError is
+        # caught alongside BotError for exactly that reason.
+        if comfy_up:
+            try:
+                notes.append(stop_comfyui_process())
+            except (BotError, OSError) as exc:
+                notes.append(f"⚠️ 關閉 ComfyUI 失敗：{exc}")
+        try:
+            notes.append(start_llama_process())
+        except (BotError, OSError) as exc:
+            notes.append(f"⚠️ 啟動 LLM 失敗：{exc}")
+        summary = "\n".join(note for note in notes if note)
+        if not summary:
+            bot_log("restart_llm_after_job: nothing to report (empty summary)")
+            return
+        bot_log("LLM restart after job: " + summary.replace("\n", " | "))
+        try:
+            self.send_safe(chat_id, "🧠 生成完成，還原本地 LLM：\n" + summary)
+        except (BotError, OSError) as exc:
+            # A failed status message must not look like a failed restart.
+            bot_log(f"restart_llm_after_job: report failed {exc}")
 
     def update_settings(
         self,
@@ -5873,6 +8311,17 @@ class TelegramMenuBot(TelegramTurboBot):
                     "📚 Ref2VA 參考", self.input_mode == INPUT_MODE_REF2VA
                 ),
                 "callback_data": "mode:ref2va",
+            },
+        ]
+        # YUPI工作流：a real mode now (Ref2VA + AfterMidnight + FastH3 6-step).
+        # Selecting it only stages the mode; generation starts from
+        # 🚀 生成影片 like every other mode.
+        yupi_row = [
+            {
+                "text": self.selected(
+                    YUPI_BUTTON, self.input_mode == INPUT_MODE_YUPI
+                ),
+                "callback_data": "mode:yupi",
             },
         ]
         resolution_row = [
@@ -5939,13 +8388,27 @@ class TelegramMenuBot(TelegramTurboBot):
             rows = [
                 mode_row,
                 reference_mode_row,
+                yupi_row,
                 [
                     {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
                     {"text": "🧹 清除提示詞", "callback_data": "clear"},
                 ],
+                [{"text": "✨ 一句話生成腳本（本機 LLM）", "callback_data": "script:new"}],
+                [
+                    {
+                        "text": "🌐 腳本語言："
+                        + SCRIPT_LANG_LABEL[
+                            normalize_script_lang(
+                                getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_lang:toggle",
+                    },
+                    {"text": "📝 自訂指令", "callback_data": "script_file"},
+                ],
                 [{"text": "🗑 清除上傳素材", "callback_data": "clear_image"}],
             ]
-            if self.input_mode == INPUT_MODE_REF2VA:
+            if is_ref2va_like(self.input_mode):
                 rows.append(
                     [{"text": "✅ 完成參考素材上傳", "callback_data": "media_done"}]
                 )
@@ -6012,9 +8475,22 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "✍️ 輸入／更換提示詞", "callback_data": "prompt"},
                     {"text": "🧹 清除提示詞", "callback_data": "clear"},
                 ],
+                [{"text": "✨ 一句話生成腳本（本機 LLM）", "callback_data": "script:new"}],
+                [
+                    {
+                        "text": "🌐 腳本語言："
+                        + SCRIPT_LANG_LABEL[
+                            normalize_script_lang(
+                                getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_lang:toggle",
+                    },
+                    {"text": "📝 自訂指令", "callback_data": "script_file"},
+                ],
                 [{"text": "🗑 清除上傳素材", "callback_data": "clear_image"}],
             ]
-            if self.input_mode == INPUT_MODE_REF2VA:
+            if is_ref2va_like(self.input_mode):
                 rows.append(
                     [{"text": "✅ 完成參考素材上傳", "callback_data": "media_done"}]
                 )
@@ -6024,6 +8500,18 @@ class TelegramMenuBot(TelegramTurboBot):
             two_pass_label = self.selected(
                 "🔬 兩段式 latent 上採樣",
                 bool(getattr(self, "latent_upscale", LATENT_UPSCALE_ENABLED)),
+            )
+            continuity_label = (
+                "🔗 長片接續：Motion Context ✅"
+                if getattr(self, "long_continuity", "motion_context")
+                == "motion_context"
+                else "🔗 長片接續：尾幀接續 ✅"
+            )
+            profile_label = (
+                "🧩 模型：融合加速（6步+SLA）✅"
+                if getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
+                == H3_PROFILE_FUSED
+                else "🧩 模型：經典（FL2VA/Ref2VA+LoRA）✅"
             )
             rows = [
                 [{"text": "⏱️ 片長／秒數（按下選擇）", "callback_data": "noop"}],
@@ -6041,10 +8529,12 @@ class TelegramMenuBot(TelegramTurboBot):
                 [{"text": "⚙️ 步數（按下選擇）", "callback_data": "noop"}],
                 steps_row,
                 [{"text": two_pass_label, "callback_data": "twopass_toggle"}],
+                [{"text": continuity_label, "callback_data": "continuity_toggle"}],
+                [{"text": profile_label, "callback_data": "h3_profile_toggle"}],
             ]
             rows.extend(back_row())
         elif section == MENU_MODE:
-            rows = [mode_row, reference_mode_row]
+            rows = [mode_row, reference_mode_row, yupi_row]
             rows.extend(back_row("menu:settings"))
         elif section == MENU_DURATION:
             rows = [
@@ -6105,6 +8595,21 @@ class TelegramMenuBot(TelegramTurboBot):
                     {"text": "🔄 重啟 LLM", "callback_data": "llama_restart"},
                     {"text": "⏹ 關閉 LLM", "callback_data": "llama_stop"},
                 ],
+                [
+                    {
+                        "text": self.selected(
+                            "🧠 生成後自動啟動 LLM",
+                            bool(
+                                getattr(
+                                    self,
+                                    "restart_llm_after_generation",
+                                    RESTART_LLM_AFTER_GENERATION,
+                                )
+                            ),
+                        ),
+                        "callback_data": "llm_after_job_toggle",
+                    }
+                ],
                 [{"text": "🔄 重啟 Bot", "callback_data": "bot_restart"}],
                 [{"text": shutdown_label, "callback_data": "shutdown_toggle"}],
             ]
@@ -6135,6 +8640,33 @@ class TelegramMenuBot(TelegramTurboBot):
                 str(segment_seconds),
             ]
         )
+
+    def auto_detect_prompt_duration(
+        self, prompt: str, *, chat_id: Optional[str] = None, persist: bool = False
+    ) -> Optional[float]:
+        """Use the script's maximum timestamp as the total video duration."""
+        detected = detect_prompt_total_seconds(prompt)
+        if detected is None:
+            return None
+        changed = abs(float(getattr(self, "total_seconds", 0.0)) - detected) > 0.001
+        self.total_seconds = detected
+        current = self.settings
+        self.settings = parse_config(
+            [
+                str(current.width),
+                str(current.height),
+                str(current.steps),
+                str(min(detected, MAX_SEGMENT_SECONDS)),
+            ]
+        )
+        if persist:
+            self.save_settings()
+        if chat_id is not None and changed:
+            self.send_safe(
+                chat_id,
+                f"已按腳本自動設定總片長：{self.duration_label(detected)}。",
+            )
+        return detected
 
     def set_total_seconds(self, seconds: float) -> None:
         if not math.isfinite(seconds):
@@ -6383,6 +8915,17 @@ class TelegramMenuBot(TelegramTurboBot):
             job.preview_in_progress.clear()
 
     def start_selected_generation(self, chat_id: str, prompt: str) -> bool:
+        self.auto_detect_prompt_duration(prompt, chat_id=chat_id, persist=True)
+        if self.input_mode == INPUT_MODE_YUPI:
+            # YUPI has its own graph (Ref2VA + AfterMidnight + FastH3 6-step).
+            # It only runs from 🚀 生成影片, like every other mode.
+            has_reference = any(
+                path.is_file() for path in self.reference_image_paths
+            ) or (self.image_path is not None and self.image_path.is_file())
+            if not has_reference:
+                raise BotError("YUPI 需要一張參考圖：請先上傳圖片，再按「🚀 生成影片」。")
+            self.run_yupi_generation(chat_id, fast=True)
+            return True
         config = self.effective_config()
         input_image_path = (
             self.image_path
@@ -6505,7 +9048,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 config=config,
                 prompt=str(payload.get("prompt", "")),
                 started_at=time.time(),
-                task_type=normalize_model_mode(payload.get("task_type", MODEL_H3)),
+                task_type=normalize_task_type(payload.get("task_type", MODEL_H3)),
+                yupi_fast=bool(payload.get("yupi_fast", False)),
                 output_prefix=str(payload["output_prefix"]),
                 long_base_prefix=str(payload["output_prefix"]),
                 checkpoint_path=path,
@@ -6693,7 +9237,8 @@ class TelegramMenuBot(TelegramTurboBot):
                 config=config,
                 prompt=prompt,
                 started_at=time.time(),
-                task_type=normalize_model_mode(payload.get("task_type", MODEL_H3)),
+                task_type=normalize_task_type(payload.get("task_type", MODEL_H3)),
+                yupi_fast=bool(payload.get("yupi_fast", False)),
                 output_prefix=extension_prefix,
                 long_base_prefix=extension_prefix,
                 base_config=config,
@@ -6760,6 +9305,7 @@ class TelegramMenuBot(TelegramTurboBot):
         reference_audio_paths: Optional[list[Path]] = None,
         generation_mode: str = INPUT_MODE_TEXT,
         task_type: str = MODEL_H3,
+        yupi_fast: bool = False,
     ) -> bool:
         prompt = prompt.strip()
         if not prompt:
@@ -6791,13 +9337,34 @@ class TelegramMenuBot(TelegramTurboBot):
         try:
             plan = build_long_video_plan(prompt, total_seconds)
         except BotError as exc:
-            self.send_safe(chat_id, f"長片時間軸格式錯誤：{exc}")
+            # The most common cause is a prompt/length mismatch: a short prose
+            # script (or a hand-written paragraph) left selected while the video
+            # length is still a long value. Name that explicitly, because the
+            # raw parser error does not tell the user which control to change.
+            hint = ""
+            if (
+                parse_timeline_prompt(prompt) is None
+                and parse_segmented_prompt(prompt) is None
+            ):
+                hint = (
+                    "\n\n目前的提示詞是一段散文、沒有任何時間軸。"
+                    "如果它其實是短片腳本，請把片長改成 15 秒以內；"
+                    "如果要 15 秒以上的長片，請改用時間軸格式"
+                    "（按「✨ 一句話生成腳本」會自動產生正確的時間軸）。"
+                )
+            self.send_safe(chat_id, f"長片時間軸格式錯誤：{exc}{hint}")
             return False
         segment_total = len(plan.shots)
         if segment_total < 2:
             self.send_safe(chat_id, "長片時間軸至少需要兩個鏡頭。")
             return False
-        batch_prefix = f"{OUTPUT_PREFIX}/long_{uuid.uuid4().hex[:12]}"
+        if yupi_fast:
+            output_root = YUPI_FAST_OUTPUT_PREFIX
+        elif task_type == YUPI_TASK_TYPE:
+            output_root = YUPI_OUTPUT_PREFIX
+        else:
+            output_root = OUTPUT_PREFIX
+        batch_prefix = f"{output_root}/long_{uuid.uuid4().hex[:12]}"
         with self.lock:
             if self.job:
                 self.send_safe(chat_id, "目前已有工作在生成，請先等待完成或使用 /cancel。")
@@ -6818,8 +9385,9 @@ class TelegramMenuBot(TelegramTurboBot):
                 reference_image_paths=list(reference_image_paths or []),
                 reference_video_paths=list(reference_video_paths or []),
                 reference_audio_paths=list(reference_audio_paths or []),
-                task_type=normalize_model_mode(task_type),
+                task_type=normalize_task_type(task_type),
                 generation_mode=mode,
+                yupi_fast=yupi_fast,
                 base_config=config,
                 long_base_prefix=batch_prefix,
                 checkpoint_path=LONG_CHECKPOINT_DIR
@@ -6846,6 +9414,8 @@ class TelegramMenuBot(TelegramTurboBot):
             "後續鏡頭會使用上一鏡尾幀；每鏡重新生成原生音訊，避免重複上一鏡對白。\n"
             "若你另外上傳參考音訊，仍會按參考音訊模式生成。",
         )
+        if task_type == YUPI_TASK_TYPE:
+            self._send_progress_message(chat_id)
         thread = threading.Thread(target=self.run_long_job, args=(job,), daemon=True)
         thread.start()
         return True
@@ -6908,8 +9478,13 @@ class TelegramMenuBot(TelegramTurboBot):
             with job.progress_lock:
                 job.progress_phase = "uploading"
                 job.progress_percent = 100.0
+            model_label = (
+                "🌙 YUPI"
+                if job.task_type == YUPI_TASK_TYPE
+                else "MiniMax H3 Turbo"
+            )
             caption = (
-                "MiniMax H3 Turbo 長片已提早中止，已合成部分結果\n"
+                f"{model_label} 長片已提早中止，已合成部分結果\n"
                 f"{completed_seconds:.2f} 秒 | {job.config.width}×{job.config.height} | "
                 f"{job.config.steps} steps | {completed_count}/{job.segment_total} 段"
             )
@@ -7002,23 +9577,22 @@ class TelegramMenuBot(TelegramTurboBot):
                     bot_log(f"ComfyUI memory release before long resume unavailable: {exc}")
             if job.resume_motion_context is None:
                 motion_context_enabled = (
-                    LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}
+                    getattr(self, "long_continuity", "motion_context")
+                    == "motion_context"
                     and motion_context_nodes_available()
                 )
             else:
                 motion_context_enabled = bool(job.resume_motion_context)
                 if motion_context_enabled and not motion_context_nodes_available():
                     motion_context_enabled = False
-            if motion_context_enabled:
-                layout_compatible = motion_context_layout_compatible()
-                if layout_compatible is False:
-                    motion_context_enabled = False
-                    motion_context_legacy_layout = True
-                    bot_log(
-                        "long job: old ComfyUI H3 PackedLayout detected; "
-                        "falling back to tail-frame continuation"
-                    )
-            if job.generation_mode == INPUT_MODE_REF2VA:
+            # The installed pack can patch older PackedLayout constructors.
+            # A frame_count parameter alone cannot establish incompatibility.
+            # Let the node's runtime self-test decide; the existing execution
+            # error handler still falls back for packs that reject the layout.
+            if (
+                job.generation_mode == INPUT_MODE_REF2VA
+                and job.task_type != YUPI_TASK_TYPE
+            ):
                 if motion_context_enabled:
                     bot_log(
                         "Ref2VA long job: disabling AV Motion Context; using "
@@ -7027,9 +9601,32 @@ class TelegramMenuBot(TelegramTurboBot):
                 # Ref2VA is used only for the opening shot.  Later shots are
                 # assembled by run_segment as I2VA from the previous tail
                 # frame, so the reference pose cannot reset every segment.
+                # YUPI is exempt: it keeps Motion Context and pins the previous
+                # AV latent onto each shot's head instead.
                 motion_context_enabled = False
-            if LONG_CONTINUITY_MODE in {"motion_context", "motion", "experimental"}:
-                if job.generation_mode == INPUT_MODE_REF2VA:
+            if getattr(self, "long_continuity", "motion_context") != "motion_context":
+                self.send_safe(
+                    job.chat_id,
+                    "長片接續：目前使用「尾幀接續」——第 2 鏡起只接上一鏡尾幀，"
+                    "每鏡重新生成原生音訊。",
+                )
+            if getattr(self, "long_continuity", "motion_context") == "motion_context":
+                if job.task_type == YUPI_TASK_TYPE:
+                    if motion_context_enabled:
+                        self.send_safe(
+                            job.chat_id,
+                            "YUPI 長片：第 1 鏡用 AfterMidnight Ref2VA 錨定角色，"
+                            "第 2 鏡起接續上一鏡的 AV latent 與尾幀"
+                            "（Motion Context），最後合併為完整影片。",
+                        )
+                    else:
+                        self.send_safe(
+                            job.chat_id,
+                            "YUPI 長片會以 AfterMidnight Ref2VA 逐鏡生成；"
+                            "第 2 鏡起接續上一鏡尾幀，最後合併為完整影片。"
+                            "（Motion Context 節點未就緒）",
+                        )
+                elif job.generation_mode == INPUT_MODE_REF2VA:
                     self.send_safe(
                         job.chat_id,
                         "已啟用長片接續：第 1 鏡使用 Ref2VA 多參考圖；第 2 鏡起改用 I2VA，"
@@ -7253,6 +9850,27 @@ class TelegramMenuBot(TelegramTurboBot):
                             context_latent_path,
                         )
                         context_video_name = upload_video_to_comfy(video_path)
+                        if job.task_type == YUPI_TASK_TYPE:
+                            # YUPI's graph always attaches a reference image
+                            # (ref_image_0 is wired to its LoadImage node). Use
+                            # the immediate previous tail frame rather than the
+                            # original character reference, so the pose cannot
+                            # reset every shot now that Motion Context carries
+                            # the latent continuity.
+                            job.audio_reference_name = None
+                            previous_frame = job.continuation_image_path
+                            continuation_path = (
+                                CONTINUATION_DIR
+                                / f"{uuid.uuid4().hex}_segment_{index:03d}.png"
+                            )
+                            job.continuation_image_path = extract_last_frame(
+                                video_path, continuation_path
+                            )
+                            if previous_frame and previous_frame != continuation_path:
+                                try:
+                                    previous_frame.unlink()
+                                except OSError:
+                                    pass
                     else:
                         # Keep visual continuity from the immediate previous
                         # segment, but generate native audio for this shot.
@@ -7312,12 +9930,18 @@ class TelegramMenuBot(TelegramTurboBot):
             self.mark_long_checkpoint(job, "completed")
             with job.progress_lock:
                 job.progress_phase = "uploading"
+            model_label = (
+                "🌙 YUPI"
+                if job.task_type == YUPI_TASK_TYPE
+                else "MiniMax H3 Turbo"
+            )
             caption = (
-                f"MiniMax H3 Turbo 長片完成\n{job.total_seconds:.0f} 秒 | "
+                f"{model_label} 長片完成\n{job.total_seconds:.0f} 秒 | "
                 f"{base_config.width}×{base_config.height} | {base_config.steps} steps | "
                 f"{job.segment_total} 鏡頭合併"
             )
             self.telegram.send_video(job.chat_id, output_path, caption)
+            self.offer_tail_reference(job.chat_id, output_path)
             self.send_safe(
                 job.chat_id,
                 completion_report(
@@ -7387,6 +10011,7 @@ class TelegramMenuBot(TelegramTurboBot):
             INPUT_MODE_IMAGE: "I2VA 圖片生視頻",
             INPUT_MODE_FL2VA: "FL2VA 首尾幀生視頻",
             INPUT_MODE_REF2VA: "Ref2VA 參考素材生視頻",
+            INPUT_MODE_YUPI: "🌙 YUPI工作流（Ref2VA + FastH3 6步）",
         }.get(self.input_mode, "T2VA 文字生視頻")
         image_status = "已收到" if self.image_path and self.image_path.is_file() else "未收到"
         media_status = (
@@ -7397,7 +10022,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 f"參考圖 {len(self.reference_image_paths)} 張／"
                 f"參考片 {len(self.reference_video_paths)} 段／"
                 f"參考音訊 {len(self.reference_audio_paths)} 段"
-                if self.input_mode == INPUT_MODE_REF2VA
+                if is_ref2va_like(self.input_mode)
                 else image_status
             )
         )
@@ -7438,8 +10063,8 @@ class TelegramMenuBot(TelegramTurboBot):
         section_hints = {
             MENU_MAIN: "模式、提示詞、任務和系統按鈕直接顯示；只有片長、解析度和 steps 收納在生成參數。",
             MENU_INPUT: "可直接發圖片、影片、音訊或 TXT；Ref2VA 素材完成後按確認。",
-            MENU_SETTINGS: "這裡集中調整片長、解析度和 steps；其他功能仍在主選單。",
-            MENU_MODE: "T2VA／I2VA／FL2VA／Ref2VA 會在生成時使用對應接線。",
+            MENU_SETTINGS: "這裡集中調整片長、解析度、steps、長片接續方式；其他功能仍在主選單。",
+            MENU_MODE: "T2VA／I2VA／FL2VA／Ref2VA／YUPI 會在生成時使用對應接線。",
             MENU_DURATION: "超過 15 秒會按提示詞時間軸自動分段。",
             MENU_QUALITY: "解析度越高越清晰，也越容易需要更多顯存。",
             MENU_JOB: "生成中的任務可以查看進度、暫停、繼續或中止。",
@@ -7451,12 +10076,22 @@ class TelegramMenuBot(TelegramTurboBot):
             if bool(getattr(self, "latent_upscale", LATENT_UPSCALE_ENABLED))
             else "兩段式上採：關閉（單段直出）"
         )
+        fused_active = (
+            getattr(self, "h3_profile", H3_PROFILE_FUSED) == H3_PROFILE_FUSED
+        )
+        profile_text = (
+            f"融合加速（{FUSED_PROFILE_STEPS} steps，SLA {'開' if h3_sla_available() else '關'}）"
+            if fused_active
+            else f"經典（{current.steps} steps，turbo LoRA）"
+        )
         menu = (
             f"{prefix}🎬 MiniMax H3 Turbo 控制面板\n"
             f"目前頁面：{section_titles.get(section, '主選單')}\n\n"
             f"模式：{mode_text}\n"
+            f"模型：{profile_text}\n"
             f"參數：{resolution_label(current.width, current.height)} | "
-            f"{current.steps} steps | {duration_text}\n"
+            f"{FUSED_PROFILE_STEPS if fused_active else current.steps} steps | "
+            f"{duration_text}\n"
             f"素材：{media_status}\n"
             f"提示詞：{prompt_status}\n"
             f"任務：{job_text}\n"
@@ -7545,30 +10180,7 @@ class TelegramMenuBot(TelegramTurboBot):
         message_id: Optional[int] = None,
     ) -> None:
         """Show one auto-refreshing progress message at the chat bottom."""
-        text = self.progress_text()
-        with self.progress_message_lock:
-            old_message_id = self.progress_message_id
-            old_chat_id = self.progress_message_chat_id
-            self.progress_message_id = None
-            self.progress_message_chat_id = None
-            self.progress_message_text = ""
-
-        if old_message_id is not None and old_chat_id:
-            try:
-                self.telegram.delete_message(old_chat_id, old_message_id)
-            except BotError:
-                pass
-
-        try:
-            result = self.telegram.send_message(chat_id, text)
-            new_message_id = result.get("message_id") if isinstance(result, dict) else None
-            if new_message_id:
-                with self.progress_message_lock:
-                    self.progress_message_id = int(new_message_id)
-                    self.progress_message_chat_id = chat_id
-                    self.progress_message_text = text
-        except BotError as exc:
-            self.send_safe(chat_id, f"顯示生成進度失敗：{exc}")
+        self._send_progress_message(chat_id)
         self.show_menu(chat_id, message_id)
 
     def show_menu(
@@ -7632,6 +10244,7 @@ class TelegramMenuBot(TelegramTurboBot):
         self.awaiting_duration = True
         self.awaiting_prompt = False
         self.awaiting_queue_prompt = False
+        self.awaiting_script_idea = False
         self.telegram.send_message(
             chat_id,
             "請輸入總片長秒數（2 至 1800），例如 37、180、600 或 1800。",
@@ -7641,18 +10254,601 @@ class TelegramMenuBot(TelegramTurboBot):
             },
         )
 
-    def request_prompt(self, chat_id: str) -> None:
+    def request_prompt(self, chat_id: str, note: str = "") -> None:
         self.awaiting_duration = False
         self.awaiting_prompt = True
         self.awaiting_queue_prompt = False
+        self.awaiting_script_idea = False
+        text = (
+            "請下一則訊息貼上提示詞，可以是多行文字。Bot 會自動讀取腳本時間軸最大秒數，"
+            "完成後回到面板按「生成影片」。"
+        )
+        if note:
+            text = note + "\n\n" + text
         self.telegram.send_message(
             chat_id,
-            "請下一則訊息貼上提示詞，可以是多行文字。完成後回到面板按「生成影片」。",
+            text,
             reply_markup={
                 "force_reply": True,
                 "input_field_placeholder": "貼上影片提示詞",
             },
         )
+
+    # --- ✨ script generator ------------------------------------------------
+    def request_script_idea(self, chat_id: str, note: str = "") -> None:
+        """Ask for a one-line idea; the duration may be embedded in the line."""
+        if not SCRIPT_GEN_ENABLED:
+            self.send_safe(
+                chat_id,
+                "腳本生成器已停用（MINIMAX_SCRIPT_GEN=0）。",
+            )
+            return
+        self.awaiting_script_idea = True
+        self.awaiting_prompt = False
+        self.awaiting_duration = False
+        self.awaiting_queue_prompt = False
+        text = (
+            "✨ 一句話生成完整腳本\n\n"
+            "直接描述你想拍的畫面，開頭或結尾加上秒數即可：\n"
+            "  • 60秒 下雨的東京街頭，一個女生錯過末班車\n"
+            "  • 30秒 貓在窗邊發呆，午後陽光\n"
+            "  • 2分鐘 賽博龐克機車追逐\n\n"
+            f"沒寫秒數就用目前的 {self.duration_label(self.total_seconds)}。\n"
+            f"腳本語言：{SCRIPT_LANG_LABEL[normalize_script_lang(getattr(self, 'script_lang', SCRIPT_LANG_DEFAULT))]}"
+            "（輸入 /lang 可切換）\n"
+            "生成約需 20–60 秒，完成後可一鍵採用或重新生成。"
+        )
+        if note:
+            text = note + "\n\n" + text
+        self.telegram.send_message(
+            chat_id,
+            text,
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "例如：60秒 下雨的車站，女生錯過末班車",
+            },
+        )
+
+    def set_script_lang(self, chat_id: str, value: str, message_id: Optional[int] = None) -> None:
+        """Switch the generated-script output language and persist it."""
+        self.script_lang = normalize_script_lang(value)
+        self.save_settings()
+        label = SCRIPT_LANG_LABEL[self.script_lang]
+        extra = (
+            "\n（H3 以英文語料為主，英文運鏡描述通常最穩定；簡中完全可用。）"
+            if self.script_lang == SCRIPT_LANG_ZH
+            else "\n（英文是 H3 訓練語料的主要語言，動態與運鏡描述最穩定。）"
+        )
+        notice = f"腳本語言已切換為：{label}{extra}"
+        if message_id is not None:
+            self.show_menu(chat_id, message_id, notice)
+        else:
+            self.show_menu(chat_id, notice=notice)
+
+    def show_script_prompt_file(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        """Show the custom-instruction file: path, status and its live content."""
+        created = ensure_script_prompt_file()
+        custom, status = load_custom_script_instructions()
+        lines = [
+            "📝 自訂指令（會附加到每次生成的系統提示後段）",
+            "",
+            f"狀態：{status}",
+            "",
+            "以 # 開頭的行是註解，不會送出。",
+            "改完立即生效，不必重啟 Bot。",
+        ]
+        if created:
+            lines += ["", created]
+        if custom:
+            lines += ["", "── 目前實際送出的內容 ──", custom]
+        else:
+            lines += ["", "目前沒有任何自訂指令。"]
+
+        markup = {
+            "inline_keyboard": [
+                [{"text": "✏️ 編輯（整段取代）", "callback_data": "script_file:edit"}],
+                [{"text": "➕ 追加一條規則", "callback_data": "script_file:append"}],
+                [
+                    {"text": "🗑 清空", "callback_data": "script_file:clear"},
+                    {"text": "↩️ 還原上一版", "callback_data": "script_file:undo"},
+                ],
+                [{"text": "🔄 重新整理", "callback_data": "script_file"}],
+            ]
+        }
+        text = "\n".join(lines)
+        try:
+            if message_id is not None:
+                self.telegram.edit_message_text(chat_id, message_id, text, reply_markup=markup)
+            else:
+                self.telegram.send_message(chat_id, text, reply_markup=markup)
+        except BotError:
+            self.send_long_text(chat_id, text)
+
+    def request_custom_prompt(self, chat_id: str, mode: str) -> None:
+        """Ask for custom instruction text typed straight into Telegram."""
+        self.awaiting_custom_prompt = mode  # "replace" | "append"
+        self.awaiting_prompt = False
+        self.awaiting_script_idea = False
+        self.awaiting_duration = False
+        self.awaiting_queue_prompt = False
+        current, _ = load_custom_script_instructions()
+        if mode == "append":
+            hint = (
+                "請輸入要「追加」的規則，一則訊息可以寫多行。\n"
+                f"目前已有 {len(current)} 字元，新的會接在後面。"
+                if current
+                else "目前沒有內容，這則會成為第一條規則。"
+            )
+            placeholder = "例如：運鏡一律緩慢，不要手持晃動"
+        else:
+            hint = (
+                "請輸入「完整」的自訂指令內容（會整段取代現有內容）。\n"
+                "一則訊息可以寫多行；不需要寫 # 註解。\n"
+                f"目前內容 {len(current)} 字元，送出後可用「↩️ 還原上一版」復原。"
+            )
+            placeholder = "例如：運鏡一律緩慢。不要出現浮水印。"
+        self.telegram.send_message(
+            chat_id,
+            f"📝 {hint}\n\n隨時可用 /cancel 取消。",
+            reply_markup={"force_reply": True, "input_field_placeholder": placeholder},
+        )
+
+    def handle_custom_prompt_text(self, chat_id: str, text: str) -> None:
+        """Apply text typed in Telegram to the custom instruction file."""
+        mode = str(getattr(self, "awaiting_custom_prompt", "") or "")
+        self.awaiting_custom_prompt = ""
+
+        body = (text or "").strip()
+        if not body:
+            self.send_safe(chat_id, "內容是空的，已取消。")
+            self.show_script_prompt_file(chat_id)
+            return
+
+        if mode == "append":
+            current, _ = load_custom_script_instructions()
+            combined = f"{current}\n{body}" if current else body
+            ok, note = save_custom_script_instructions(combined, "由 Telegram 追加")
+        else:
+            ok, note = save_custom_script_instructions(body, "由 Telegram 編輯")
+
+        if not ok:
+            self.send_safe(chat_id, f"⚠️ {note}")
+            return
+
+        # Prove the file is genuinely in effect by showing what will be sent.
+        saved, status = load_custom_script_instructions()
+        self.send_long_text(
+            chat_id,
+            f"✅ {note}（{status}）\n\n"
+            "── 之後每次生成都會送出 ──\n"
+            f"{saved}\n\n"
+            "立即生效，不需要重啟。",
+        )
+        self.show_script_prompt_file(chat_id)
+
+    def handle_script_idea(self, chat_id: str, text: str) -> None:
+        """Kick off script generation in the background."""
+        if self.script_busy:
+            self.send_safe(chat_id, "上一個腳本還在生成中，請稍候。")
+            return
+        seconds, idea = parse_idea_duration(text)
+        if seconds is None:
+            seconds = float(self.total_seconds)
+        if not idea:
+            self.send_safe(chat_id, "請描述你想拍的畫面，例如：60秒 下雨的車站，女生錯過末班車")
+            return
+
+        self.awaiting_script_idea = False
+        self.script_idea = idea
+        self.script_seconds = float(seconds)
+        self.script_busy = True
+        # A brand-new idea starts a fresh editing session; dropping the history
+        # prevents "undo" from jumping back into an unrelated script.
+        self.script_draft = None
+        self.script_history = []
+
+        self.send_safe(
+            chat_id,
+            f"✨ 正在用本機 LLM 生成 {self.duration_label(seconds)} 腳本…\n"
+            f"想法：{idea}\n\n首次約需 20–60 秒，請稍候。",
+        )
+        thread = threading.Thread(
+            target=self._script_worker,
+            args=(chat_id,),
+            name="h3-script-generator",
+            daemon=True,
+        )
+        thread.start()
+
+    def _ensure_llm_ready(self, chat_id: str) -> None:
+        """Make sure the local LLM can answer, waiting out a model load.
+
+        Right after a generation the Bot restarts the LLM itself and it spends
+        about a minute reading ~22GB of weights (503 "Loading model"). Saying
+        "not started, starting it" during that window is both wrong and alarming,
+        so the two states are reported separately.
+        """
+        if llama_is_online():
+            return
+        # NOTE: the VRAM guard against a model-holding ComfyUI lives inside
+        # start_llama_process(), so it covers this path and every other entry
+        # point from one place.
+        if llama_server_responding():
+            self.send_safe(
+                chat_id,
+                "🧠 本機 LLM 正在載入模型（剛生成完會自動重啟），請稍候…",
+            )
+        else:
+            self.send_safe(chat_id, "🧠 本機 LLM 未啟動，正在啟動…")
+            try:
+                self.send_safe(chat_id, start_llama_process())
+            except (BotError, OSError) as exc:
+                raise BotError(f"無法啟動本機 LLM：{exc}") from exc
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            if llama_is_online():
+                break
+            time.sleep(3)
+        else:
+            raise BotError("本機 LLM 在 300 秒內沒有就緒。")
+        self.send_safe(chat_id, "🧠 本機 LLM 已就緒。")
+
+    def _script_progress(self, chat_id: str):
+        """Callback shared by generation and refinement attempts."""
+
+        def progress(attempt: int, total: int, last_error: str) -> None:
+            if attempt > 1:
+                self.send_safe(
+                    chat_id,
+                    f"🔁 第 {attempt}/{total} 次嘗試（上次：{last_error[:120]}）",
+                )
+            self.telegram.send_chat_action(chat_id, "typing")
+
+        return progress
+
+    def _script_lang(self) -> str:
+        return normalize_script_lang(
+            getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
+        )
+
+    def _draft_seconds(self) -> float:
+        """Duration to validate the current draft against.
+
+        A hand-edited timeline states its own length, which wins; otherwise fall
+        back to the length the draft was written for.
+        """
+        detected = detect_prompt_total_seconds(self.script_draft or "")
+        if detected is not None:
+            return float(detected)
+        return float(getattr(self, "script_seconds", 0) or self.total_seconds)
+
+    def _set_script_draft(self, script: str, label: str) -> None:
+        """Replace the draft, keeping the previous revision for undo."""
+        previous = self.script_draft
+        if previous and previous != script:
+            self.script_history.append(previous)
+            # Bounded so a long editing session cannot grow without limit.
+            if len(self.script_history) > 30:
+                del self.script_history[0]
+        self.script_draft = script
+        self.script_last_action = label
+
+    def _script_worker(self, chat_id: str) -> None:
+        """Generate, self-repair and report a script without blocking polling."""
+        progress = self._script_progress(chat_id)
+        try:
+            self._ensure_llm_ready(chat_id)
+            script, log = generate_h3_script(
+                self.script_idea,
+                self.script_seconds,
+                self.input_mode,
+                on_progress=progress,
+                lang=self._script_lang(),
+                continuity=self.script_continuity,
+            )
+        except (BotError, OSError) as exc:
+            self.script_busy = False
+            bot_log(f"script generator failed: {exc}")
+            self.send_safe(chat_id, f"❌ 腳本生成失敗：{exc}")
+            return
+
+        self.script_busy = False
+        # Route through _set_script_draft so a regenerate is also undoable.
+        self._set_script_draft(script, "重新生成")
+        bot_log("script generator: " + " | ".join(log))
+        self.show_script_draft(chat_id, script, "\n".join(log))
+
+    def send_long_text(self, chat_id: str, text: str) -> None:
+        """Send text longer than Telegram's 4096 character message limit."""
+        limit = 3500
+        remaining = text
+        while remaining:
+            if len(remaining) <= limit:
+                chunk, remaining = remaining, ""
+            else:
+                split = remaining.rfind("\n\n", 0, limit)
+                if split < limit // 2:
+                    split = remaining.rfind("\n", 0, limit)
+                if split < limit // 2:
+                    split = limit
+                chunk, remaining = remaining[:split], remaining[split:].lstrip("\n")
+            self.send_safe(chat_id, chunk)
+
+    def show_script_draft(self, chat_id: str, script: str, log: str = "") -> None:
+        """Present the draft with accept, repeated-edit and discard actions."""
+        seconds = self._draft_seconds()
+        detected = detect_prompt_total_seconds(script)
+        revision = len(self.script_history)
+        title = f"✨ 腳本草稿（第 {revision + 1} 版，{self.duration_label(detected or self.script_seconds)}）"
+        if log:
+            title += f"\n{log}"
+        title += "\n" + "─" * 18
+        self.send_long_text(chat_id, f"{title}\n\n{script}")
+
+        ok, message = _script_accepts(script, seconds)
+        mode_note = {
+            INPUT_MODE_IMAGE: "🖼 I2VA：已依「不重述圖片外觀」規則生成",
+            INPUT_MODE_FL2VA: "🎬 FL2VA：只描述首尾幀之間的中間過程",
+            INPUT_MODE_REF2VA: "📚 Ref2VA：已鎖人物外貌、場景寫在提示詞內",
+        }.get(self.input_mode, "📝 T2VA：完整時間軸")
+
+        status = f"✅ 格式檢查通過：{message}" if ok else f"⚠️ 格式檢查未通過：{message}"
+        rows: list[list[dict[str, str]]] = [
+            [{"text": "✅ 採用並生成影片", "callback_data": "script:accept_run"}],
+            [{"text": "📥 只採用（回面板）", "callback_data": "script:accept"}],
+            [
+                {"text": "🤖 指令修改（AI）", "callback_data": "script:refine"},
+                {"text": "✏️ 手動編輯", "callback_data": "script:edit"},
+            ],
+            [
+                {"text": "➕ 追加內容", "callback_data": "script:append"},
+                {"text": "🔄 重新生成", "callback_data": "script:regen"},
+            ],
+        ]
+        if self.script_history:
+            rows.append(
+                [
+                    {
+                        "text": f"↩️ 回到上一版（共 {len(self.script_history)} 版可退）",
+                        "callback_data": "script:undo",
+                    }
+                ]
+            )
+        rows.append([{"text": "❌ 放棄", "callback_data": "script:cancel"}])
+
+        hint = (
+            "可以一直改下去：\n"
+            "  • 🤖 指令修改 — 用一句話叫 AI 改（例如「運鏡再慢一點」）\n"
+            "  • ✏️ 手動編輯 — 直接貼上你要的完整內容\n"
+            "  • ➕ 追加內容 — 在現有內容後面補一段\n"
+            "每改一次都會自動保留上一版，可隨時退回。"
+        )
+        if not ok:
+            hint += (
+                "\n\n⚠️ 目前格式未通過，直接生成會被拒絕。"
+                "長片必須是連續、無缺口的時間軸；可手動修正或按上一版退回。"
+            )
+        self.telegram.send_message(
+            chat_id,
+            f"{mode_note}\n字數 {len(script)}｜{status}",
+            reply_markup={"inline_keyboard": rows},
+        )
+        self.send_safe(chat_id, hint)
+
+    def request_script_edit(self, chat_id: str, mode: str) -> None:
+        """Ask for replacement or additional script text typed in Telegram."""
+        if not self.script_draft:
+            self.send_safe(chat_id, "目前沒有草稿，請先按「✨ 生成腳本」。")
+            return
+        self.awaiting_script_edit = mode  # "replace" | "append"
+        self.awaiting_script_refine = False
+        self.awaiting_script_idea = False
+        self.awaiting_custom_prompt = ""
+        if mode == "append":
+            hint = (
+                "請輸入要「追加」到草稿後面的內容，一則訊息可多行。\n"
+                "現有內容會保留，新的接在後面。"
+            )
+            placeholder = "例如：結尾再加一個鏡頭，雨停了"
+        else:
+            hint = (
+                "請貼上「完整」的腳本內容（會整段取代目前草稿）。\n"
+                "一則訊息可多行；送出後可用「↩️ 回到上一版」復原。"
+            )
+            placeholder = "貼上完整腳本"
+        self.telegram.send_message(
+            chat_id,
+            f"✏️ {hint}\n\n隨時可用 /cancel 取消。",
+            reply_markup={"force_reply": True, "input_field_placeholder": placeholder},
+        )
+
+    def handle_script_edit_text(self, chat_id: str, text: str) -> None:
+        """Apply hand-typed script text and re-check it against the validator."""
+        mode = str(getattr(self, "awaiting_script_edit", "") or "")
+        self.awaiting_script_edit = ""
+        body = (text or "").strip()
+        if not body:
+            self.send_safe(chat_id, "內容是空的，已取消。")
+            self.show_script_draft(chat_id, self.script_draft or "")
+            return
+
+        draft = self.script_draft or ""
+        if mode == "append":
+            new = f"{draft}\n{body}".strip() if draft else body
+            label = "手動追加"
+        else:
+            new = body
+            label = "手動編輯"
+
+        self._set_script_draft(new, label)
+        # A hand edit is accepted even when it breaks the format: the user may be
+        # fixing a long timeline in several steps, and blocking the save would
+        # make that impossible. The draft view states the result plainly instead.
+        self.show_script_draft(chat_id, new, f"{label}後重新檢查：")
+
+    def request_script_refine(self, chat_id: str) -> None:
+        """Ask for a one-line instruction that the LLM applies to the draft."""
+        if not self.script_draft:
+            self.send_safe(chat_id, "目前沒有草稿，請先按「✨ 生成腳本」。")
+            return
+        self.awaiting_script_refine = True
+        self.awaiting_script_edit = ""
+        self.awaiting_script_idea = False
+        self.awaiting_custom_prompt = ""
+        self.telegram.send_message(
+            chat_id,
+            "🤖 請用一句話說明要怎麼改（AI 會重寫整份腳本）：\n\n"
+            "  • 運鏡再慢一點，多用推近\n"
+            "  • 把時間改到清晨，光線更冷\n"
+            "  • 第二幕太長，動作拆細一點\n"
+            "  • 結尾改成她轉頭看鏡頭\n\n"
+            f"要改幾次都可以。隨時可用 /cancel 取消。",
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "例如：運鏡再慢一點",
+            },
+        )
+
+    def handle_script_refine_text(self, chat_id: str, instruction: str) -> None:
+        """Run one LLM refinement round in the background."""
+        if self.script_busy:
+            self.send_safe(chat_id, "上一次修改還在進行中，請稍候。")
+            return
+        if not self.script_draft:
+            self.send_safe(chat_id, "目前沒有草稿，請先按「✨ 生成腳本」。")
+            return
+        body = (instruction or "").strip()
+        if not body:
+            self.send_safe(chat_id, "沒有收到修改指令，已取消。")
+            return
+
+        self.awaiting_script_refine = False
+        self.script_refine_instruction = body
+        self.script_busy = True
+        self.send_safe(chat_id, f"🤖 正在依指令修改腳本…\n「{body}」\n\n約需 20–60 秒。")
+        threading.Thread(
+            target=self._script_refine_worker,
+            args=(chat_id,),
+            name="h3-script-refiner",
+            daemon=True,
+        ).start()
+
+    def _script_refine_worker(self, chat_id: str) -> None:
+        """Apply one refinement, validating before it replaces the draft."""
+        progress = self._script_progress(chat_id)
+        draft = self.script_draft or ""
+        try:
+            self._ensure_llm_ready(chat_id)
+            script, log = refine_h3_script(
+                draft,
+                self.script_refine_instruction,
+                self._draft_seconds(),
+                self.input_mode,
+                on_progress=progress,
+                lang=self._script_lang(),
+                continuity=self.script_continuity,
+            )
+        except (BotError, OSError) as exc:
+            self.script_busy = False
+            bot_log(f"script refine failed: {exc}")
+            self.send_safe(
+                chat_id,
+                f"❌ 修改失敗：{exc}\n\n草稿維持原樣，可以換個說法再試。",
+            )
+            return
+
+        self.script_busy = False
+        # Only a validated result replaces the draft, so a failed refinement can
+        # never destroy a good script the user already had.
+        self._set_script_draft(script, "指令修改")
+        bot_log("script refine: " + " | ".join(log))
+        self.show_script_draft(
+            chat_id, script, f"指令：{self.script_refine_instruction}\n" + "\n".join(log)
+        )
+
+    def undo_script_draft(self, chat_id: str) -> None:
+        """Step back to the previous draft revision."""
+        if not self.script_history:
+            self.send_safe(chat_id, "沒有更早的版本可以退回。")
+            return
+        previous = self.script_history.pop()
+        self.script_draft = previous
+        self.show_script_draft(
+            chat_id,
+            previous,
+            f"已退回上一版（還有 {len(self.script_history)} 版可退）",
+        )
+
+    def accept_script_draft(self, chat_id: str, message_id: Optional[int], run_now: bool) -> None:
+        """Make the draft the active prompt, optionally starting generation."""
+        script = self.script_draft
+        if not script:
+            self.send_safe(chat_id, "草稿已過期，請重新按「✨ 生成腳本」。")
+            return
+        self.prompt = script
+        self.continuity_source_script = script
+        self.awaiting_prompt = False
+        detected = self.auto_detect_prompt_duration(script, persist=True)
+        adjusted_from: Optional[float] = None
+        if detected is None:
+            # A short (<= 15s) script is plain prose with no timeline, so its
+            # duration cannot be recovered from the text. Apply the duration the
+            # script was actually written for. Without this, a leftover longer
+            # setting sends prose down the long-video path, where
+            # build_long_video_plan() rejects it with "必須提供時間軸" - the
+            # script looks fine in chat but can never be generated.
+            target = min(
+                float(getattr(self, "script_seconds", 0) or 0), MAX_SEGMENT_SECONDS
+            )
+            if target >= MIN_TOTAL_SECONDS:
+                previous = float(getattr(self, "total_seconds", 0) or 0)
+                try:
+                    self.set_total_seconds(target)
+                except (BotError, ValueError):
+                    pass
+                else:
+                    detected = self.total_seconds
+                    if abs(previous - detected) > 0.001:
+                        adjusted_from = previous
+        self.save_settings()
+        if detected is None:
+            note = "已採用腳本"
+        elif adjusted_from is not None:
+            note = (
+                f"已採用腳本，片長由 {self.duration_label(adjusted_from)} "
+                f"調整為 {self.duration_label(detected)}"
+                "（短片散文腳本沒有時間軸，需用短片片長生成）"
+            )
+        else:
+            note = f"已採用腳本，片長 {self.duration_label(detected)}"
+        if not run_now:
+            self.show_menu(chat_id, notice=note + "，按「🚀 生成影片」開始。")
+            return
+
+        if message_id is not None:
+            self.show_menu(chat_id, message_id, note + "，開始生成。")
+        else:
+            self.show_menu(chat_id, note=note + "，開始生成。")
+        try:
+            self.start_selected_generation(chat_id, script)
+        except (BotError, ValueError) as exc:
+            self.send_safe(chat_id, f"生成失敗：{exc}")
+
+    def regenerate_script(self, chat_id: str) -> None:
+        if self.script_busy:
+            self.send_safe(chat_id, "上一版還在生成中，請稍候。")
+            return
+        if not self.script_idea:
+            self.request_script_idea(chat_id)
+            return
+        self.script_busy = True
+        self.send_safe(chat_id, "🔄 正在重新生成腳本…")
+        threading.Thread(
+            target=self._script_worker,
+            args=(chat_id,),
+            name="h3-script-generator",
+            daemon=True,
+        ).start()
 
     def comfy_status_text(self) -> str:
         if comfyui_is_online():
@@ -7826,16 +11022,27 @@ class TelegramMenuBot(TelegramTurboBot):
                     notice = "FL2VA 首幀和尾幀都已收到；現在輸入提示詞即可生成。"
                 if caption:
                     self.prompt = caption
+                    self.auto_detect_prompt_duration(caption)
                 self.awaiting_prompt = False
                 self.awaiting_duration = False
                 self.save_settings()
                 self.show_menu(chat_id, notice=notice)
                 return
-            if self.input_mode == INPUT_MODE_REF2VA:
+            if is_ref2va_like(self.input_mode):
+                mode_label = (
+                    "YUPI" if self.input_mode == INPUT_MODE_YUPI else "Ref2VA"
+                )
                 if len(self.reference_image_paths) >= MAX_REF2VA_IMAGES:
-                    self.send_safe(chat_id, f"Ref2VA 最多支援 {MAX_REF2VA_IMAGES} 張參考圖。")
+                    self.send_safe(
+                        chat_id,
+                        f"{mode_label} 最多支援 {MAX_REF2VA_IMAGES} 張參考圖。",
+                    )
                     return
                 REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+                if not self.reference_image_paths:
+                    # A first uploaded image starts a new reference set, so the
+                    # previous story's continuity contract no longer applies.
+                    self.script_continuity = ""
                 target_path = (
                     REFERENCE_DIR
                     / f"ref_image_{len(self.reference_image_paths) + 1:02d}{suffix}"
@@ -7844,14 +11051,15 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.reference_image_paths.append(target_path)
                 if caption:
                     self.prompt = caption
+                    self.auto_detect_prompt_duration(caption)
                 self.awaiting_prompt = False
                 self.awaiting_duration = False
                 self.save_settings()
                 self.show_menu(
                     chat_id,
                     notice=(
-                        f"Ref2VA 已收到第 {len(self.reference_image_paths)} 張參考圖；"
-                        "可繼續上傳，完成後按「完成參考素材上傳」。"
+                        f"{mode_label} 已收到第 {len(self.reference_image_paths)} 張參考圖；"
+                        "完成後按「✅ 完成參考素材上傳」。"
                     ),
                 )
                 return
@@ -7869,6 +11077,7 @@ class TelegramMenuBot(TelegramTurboBot):
             self.awaiting_duration = False
             if caption:
                 self.prompt = caption
+                self.auto_detect_prompt_duration(caption)
             self.save_settings()
             if caption:
                 self.show_menu(chat_id, notice="图片和提示詞已收到")
@@ -7907,6 +11116,7 @@ class TelegramMenuBot(TelegramTurboBot):
             caption = str(message.get("caption", "")).strip()
             if caption:
                 self.prompt = caption
+                self.auto_detect_prompt_duration(caption)
             self.save_settings()
             self.show_menu(
                 chat_id,
@@ -8004,8 +11214,17 @@ class TelegramMenuBot(TelegramTurboBot):
         self.awaiting_extension_duration = False
         self.awaiting_extension_prompt = False
         self.awaiting_queue_prompt = False
+        detected = self.auto_detect_prompt_duration(prompt)
         self.save_settings()
-        self.show_menu(chat_id, notice=f"已讀取 {file_name}，提示詞已更新（{len(prompt)} 字）")
+        duration_note = (
+            f"；已自動設定片長 {self.duration_label(detected)}"
+            if detected is not None
+            else ""
+        )
+        self.show_menu(
+            chat_id,
+            notice=f"已讀取 {file_name}，提示詞已更新（{len(prompt)} 字）{duration_note}",
+        )
 
     def handle_message(self, message: dict[str, Any]) -> None:
         chat_id = str(message.get("chat", {}).get("id", ""))
@@ -8033,6 +11252,30 @@ class TelegramMenuBot(TelegramTurboBot):
             # Editing the old inline panel does not scroll Telegram back to it.
             # Send a fresh panel at the current chat position instead.
             self.show_menu(chat_id, force_new=True, section=MENU_MAIN)
+            return
+        if self.awaiting_script_edit and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            self.handle_script_edit_text(chat_id, text)
+            return
+        if self.awaiting_script_refine and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            self.handle_script_refine_text(chat_id, text)
+            return
+        if self.awaiting_custom_prompt and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            self.handle_custom_prompt_text(chat_id, text)
+            return
+        if self.awaiting_script_idea and text.lower() != "/cancel":
+            if text.startswith("/"):
+                self.handle_command(chat_id, text)
+                return
+            self.handle_script_idea(chat_id, text)
             return
         if self.awaiting_extension_duration and text.lower() != "/cancel":
             if text.startswith("/"):
@@ -8083,9 +11326,16 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.handle_command(chat_id, text)
                 return
             self.prompt = text
+            self.continuity_source_script = text
             self.awaiting_prompt = False
+            detected = self.auto_detect_prompt_duration(text)
             self.save_settings()
-            self.show_menu(chat_id, notice="提示詞已更新")
+            duration_note = (
+                f"；已自動設定片長 {self.duration_label(detected)}"
+                if detected is not None
+                else ""
+            )
+            self.show_menu(chat_id, notice=f"提示詞已更新{duration_note}")
             return
         if text.startswith("/"):
             self.handle_command(chat_id, text)
@@ -8196,7 +11446,142 @@ class TelegramMenuBot(TelegramTurboBot):
         self.reference_image_paths = []
         self.reference_video_paths = []
         self.reference_audio_paths = []
+        self.script_continuity = ""
         self.save_settings()
+
+    # --- tail-frame reference handoff --------------------------------------
+    def offer_tail_reference(self, chat_id: str, video_path: Path) -> None:
+        """Send the finished video's last two frames and offer them as new refs.
+
+        Best-effort: this runs after a successful delivery, so every failure
+        path only logs and the delivery itself is never affected.
+        """
+        if not TAIL_REF_OFFER_ENABLED:
+            return
+        try:
+            token, frames = extract_tail_frames(video_path, 2)
+        except Exception as exc:  # noqa: BLE001 - cosmetic feature
+            bot_log(f"tail reference extraction failed: {exc}")
+            return
+        if not frames:
+            bot_log(f"tail reference: no frames extracted from {video_path}")
+            return
+        try:
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "✅ 清空參考圖，用這兩帧做新參考圖",
+                            "callback_data": f"tailref:yes:{token}",
+                        }
+                    ],
+                    [
+                        {
+                            "text": "❌ 保留原本參考圖",
+                            "callback_data": f"tailref:no:{token}",
+                        }
+                    ],
+                ]
+            }
+            if len(frames) > 1:
+                self.telegram.send_photo(
+                    chat_id,
+                    frames[0],
+                    "📸 片段最後兩帧（可以直接變成下一段嘅參考圖）",
+                )
+                self.telegram.send_photo(
+                    chat_id,
+                    frames[-1],
+                    "最後一帧。",
+                    reply_markup=keyboard,
+                )
+            else:
+                self.telegram.send_photo(
+                    chat_id,
+                    frames[0],
+                    "📸 片段最後一帧（可以直接變成下一段嘅參考圖）",
+                    reply_markup=keyboard,
+                )
+            bot_log(f"tail reference offered: token={token} frames={len(frames)}")
+        except BotError as exc:
+            bot_log(f"tail reference offer failed: {exc}")
+
+    def handle_tailref_callback(
+        self, chat_id: str, message_id: Optional[int], data: str
+    ) -> None:
+        """Handle the ✅/❌ buttons that follow a tail-frame offer."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        token = parts[2] if len(parts) > 2 else ""
+
+        def drop_keyboard() -> None:
+            if message_id is None:
+                return
+            try:
+                self.telegram.clear_inline_keyboard(chat_id, message_id)
+            except BotError:
+                pass
+
+        if action != "yes":
+            drop_keyboard()
+            self.send_safe(chat_id, "❌ 保留原本參考圖，冇改動。")
+            return
+
+        frames = tail_reference_frames(token)
+        if not frames:
+            drop_keyboard()
+            self.send_safe(chat_id, "⚠️ 搵唔到嗰兩帧（可能已被清理），今次冇改動。")
+            return
+
+        try:
+            REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+            for old in REFERENCE_DIR.glob("ref_image_*"):
+                if old.is_file():
+                    old.unlink(missing_ok=True)
+            new_paths: list[Path] = []
+            for index, frame in enumerate(frames[:2], start=1):
+                destination = REFERENCE_DIR / f"ref_image_{index:02d}.jpg"
+                shutil.copyfile(frame, destination)
+                new_paths.append(destination)
+        except OSError as exc:
+            drop_keyboard()
+            self.send_safe(chat_id, f"⚠️ 更新參考圖失敗：{exc}")
+            return
+
+        self.reference_image_paths = new_paths
+        source = (
+            (getattr(self, "continuity_source_script", "") or "").strip()
+            or (getattr(self, "prompt", "") or "").strip()
+        )
+        if len(source) > 4000:
+            source = source[:4000].rstrip() + "\n……（劇本太長，已截斷）"
+        self.script_continuity = TAIL_CONTINUITY_NOTE
+        if source:
+            self.script_continuity += (
+                "\n\n【上一段劇本（最新一條片用嘅；只寫之後發生嘅事）】\n"
+                + source
+                + "\n【上一段劇本完】"
+            )
+        self.save_settings()
+        bot_log(f"tail reference promoted: {[str(path) for path in new_paths]}")
+
+        drop_keyboard()
+        note = (
+            f"✅ 已清空舊參考圖，改用呢 {len(new_paths)} 帧（片段尾帧）做新參考圖。\n"
+            + (
+                "🔗 已記住上一段劇本：跟住發一句「想法」，本地 LLM 會讀住上一段幫你寫延續嘅"
+                "新腳本（同一人物、同一場景、由尾帧動作接落去，唔會重複演過嘅嘢）。\n"
+                if source
+                else "🔗 新一段會當作「上一幕嘅延續」生成（同一人物、同一場景、由尾帧動作接落去）。\n"
+            )
+            + "（想自己貼完整提示詞：面板「✍️ 輸入／更換提示詞」。）"
+        )
+        if (
+            normalize_input_mode(getattr(self, "input_mode", INPUT_MODE_TEXT))
+            != INPUT_MODE_REF2VA
+        ):
+            note += "\n（提醒：目前唔係 Ref2VA 模式，參考圖要切去 Ref2VA 先會用到。）"
+        self.request_script_idea(chat_id, note=note)
 
     def handle_callback(self, callback: dict[str, Any]) -> None:
         query_id = str(callback.get("id", ""))
@@ -8212,10 +11597,78 @@ class TelegramMenuBot(TelegramTurboBot):
         data = str(callback.get("data", ""))
         message_id = message.get("message_id")
         try:
+            if data.startswith("tailref:"):
+                self.handle_tailref_callback(chat_id, message_id, data)
+                return
             if data.startswith("upscale:"):
                 self.handle_upscale_callback(chat_id, message_id, data)
                 return
             if data == "noop":
+                return
+            if data == "script_file":
+                self.show_script_prompt_file(chat_id, message_id)
+                return
+            if data.startswith("script_file:"):
+                action = data.removeprefix("script_file:")
+                if action == "edit":
+                    self.request_custom_prompt(chat_id, "replace")
+                elif action == "append":
+                    self.request_custom_prompt(chat_id, "append")
+                elif action == "clear":
+                    ok, note = save_custom_script_instructions("", "由 Telegram 清空")
+                    self.send_safe(
+                        chat_id,
+                        f"🗑 {note}" if ok else f"⚠️ {note}",
+                    )
+                    self.show_script_prompt_file(chat_id, message_id)
+                elif action == "undo":
+                    ok, note = restore_custom_script_instructions()
+                    self.send_safe(
+                        chat_id,
+                        f"↩️ {note}" if ok else f"⚠️ {note}",
+                    )
+                    self.show_script_prompt_file(chat_id, message_id)
+                return
+            if data.startswith("script_lang:"):
+                action = data.removeprefix("script_lang:")
+                if action == "toggle":
+                    current = normalize_script_lang(
+                        getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
+                    )
+                    target = (
+                        SCRIPT_LANG_EN
+                        if current == SCRIPT_LANG_ZH
+                        else SCRIPT_LANG_ZH
+                    )
+                else:
+                    target = normalize_script_lang(action)
+                self.set_script_lang(chat_id, target, message_id)
+                return
+            if data.startswith("script:"):
+                action = data.removeprefix("script:")
+                if action == "new":
+                    self.request_script_idea(chat_id)
+                elif action == "accept":
+                    self.accept_script_draft(chat_id, message_id, run_now=False)
+                elif action == "accept_run":
+                    self.accept_script_draft(chat_id, message_id, run_now=True)
+                elif action == "regen":
+                    self.regenerate_script(chat_id)
+                elif action == "cancel":
+                    self.script_draft = None
+                    self.script_history = []
+                    self.script_busy = False
+                    self.awaiting_script_edit = ""
+                    self.awaiting_script_refine = False
+                    self.show_menu(chat_id, message_id, "已放棄腳本草稿。")
+                elif action == "edit":
+                    self.request_script_edit(chat_id, "replace")
+                elif action == "append":
+                    self.request_script_edit(chat_id, "append")
+                elif action == "refine":
+                    self.request_script_refine(chat_id)
+                elif action == "undo":
+                    self.undo_script_draft(chat_id)
                 return
             if data.startswith("menu:"):
                 self.menu_section = normalize_menu_section(data.removeprefix("menu:"))
@@ -8316,8 +11769,29 @@ class TelegramMenuBot(TelegramTurboBot):
                     "已選 Ref2VA：可連續上傳參考圖片／影片／音訊，完成後按按鈕。",
                 )
                 return
+            if data == "mode:yupi":
+                # 🌙 YUPI工作流：a real mode now. Selecting it only stages the
+                # mode; the user uploads a reference image, types a prompt, then
+                # presses 🚀 生成影片 — same flow as every other mode.
+                self.input_mode = INPUT_MODE_YUPI
+                self.save_settings()
+                self.show_menu(
+                    chat_id,
+                    message_id,
+                    "已選 YUPI工作流（Ref2VA + AfterMidnight + FastH3 6步）："
+                    "上傳參考圖、輸入提示詞，再按「🚀 生成影片」。",
+                )
+                return
             if data == "media_done":
-                if self.input_mode == INPUT_MODE_REF2VA and not (
+                if self.input_mode == INPUT_MODE_YUPI:
+                    if not any(
+                        path.is_file() for path in self.reference_image_paths
+                    ) and not (
+                        self.image_path is not None and self.image_path.is_file()
+                    ):
+                        self.send_safe(chat_id, "YUPI 尚未收到參考圖片。")
+                        return
+                elif self.input_mode == INPUT_MODE_REF2VA and not (
                     self.reference_image_paths
                     or self.reference_video_paths
                     or self.reference_audio_paths
@@ -8411,6 +11885,53 @@ class TelegramMenuBot(TelegramTurboBot):
                     )
                 self.show_menu(chat_id, message_id, note)
                 return
+            if data == "continuity_toggle":
+                current = getattr(self, "long_continuity", "motion_context")
+                self.long_continuity = (
+                    "tail_frame" if current == "motion_context" else "motion_context"
+                )
+                self.save_settings()
+                if self.long_continuity == "motion_context":
+                    note = (
+                        "長片接續：已切換為 Motion Context。\n"
+                        "第 2 鏡起接續上一鏡的 AV latent 與尾幀，動作與音訊更連貫。\n"
+                        "需要 4 個 Motion Context 節點；若缺少會自動退回尾幀接續。"
+                    )
+                else:
+                    note = (
+                        "長片接續：已切換為尾幀接續。\n"
+                        "第 2 鏡起只接上一鏡尾幀，每鏡重新生成原生音訊（較穩定）。"
+                    )
+                self.show_menu(chat_id, message_id, note)
+                return
+            if data == "h3_profile_toggle":
+                current = getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
+                self.h3_profile = (
+                    H3_PROFILE_FUSED
+                    if current != H3_PROFILE_FUSED
+                    else H3_PROFILE_CLASSIC
+                )
+                self.save_settings()
+                if self.h3_profile == H3_PROFILE_FUSED:
+                    sla_note = (
+                        "SLA 稀疏注意力：已偵測到，會自動插入（約快 40%、音訊高頻更好）。"
+                        if h3_sla_available()
+                        else "⚠️ 未偵測到 H3 SLA 節點，這次會用稠密注意力（較慢、音訊較悶）。"
+                    )
+                    note = (
+                        "模型：已切換為融合加速。\n"
+                        "單一 21GB 檔同時支援 T2VA／I2VA／FL2VA／Ref2VA，"
+                        "turbo 與 Mystic 已烤進權重（不掛 LoRA），固定 6 步。\n"
+                        f"{sla_note}\n"
+                        "YUPI 工作流不受影響。"
+                    )
+                else:
+                    note = (
+                        "模型：已切換為經典。\n"
+                        "FL2VA／Ref2VA 分開載入 + turbo LoRA，步數吃面板設定。"
+                    )
+                self.show_menu(chat_id, message_id, note)
+                return
             if data.startswith("vram:"):
                 mode = normalize_comfyui_vram_mode(data.removeprefix("vram:"))
                 self.vram_mode = mode
@@ -8469,6 +11990,29 @@ class TelegramMenuBot(TelegramTurboBot):
                 except BotError as exc:
                     self.send_safe(chat_id, str(exc))
                 return
+            if data == "llm_after_job_toggle":
+                self.restart_llm_after_generation = not bool(
+                    getattr(
+                        self,
+                        "restart_llm_after_generation",
+                        RESTART_LLM_AFTER_GENERATION,
+                    )
+                )
+                self.save_settings()
+                if self.restart_llm_after_generation:
+                    note = (
+                        "生成後自動啟動 LLM：已開啟。\n"
+                        "每個生成任務完成後，Bot 會先關閉 ComfyUI 釋放顯存，"
+                        "再自動啟動本地 LLM（Hermes／DSH 的本機模型就能繼續用）。"
+                    )
+                else:
+                    note = (
+                        "生成後自動啟動 LLM：已關閉。\n"
+                        "生成完成後 LLM 保持關閉、ComfyUI 也維持原狀，"
+                        "需要時再按「▶️ 啟動 LLM」。"
+                    )
+                self.show_menu(chat_id, message_id, note)
+                return
             if data == "bot_restart":
                 self.restart_bot(chat_id)
                 return
@@ -8485,6 +12029,14 @@ class TelegramMenuBot(TelegramTurboBot):
                     self.send_safe(
                         chat_id,
                         "FL2VA 需要兩張圖片：請先上傳首幀，再上傳尾幀。",
+                    )
+                elif self.input_mode == INPUT_MODE_YUPI and not (
+                    any(path.is_file() for path in self.reference_image_paths)
+                    or (self.image_path is not None and self.image_path.is_file())
+                ):
+                    self.send_safe(
+                        chat_id,
+                        "YUPI 需要一張參考圖：請先上傳圖片。",
                     )
                 elif self.input_mode == INPUT_MODE_REF2VA and not (
                     self.reference_image_paths
@@ -8516,6 +12068,36 @@ class TelegramMenuBot(TelegramTurboBot):
             return
         if command == "/prompt":
             self.request_prompt(chat_id)
+            return
+        if command in {"/make", "/script"}:
+            # One-line idea (+ optional duration) -> full H3 script via the local
+            # LLM, entirely inside Telegram.
+            remainder = text.split(None, 1)
+            if len(remainder) > 1 and remainder[1].strip():
+                self.awaiting_script_idea = False
+                self.handle_script_idea(chat_id, remainder[1].strip())
+            else:
+                self.request_script_idea(chat_id)
+            return
+        if command in {"/lang", "/language"}:
+            if len(parts) >= 2:
+                self.set_script_lang(chat_id, parts[1])
+            else:
+                current = normalize_script_lang(
+                    getattr(self, "script_lang", SCRIPT_LANG_DEFAULT)
+                )
+                self.send_safe(
+                    chat_id,
+                    f"🌐 目前腳本語言：{SCRIPT_LANG_LABEL[current]}\n\n"
+                    "/lang zh — 簡體中文\n"
+                    "/lang en — English\n\n"
+                    "也可以在面板按「🌐 腳本語言」切換。",
+                )
+            return
+        if command in {"/prompt_file", "/custom"}:
+            # Custom instruction file; re-read on every generation, so editing it
+            # needs no Bot restart.
+            self.show_script_prompt_file(chat_id)
             return
         if command == "/prompt_help":
             self.send_safe(chat_id, PROMPT_HELP_TEXT)
@@ -8728,6 +12310,10 @@ class TelegramMenuBot(TelegramTurboBot):
             self.awaiting_extension_duration = False
             self.awaiting_extension_prompt = False
             self.awaiting_queue_prompt = False
+            self.awaiting_script_idea = False
+            self.awaiting_custom_prompt = ""
+            self.awaiting_script_edit = ""
+            self.awaiting_script_refine = False
             self.extension_seconds = None
             self.extension_checkpoint_id = None
             with self.lock:

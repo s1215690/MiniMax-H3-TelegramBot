@@ -1,0 +1,266 @@
+{
+  "1": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "YUPI_FAST: Load H3 video VAE"
+    }
+  },
+  "2": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "YUPI_FAST: Load H3 audio VAE"
+    }
+  },
+  "3": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "YUPI_FAST: Load H3 CLIP (heretic uncensored)"
+    }
+  },
+  "4": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "YUPI_FAST: Load Ref2VA diffusion model (NSFW base)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "lora_name": "Vagina_minimax-h3_epoch20.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "YUPI_FAST: HMPussy V1 anatomy LoRA (trigger 'pussy', strength 1.0)"
+    }
+  },
+  "16": {
+    "inputs": {
+      "lora_name": "HMNSFW-AIO-V2.5.safetensors",
+      "strength_model": 0.7,
+      "model": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "YUPI_FAST: HMNSFW V2.5 action LoRA (trigger 'hmmotion', 0.5-0.9)"
+    }
+  },
+  "15": {
+    "inputs": {
+      "lora_name": "fasth3_6step.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "YUPI_FAST: FastH3 6-step distill LoRA (chained last, model 1.0)"
+    }
+  },
+  "6": {
+    "inputs": {
+      "prompt": "Cinematic Japanese AV-style scene, bright white bathroom, a young woman fully nude under a rain shower, water streaming down her bare skin, slow sensual motion, detailed realistic anatomy, soft white light, 4K.",
+      "width": 1152,
+      "height": 640,
+      "length": 124,
+      "clip": [
+        "3",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "ref_image_size": "match",
+      "ref_images": {
+        "ref_image_0": [
+          "14",
+          0
+        ]
+      }
+    },
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "_meta": {
+      "title": "YUPI_FAST: Ref2VA conditioning (NSFW)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "YUPI_FAST: sampler (euler, required by AfterMidnight + FastH3)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "noise_seed": 123456789
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "YUPI_FAST: Noise"
+    }
+  },
+  "9": {
+    "inputs": {
+      "model": [
+        "15",
+        0
+      ],
+      "conditioning": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "YUPI_FAST: guider (uses FastH3-chained model)"
+    }
+  },
+  "10": {
+    "inputs": {
+      "noise": [
+        "8",
+        0
+      ],
+      "guider": [
+        "9",
+        0
+      ],
+      "sampler": [
+        "7",
+        0
+      ],
+      "sigmas": [
+        "13",
+        0
+      ],
+      "latent_image": [
+        "6",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "YUPI_FAST: sampler (advanced)"
+    }
+  },
+  "13": {
+    "inputs": {
+      "scheduler": "beta",
+      "steps": 6,
+      "denoise": 1.0,
+      "model": [
+        "15",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "YUPI_FAST: scheduler (beta, 6 steps for FastH3 distill)"
+    }
+  },
+  "21": {
+    "inputs": {
+      "samples": [
+        "10",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "YUPI_FAST: decode video"
+    }
+  },
+  "22": {
+    "inputs": {
+      "samples": [
+        "10",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "YUPI_FAST: decode audio"
+    }
+  },
+  "23": {
+    "inputs": {
+      "images": [
+        "21",
+        0
+      ],
+      "audio": [
+        "22",
+        0
+      ],
+      "fps": 24,
+      "bit_depth": 8
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "YUPI_FAST: create synchronized video"
+    }
+  },
+  "12": {
+    "inputs": {
+      "video": [
+        "23",
+        0
+      ],
+      "filename_prefix": "MiniMaxH3/YUPI_FAST",
+      "format": "mp4",
+      "codec": "auto"
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "YUPI_FAST: save MP4"
+    }
+  },
+  "14": {
+    "inputs": {
+      "image": "yupi_reference.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "YUPI_FAST: reference image (replace with your nude ref)"
+    }
+  }
+}

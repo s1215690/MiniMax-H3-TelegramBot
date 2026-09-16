@@ -1,0 +1,119 @@
+JAPANESE AV-STYLE ADULT SCENE - 60 SECONDS (GLOBAL + SEGMENT 1/2/3)
+
+================================================================
+GLOBAL (paste this whole block into the global/scene description
+field for every generation to keep the three segments consistent)
+================================================================
+
+A Japanese AV-style adult scene, 60 seconds total, divided into
+three 20-second segments.
+
+Character: a 24-year-old Japanese woman, slim athletic build,
+long straight jet-black hair falling past her mid-back, fair
+porcelain skin with a natural healthy flush, delicate oval face,
+almond-shaped dark brown eyes, a small nose, soft full lips,
+smooth unblemished skin, fully nude or minimally covered.
+
+Setting: a modern minimalist white space. A changing room with
+white walls, a row of numbered white metal lockers, a full-length
+standing mirror on the left wall, a light wooden bench, a single
+white robe hanging, and light-gray tiled floor. Connected to it
+is a bathroom: all-white ceramic tiles (large 60x60 format), a
+freestanding white oval bathtub, a glass-enclosed rain shower, a
+neat stack of white towels, a small round wall mirror, and a
+white bath mat.
+
+Lighting: bright, even white fluorescent / LED panel light
+(daylight 5000-6500K), high-key, soft bounce, no harsh shadows,
+a faint cool cast, with gentle reflections off tiles, glass, and
+wet skin. The white light is the visual signature of the whole
+piece.
+
+Camera: 35mm / 50mm lens, shallow depth of field (f/1.8 - f/2.8),
+smooth gimbal / dolly movement, slow and deliberate pacing,
+cinematic. 16:9, 4K, 24 fps, realistic, high resolution, clean
+cool-white color grade.
+
+Mood: intimate, quiet, hypnotic, alluring, sensual, slow-burn.
+
+================================================================
+SEGMENT 1 (0-20s) - CHANGING ROOM
+================================================================
+
+Wide establishing shot. The camera slowly dollies
+in from the doorway. We see the entire bright white changing
+room - lockers, the standing mirror, the wooden bench. The woman
+stands by the mirror with her back to the camera, wearing the
+white robe. The white light floods the frame. She reaches both
+hands up slowly toward the front of the robe.
+
+Medium shot, side angle. She lets the robe slip
+off one shoulder, then the other; it pools on the floor. She
+turns slowly toward the mirror, her reflection catching her face.
+Her expression is calm and neutral, lips slightly parted. The
+camera tracks her movement in a smooth lateral pan.
+
+Close-up, over-the-shoulder into the mirror.
+Her face fills the reflection. A subtle slow exhale, her breath
+soft. She brushes a strand of black hair back behind her ear and
+glances directly at the camera through the mirror. Slow push-in.
+Warm bare skin contrasts against the cold white room.
+
+================================================================
+SEGMENT 2 (20-40s) - BATHROOM (SHOWER)
+================================================================
+
+Transition. The camera glides from the
+changing-room doorway into the bathroom. We see the all-white
+tiled space, the glass shower with water already running, soft
+steam rising. The woman steps through fully nude; water beads on
+her bare skin.
+
+Medium / low angle. She steps into the rain
+shower, tilts her head back, and water cascades over her hair and
+body. Eyes closed, a soft expression of relief. Water streams
+down her bare back, shoulders, and arms. The white light reflects
+off the wet tiles and the falling water.
+
+Extreme close-up montage, shallow depth of
+field. Water streaming down her collarbone. Droplets rolling off
+her shoulder. The curve of her body in profile, softened by
+steam. Slow, intimate, sensual.
+
+================================================================
+SEGMENT 3 (40-60s) - CLOSING
+================================================================
+
+Medium shot. She steps out of the shower, water
+dripping. She wraps a large white towel loosely around herself
+(or remains fully nude). She sits down on the edge of the white
+bathtub, tucking her legs to one side. Water still drips from
+her hair onto the white tile floor.
+
+Close-up. Her face, black hair plastered to her
+cheeks, a few water droplets on her skin. She looks directly into
+the camera with a calm, soft, alluring gaze and a faint closed-lip
+smile. The white light is gentle and even on her face.
+
+Slow dolly-out. The frame widens to reveal the
+whole minimalist white bathroom, her small figure on the edge of
+the tub, the bright white light filling the space. The image
+slowly fades as the white light remains. End.
+
+================================================================
+NOTES
+================================================================
+
+- Duration: 20 seconds per segment. If your model caps a single
+  generation at 10 seconds, split each segment into two 10-second
+  sub-segments (first half / second half of the action).
+- Consistency: paste the whole GLOBAL block into the global /
+  scene description field every time so the character, lighting,
+  and setting stay identical across all three segments.
+- NSFW: most commercial models auto-censor; for full nudity use a
+  model that supports NSFW (local Stable Video / AnimateDiff +
+  uncensored LoRA, or a platform that allows adult content).
+- Audio (optional): low fluorescent hum, water rising then
+  fading, soft breathing, silence at the end.
+- Aspect ratio: for vertical (phone / IG), change 16:9 in GLOBAL
+  to 9:16.

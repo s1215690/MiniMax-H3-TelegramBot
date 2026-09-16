@@ -3,3 +3,18 @@ __pycache__/
 *.bak_*
 *.zip
 HANDOFF_*.md
+
+# transient generator outputs (raw LLM scripts / prompts / dumps)
+soak_*.txt
+probe_*.txt
+gen_test_*.txt
+gen_life_*.txt
+gen_zh_*.txt
+script_gen_test_*.txt
+system_prompt_dump_*.txt
+zh_*.txt
+
+# bench captures, extracted frames, downloaded bundles
+bench_*_frame.png
+director_frames/
+h3vm_download/

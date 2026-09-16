@@ -1,0 +1,22 @@
+[
+  {
+    "tag": "fused6",
+    "profile": "fused",
+    "lora": null,
+    "steps": 6,
+    "status": "success",
+    "wall_s": 240.4,
+    "executed": "\u001b[32m[INFO]\u001b[0m \u001b[32mPrompt executed in 238.00 seconds\u001b[0m",
+    "sampling": "6/6 steps in 01m10s"
+  },
+  {
+    "tag": "taomate3",
+    "profile": "classic",
+    "lora": "taomate_h3_3step_MAXQUALITY_bf16.safetensors",
+    "steps": 3,
+    "status": "success",
+    "wall_s": 185.2,
+    "executed": "\u001b[32m[INFO]\u001b[0m \u001b[32mPrompt executed in 180.42 seconds\u001b[0m",
+    "sampling": "3/3 steps in 01m15s"
+  }
+]
