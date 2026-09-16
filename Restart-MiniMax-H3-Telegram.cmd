@@ -25,7 +25,7 @@ set "BOTLOG=%BOTDIR%\bot.log"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$line = Get-Content -LiteralPath '%BOTLOG%' -Tail 60 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'heartbeat' } | Select-Object -Last 1; if ($line -and $line -notmatch 'job=idle') { if ($line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') { $ts = [datetime]::ParseExact($matches[1], 'yyyy-MM-dd HH:mm:ss', $null); if (((Get-Date) - $ts).TotalMinutes -lt 5) { Write-Host ('  BUSY: ' + $line.Trim()); exit 7 } } }"
 if errorlevel 7 (
-  echo   [!] 生成工作中（見上面最後心跳），唔重啟住。等 job 完成之後再執行一次。
+  echo   [!] A generation job is running - see the last heartbeat above. Not restarting; run this again once the job is done.
   pause
   exit /b 1
 )
