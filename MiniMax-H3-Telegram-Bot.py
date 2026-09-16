@@ -3032,24 +3032,51 @@ def start_comfyui_process(vram_mode: Optional[str] = None) -> str:
         if visible:
             comfy_env["CUDA_VISIBLE_DEVICES"] = visible
         else:
-            # Try to find the GPU with most free memory
+            # Pick a GPU for ComfyUI. Preference order:
+            #   1. a card that is NOT driving a display (never put a 20GB video
+            #      model on the user's desktop card while a free card exists),
+            #   2. most free VRAM.
+            # The old "most free" rule could still land on the display card when
+            # the freed VRAM happened to be a few MiB higher there, which is
+            # exactly what this avoids. A non-display card is only skipped when
+            # it has less than COMFY_GPU_MIN_FREE_MB free (e.g. while the local
+            # LLM is holding it), in which case the freest card wins.
+            min_free = int(os.environ.get("MINIMAX_COMFY_GPU_MIN_FREE_MB", "6000"))
             try:
                 result = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=5
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used,memory.total,display_attached",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
-                lines = result.stdout.strip().split("\n")
-                best_gpu = 0
-                best_free = 0
-                for i, line in enumerate(lines):
-                    if "," in line:
-                        used, total = map(int, line.split(","))
-                        free = total - used
-                        if free > best_free:
-                            best_free = free
-                            best_gpu = i
+                rows: list[tuple[int, int, bool]] = []
+                for i, line in enumerate(result.stdout.strip().split("\n")):
+                    parts = [part.strip() for part in line.split(",")]
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        used, total = int(parts[0]), int(parts[1])
+                    except ValueError:
+                        continue
+                    attached = len(parts) > 2 and parts[2].lower() in {"yes", "enabled"}
+                    rows.append((i, total - used, attached))
+                if not rows:
+                    raise RuntimeError("nvidia-smi returned no usable GPU rows")
+                preferred = [
+                    row for row in rows if not row[2] and row[1] >= min_free
+                ]
+                best_gpu, best_free, best_attached = max(
+                    preferred or rows, key=lambda row: row[1]
+                )
                 comfy_env["CUDA_VISIBLE_DEVICES"] = str(best_gpu)
-                bot_log(f"Auto-selected GPU {best_gpu} ({best_free} MiB free)")
+                note = "display card, no free card above the floor" if best_attached else "non-display card"
+                bot_log(
+                    f"Auto-selected GPU {best_gpu} ({best_free} MiB free, {note})"
+                )
             except Exception as e:
                 bot_log(f"GPU auto-detection failed: {e}, using GPU 0")
                 comfy_env["CUDA_VISIBLE_DEVICES"] = "0"
@@ -5728,6 +5755,7 @@ class TelegramTurboBot:
             "/scriptllm 切換腳本 LLM（本機 / Command Code）\n"
             "/scripttemplate 切換腳本模板（成人版 / 一般版）\n"
             "/chain 5 8 5 10 或 48 [想法] 自動接力：短段生成→尾帧接續→合併（/chain off 停）\n"
+            "/gpu GPU 狀態：邊張卡係屏幕卡、ComfyUI 會用邊張\n"
             "/prompt_file 查看／編輯自訂指令檔（存檔即生效，免重啟）\n"
             "/prompt_help 提示詞寫作精華\n"
             "/progress 查看即時生成進度\n"
@@ -12097,6 +12125,51 @@ class TelegramMenuBot(TelegramTurboBot):
         self.request_script_idea(chat_id, note=note)
 
     # --- 🔗 auto-chain (short clips chained by tail-frame handoff) ----------
+    def show_gpu_status(self, chat_id: str) -> None:
+        """Report per-GPU memory/display state and the card ComfyUI will use."""
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,memory.used,memory.total,display_attached",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            lines = ["🖥 GPU 狀態"]
+            rows: list[tuple[int, int, bool]] = []
+            for line in result.stdout.strip().split("\n"):
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 5:
+                    continue
+                try:
+                    index, used, total = int(parts[0]), int(parts[2]), int(parts[3])
+                except ValueError:
+                    continue
+                attached = parts[4].lower() in {"yes", "enabled"}
+                free = total - used
+                rows.append((index, free, attached))
+                tag = "（屏幕卡）" if attached else ""
+                lines.append(
+                    f"GPU {index} {parts[1]}{tag}：{used} / {total} MiB（空閒 {free}）"
+                )
+            if rows:
+                min_free = int(
+                    os.environ.get("MINIMAX_COMFY_GPU_MIN_FREE_MB", "6000")
+                )
+                preferred = [r for r in rows if not r[2] and r[1] >= min_free]
+                pick = max(preferred or rows, key=lambda r: r[1])
+                why = "非屏幕卡" if not pick[2] else "冇可用非屏幕卡，揀最空閒嗰張"
+                lines.append(f"ComfyUI 生成會用：GPU {pick[0]}（{why}）")
+            lines.append(
+                "（想強制指定：設 MINIMAX_COMFY_CUDA_VISIBLE_DEVICES=1 並重啟 ComfyUI）"
+            )
+            self.send_safe(chat_id, "\n".join(lines))
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            self.send_safe(chat_id, f"讀取 GPU 狀態失敗：{exc}")
+
     def chain_active(self) -> bool:
         """True while an auto-chain run still has clips left to generate."""
         return bool(getattr(self, "chain_remaining", 0))
@@ -12961,6 +13034,9 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.handle_script_idea(chat_id, remainder[1].strip())
             else:
                 self.request_script_idea(chat_id)
+            return
+        if command in {"/gpu", "/gpuinfo"}:
+            self.show_gpu_status(chat_id)
             return
         if command == "/chain":
             rest = text.split(None, 1)
