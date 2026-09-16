@@ -12,6 +12,24 @@ rem [TEST] Disable Motion Context (latent format incompatible after official-nod
 set "MINIMAX_H3_LONG_CONTINUITY=off"
 
 echo === Restarting MiniMax H3 Telegram Bot ===
+
+rem Refuse to restart while a generation job is running: killing the bot mid-job
+rem loses a finished clip (never delivered to Telegram) and breaks any auto-chain
+rem waiting on it. Read the last heartbeat line from the bot log first; a stale
+rem heartbeat (older than 5 minutes) means the bot is gone, so restart anyway.
+set "BOTDIR="
+if defined MINIMAX_TELEGRAM_STATE for %%I in ("%MINIMAX_TELEGRAM_STATE%") do set "BOTDIR=%%~dpI"
+if not defined BOTDIR set "BOTDIR=E:\MiniMax-H3-Telegram\runtime\bot\"
+if "%BOTDIR:~-1%"=="\" set "BOTDIR=%BOTDIR:~0,-1%"
+set "BOTLOG=%BOTDIR%\bot.log"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$line = Get-Content -LiteralPath '%BOTLOG%' -Tail 60 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'heartbeat' } | Select-Object -Last 1; if ($line -and $line -notmatch 'job=idle') { if ($line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') { $ts = [datetime]::ParseExact($matches[1], 'yyyy-MM-dd HH:mm:ss', $null); if (((Get-Date) - $ts).TotalMinutes -lt 5) { Write-Host ('  BUSY: ' + $line.Trim()); exit 7 } } }"
+if errorlevel 7 (
+  echo   [!] 生成工作中（見上面最後心跳），唔重啟住。等 job 完成之後再執行一次。
+  pause
+  exit /b 1
+)
+
 echo Stopping running Bot process...
 
 rem Kill only the python process whose command line references the Bot script.
