@@ -265,6 +265,20 @@ AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 CLIP_NAME = "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
 UNET_NAME = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 LORA_NAME = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+# FastH3 V2 = FastVideo's official 8-step DMD2 distillation as one pruned int8
+# ConvRot ComfyUI single file. Text-to-audio-video ONLY: the model card says
+# FL2VA and Ref2VA were not distilled, so the fasth3 profile refuses those
+# modes instead of running off-distribution.
+FASTH3_UNET_NAME = os.environ.get(
+    "MINIMAX_H3_FASTH3_UNET",
+    "fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
+).strip()
+try:
+    FASTH3_PROFILE_STEPS = int(os.environ.get("MINIMAX_H3_FASTH3_STEPS", "8").strip())
+except ValueError:
+    FASTH3_PROFILE_STEPS = 8
+if FASTH3_PROFILE_STEPS <= 0:
+    FASTH3_PROFILE_STEPS = 8
 # ---- model profiles for the stock (non-YUPI) path --------------------------
 # classic: the split FL2VA / Ref2VA checkpoints + the turbo LoRA (original
 #          behaviour, untouched).
@@ -276,7 +290,8 @@ LORA_NAME = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
 #          the pack is installed.
 H3_PROFILE_CLASSIC = "classic"
 H3_PROFILE_FUSED = "fused"
-H3_PROFILES = (H3_PROFILE_CLASSIC, H3_PROFILE_FUSED)
+H3_PROFILE_FASTH3 = "fasth3"
+H3_PROFILES = (H3_PROFILE_CLASSIC, H3_PROFILE_FUSED, H3_PROFILE_FASTH3)
 H3_PROFILE_DEFAULT = H3_PROFILE_FUSED
 FUSED_UNET_NAME = os.environ.get(
     "MINIMAX_H3_FUSED_UNET",
@@ -1985,13 +2000,32 @@ def build_workflow(
     if profile not in H3_PROFILES:
         profile = H3_PROFILE_DEFAULT
     fused = profile == H3_PROFILE_FUSED
-    if fused:
+    fasth3 = profile == H3_PROFILE_FASTH3
+    if fasth3:
+        # FastH3 V2 is a text-to-video+audio distillation; FL2VA/Ref2VA were
+        # not distilled, so a reference-conditioned run would be
+        # off-distribution. Refuse with a message instead of producing mush.
+        if mode != INPUT_MODE_TEXT:
+            raise BotError(
+                "FastH3 V2 只支援文字模式（T2VA）。\n"
+                "官方講明 FL2VA／Ref2VA 冇蒸餾——要用參考圖／首尾幀，"
+                "請切換返「融合加速」或「經典」模式。"
+            )
+        if not comfy_model_available(FASTH3_UNET_NAME):
+            raise BotError(
+                f"未找到 FastH3 V2 模型檔：{FASTH3_UNET_NAME}\n"
+                "請放入 ComfyUI\\models\\diffusion_models（下載緊就等佢完成）。"
+            )
+        workflow["4"]["inputs"]["unet_name"] = FASTH3_UNET_NAME
+        workflow.pop("5", None)
+        model_source: list[Any] = ["4", 0]
+    elif fused:
         # The fused file covers every conditioning mode, so the FL2VA/Ref2VA
         # split and the separate turbo LoRA both go away (and with them the
         # ~21GB of pristine-weight backups ComfyUI keeps for a patched model).
         workflow["4"]["inputs"]["unet_name"] = FUSED_UNET_NAME
         workflow.pop("5", None)
-        model_source: list[Any] = ["4", 0]
+        model_source = ["4", 0]
     else:
         workflow["4"]["inputs"]["unet_name"] = (
             REF2VA_UNET_NAME if mode == INPUT_MODE_REF2VA else UNET_NAME
@@ -2003,7 +2037,12 @@ def build_workflow(
         workflow["5"]["inputs"]["lora_name"] = LORA_NAME
         workflow["5"]["inputs"]["strength_model"] = 1.0
         model_source = ["5", 0]
-    effective_steps = FUSED_PROFILE_STEPS if fused else max(4, config.steps)
+    if fasth3:
+        effective_steps = FASTH3_PROFILE_STEPS
+    elif fused:
+        effective_steps = FUSED_PROFILE_STEPS
+    else:
+        effective_steps = max(4, config.steps)
     if fused and h3_sla_available():
         # SLA block-sparse attention: ~40% faster and audibly cleaner than
         # dense at 4 steps. Omitted when the pack is missing so the fused
@@ -9241,12 +9280,17 @@ class TelegramMenuBot(TelegramTurboBot):
                 == "motion_context"
                 else "🔗 長片接續：尾幀接續 ✅"
             )
-            profile_label = (
-                "🧩 模型：融合加速（6步+SLA）✅"
-                if getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
-                == H3_PROFILE_FUSED
-                else "🧩 模型：經典（FL2VA/Ref2VA+LoRA）✅"
-            )
+            _profile_now = getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
+            if _profile_now == H3_PROFILE_FUSED:
+                profile_label = (
+                    f"🧩 模型：融合加速（{FUSED_PROFILE_STEPS}步+SLA）✅"
+                )
+            elif _profile_now == H3_PROFILE_FASTH3:
+                profile_label = (
+                    f"🧩 模型：FastH3 V2（{FASTH3_PROFILE_STEPS}步，只限文字）✅"
+                )
+            else:
+                profile_label = "🧩 模型：經典（FL2VA/Ref2VA+LoRA）✅"
             rows = [
                 [{"text": "⏱️ 片長／秒數（按下選擇）", "callback_data": "noop"}],
                 short_seconds_row[:2],
@@ -10813,18 +10857,24 @@ class TelegramMenuBot(TelegramTurboBot):
         fused_active = (
             getattr(self, "h3_profile", H3_PROFILE_FUSED) == H3_PROFILE_FUSED
         )
-        profile_text = (
-            f"融合加速（{FUSED_PROFILE_STEPS} steps，SLA {'開' if h3_sla_available() else '關'}）"
-            if fused_active
-            else f"經典（{current.steps} steps，turbo LoRA）"
+        fasth3_active = (
+            getattr(self, "h3_profile", H3_PROFILE_FUSED) == H3_PROFILE_FASTH3
         )
+        if fused_active:
+            profile_text = (
+                f"融合加速（{FUSED_PROFILE_STEPS} steps，SLA {'開' if h3_sla_available() else '關'}）"
+            )
+        elif fasth3_active:
+            profile_text = f"FastH3 V2（{FASTH3_PROFILE_STEPS} steps，只限文字模式）"
+        else:
+            profile_text = f"經典（{current.steps} steps，turbo LoRA）"
         menu = (
             f"{prefix}🎬 MiniMax H3 Turbo 控制面板\n"
             f"目前頁面：{section_titles.get(section, '主選單')}\n\n"
             f"模式：{mode_text}\n"
             f"模型：{profile_text}\n"
             f"參數：{resolution_label(current.width, current.height)} | "
-            f"{FUSED_PROFILE_STEPS if fused_active else current.steps} steps | "
+            f"{FUSED_PROFILE_STEPS if fused_active else FASTH3_PROFILE_STEPS if fasth3_active else current.steps} steps | "
             f"{duration_text}\n"
             f"素材：{media_status}\n"
             f"提示詞：{prompt_status}\n"
@@ -13153,12 +13203,14 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.show_menu(chat_id, message_id, note)
                 return
             if data == "h3_profile_toggle":
-                current = getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
-                self.h3_profile = (
-                    H3_PROFILE_FUSED
-                    if current != H3_PROFILE_FUSED
-                    else H3_PROFILE_CLASSIC
-                )
+                current = str(
+                    getattr(self, "h3_profile", H3_PROFILE_DEFAULT)
+                ).strip().lower()
+                try:
+                    index = H3_PROFILES.index(current)
+                except ValueError:
+                    index = H3_PROFILES.index(H3_PROFILE_DEFAULT)
+                self.h3_profile = H3_PROFILES[(index + 1) % len(H3_PROFILES)]
                 self.save_settings()
                 if self.h3_profile == H3_PROFILE_FUSED:
                     sla_note = (
@@ -13169,9 +13221,16 @@ class TelegramMenuBot(TelegramTurboBot):
                     note = (
                         "模型：已切換為融合加速。\n"
                         "單一 21GB 檔同時支援 T2VA／I2VA／FL2VA／Ref2VA，"
-                        "turbo 與 Mystic 已烤進權重（不掛 LoRA），固定 6 步。\n"
+                        f"turbo 與 Mystic 已烤進權重（不掛 LoRA），固定 {FUSED_PROFILE_STEPS} 步。\n"
                         f"{sla_note}\n"
                         "YUPI 工作流不受影響。"
+                    )
+                elif self.h3_profile == H3_PROFILE_FASTH3:
+                    note = (
+                        "模型：已切換為 FastH3 V2（FastVideo 官方 8 步蒸餾）。\n"
+                        "⚠️ 只支援文字模式（T2VA）——官方冇蒸餾 FL2VA／Ref2VA，"
+                        "用參考圖／首尾幀會直接報錯。\n"
+                        f"固定 {FASTH3_PROFILE_STEPS} 步，唔會插 SLA。"
                     )
                 else:
                     note = (
