@@ -10949,7 +10949,9 @@ class TelegramMenuBot(TelegramTurboBot):
         )
         self.show_script_prompt_file(chat_id)
 
-    def handle_script_idea(self, chat_id: str, text: str) -> None:
+    def handle_script_idea(
+        self, chat_id: str, text: str, seconds_override: Optional[float] = None
+    ) -> None:
         """Kick off script generation in the background."""
         if getattr(self, "chain_awaiting_idea", False):
             # The text is the first-clip idea for a pending auto-chain run.
@@ -10965,7 +10967,9 @@ class TelegramMenuBot(TelegramTurboBot):
             self.send_safe(chat_id, "上一個腳本還在生成中，請稍候。")
             return
         seconds, idea = parse_idea_duration(text)
-        if seconds is None:
+        if seconds_override is not None:
+            seconds = float(seconds_override)
+        elif seconds is None:
             seconds = float(self.total_seconds)
         if not idea:
             self.send_safe(chat_id, "請描述你想拍的畫面，例如：60秒 下雨的車站，女生錯過末班車")
@@ -11330,6 +11334,10 @@ class TelegramMenuBot(TelegramTurboBot):
             return
         self.prompt = script
         self.continuity_source_script = script
+        if self.chain_active():
+            # First clip of an armed auto-chain: the adopted script is the
+            # continuity source for the clips that follow.
+            self.chain_current_script = script
         self.awaiting_prompt = False
         detected = self.auto_detect_prompt_duration(script, persist=True)
         adjusted_from: Optional[float] = None
@@ -12301,6 +12309,9 @@ class TelegramMenuBot(TelegramTurboBot):
                 chat_id, "腳本生成器已停用（MINIMAX_SCRIPT_GEN=0），無法接力。"
             )
             return
+        if self.script_busy:
+            self.send_safe(chat_id, "上一個腳本還在生成中，請稍候再開始接力。")
+            return
         with self.lock:
             if self.job is not None:
                 self.send_safe(
@@ -12326,7 +12337,8 @@ class TelegramMenuBot(TelegramTurboBot):
             f"段數：{self.chain_total} 段（{plan_text} 秒；總約 {sum(clean):g} 秒）\n"
             f"腳本引擎：{script_llm_display_name()}｜模板：{script_template_display_name()}\n"
             f"想法：{self.chain_idea}\n\n"
-            "流程：生成 → 自動抽尾帧 → LLM 續寫 → 再生成…（要停：/chain off）",
+            "第 1 段：LLM 生成中——完成後請審閱，按「✅ 採用並生成」就開始接力，"
+            "之後每段自動接落去。\n（要停：/chain off）",
         )
         threading.Thread(
             target=self._chain_worker,
@@ -12334,6 +12346,12 @@ class TelegramMenuBot(TelegramTurboBot):
             name="h3-chain",
             daemon=True,
         ).start()
+        # The first clip goes through the normal draft review instead of being
+        # auto-submitted: the operator can adopt, edit or regenerate it, and the
+        # worker above simply waits for the clip that gets submitted.
+        self.handle_script_idea(
+            chat_id, self.chain_idea, seconds_override=float(clean[0])
+        )
 
     def chain_submit(self, chat_id: str, script: str, seconds: float) -> bool:
         """Submit one chain clip as a Ref2VA single-shot job."""
@@ -12398,45 +12416,41 @@ class TelegramMenuBot(TelegramTurboBot):
                         f"🔗 接力已停止（完成 {len(self.chain_done_paths)}/{total} 段）。",
                     )
                     return
-                if index == 1:
-                    idea = self.chain_idea
-                    continuity = ""
-                else:
+                if index > 1:
                     idea = (
                         f"{self.chain_idea}\n（這是第 {index}/{total} 段、片長 {clip_seconds:g} 秒："
                         "直接延續上一段的結尾動作，不要重複已經演過的內容，也不要重新介紹角色）"
                     )
-                    continuity = self.script_continuity
-                if index > 1:
                     self.send_safe(
                         chat_id,
                         f"🔗 第 {index}/{total} 段（{clip_seconds:g} 秒）：LLM 正在續寫腳本…",
                     )
-                try:
-                    script, log = generate_h3_script(
-                        idea,
-                        float(clip_seconds),
-                        INPUT_MODE_REF2VA,
-                        on_progress=None,
-                        lang=self._script_lang(),
-                        continuity=continuity,
-                    )
-                except (BotError, OSError) as exc:
-                    self.send_safe(
-                        chat_id,
-                        f"🔗 接力中止：第 {index}/{total} 段腳本生成失敗：{exc}",
-                    )
-                    return
-                self.chain_current_script = script
-                if index > 1:
+                    try:
+                        script, log = generate_h3_script(
+                            idea,
+                            float(clip_seconds),
+                            INPUT_MODE_REF2VA,
+                            on_progress=None,
+                            lang=self._script_lang(),
+                            continuity=self.script_continuity,
+                        )
+                    except (BotError, OSError) as exc:
+                        self.send_safe(
+                            chat_id,
+                            f"🔗 接力中止：第 {index}/{total} 段腳本生成失敗：{exc}",
+                        )
+                        return
+                    self.chain_current_script = script
                     self.send_safe(
                         chat_id,
                         f"🔗 第 {index}/{total} 段腳本完成（{'；'.join(log) or '通過驗證'}），"
                         "生成中…",
                     )
-                if not self.chain_submit(chat_id, script, float(clip_seconds)):
-                    self.send_safe(chat_id, "🔗 接力中止：無法送出生成工作。")
-                    return
+                    if not self.chain_submit(chat_id, script, float(clip_seconds)):
+                        self.send_safe(chat_id, "🔗 接力中止：無法送出生成工作。")
+                        return
+                # Clip 1 arrives here already submitted by the operator's own
+                # adoption of the LLM draft; every clip then waits the same way.
                 if not self.chain_wait_for_job():
                     self.send_safe(chat_id, "🔗 接力中止：工作被取消或超時。")
                     return
@@ -12457,10 +12471,11 @@ class TelegramMenuBot(TelegramTurboBot):
                 except OSError as exc:
                     self.send_safe(chat_id, f"🔗 接力中止：更新參考圖失敗：{exc}")
                     return
-                source = script[:4000]
-                if len(script) > 4000:
+                clip_script = self.chain_current_script or ""
+                source = clip_script[:4000]
+                if len(clip_script) > 4000:
                     source += "\n……（劇本太長，已截斷）"
-                self.continuity_source_script = self.chain_current_script
+                self.continuity_source_script = clip_script
                 self.script_continuity = (
                     TAIL_CONTINUITY_NOTE
                     + "\n\n【上一段劇本（最新一條片用嘅；只寫之後發生嘅事）】\n"
@@ -12613,6 +12628,11 @@ class TelegramMenuBot(TelegramTurboBot):
                     self.script_busy = False
                     self.awaiting_script_edit = ""
                     self.awaiting_script_refine = False
+                    if self.chain_active() and self.job is None:
+                        # An armed chain is waiting for this draft: dropping it
+                        # stops the run before the first clip was ever submitted.
+                        self.chain_remaining = 0
+                        self.send_safe(chat_id, "🔗 接力已取消（草稿已放棄）。")
                     self.show_menu(chat_id, message_id, "已放棄腳本草稿。")
                 elif action == "edit":
                     self.request_script_edit(chat_id, "replace")
