@@ -28,6 +28,7 @@
 - `/gen 864 480 12 15`：指令模式（先發參數，再貼提示詞）
 - `/lang zh|en`：腳本語言（預設簡體中文）
 - `/scriptllm local|cc`：切換腳本 LLM（本機 llama.cpp / Command Code 雲端）
+- `/scripttemplate adult|general`：切換腳本模板（成人版 / 一般版〔非成人〕）
 - 面板「📝 自訂指令」：加自己的風格規則，改完即時生效（檔案：`runtime\bot\script_prompt.txt`）
 - `/help`：全部指令
 

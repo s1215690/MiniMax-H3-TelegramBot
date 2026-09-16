@@ -4279,6 +4279,51 @@ def commandcode_api_key() -> str:
     return ""
 
 
+# Which script-guidance template the writer uses: the operator's adult custom
+# file (default, never modified by this switch) or the built-in general template.
+# Toggled from Telegram (/scripttemplate or the 📄 button); MINIMAX_SCRIPT_TEMPLATE
+# sets the boot default.
+SCRIPT_TEMPLATE_ADULT = "adult"
+SCRIPT_TEMPLATE_GENERAL = "general"
+SCRIPT_TEMPLATES = (SCRIPT_TEMPLATE_ADULT, SCRIPT_TEMPLATE_GENERAL)
+SCRIPT_TEMPLATE_LABEL = {
+    SCRIPT_TEMPLATE_ADULT: "成人版",
+    SCRIPT_TEMPLATE_GENERAL: "一般版",
+}
+SCRIPT_TEMPLATE_DEFAULT = (
+    os.environ.get("MINIMAX_SCRIPT_TEMPLATE", SCRIPT_TEMPLATE_ADULT).strip().lower()
+)
+if SCRIPT_TEMPLATE_DEFAULT not in SCRIPT_TEMPLATES:
+    SCRIPT_TEMPLATE_DEFAULT = SCRIPT_TEMPLATE_ADULT
+_script_template_active = SCRIPT_TEMPLATE_DEFAULT
+
+
+def normalize_script_template(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"general", "normal", "sfw", "safe", "一般", "一般版", "非成人"}:
+        return SCRIPT_TEMPLATE_GENERAL
+    if text in {"adult", "nsfw", "成人", "成人版"}:
+        return SCRIPT_TEMPLATE_ADULT
+    return SCRIPT_TEMPLATE_DEFAULT
+
+
+def get_script_template() -> str:
+    """Which guidance template the writer will use next."""
+    return _script_template_active
+
+
+def set_script_template(value: str) -> str:
+    global _script_template_active
+    _script_template_active = normalize_script_template(value)
+    return _script_template_active
+
+
+def script_template_display_name() -> str:
+    if _script_template_active == SCRIPT_TEMPLATE_GENERAL:
+        return "一般版（非成人）"
+    return "成人版"
+
+
 # Output language for generated scripts. The H3 model was trained mostly on
 # English, so English action/camera phrasing is the most stable; Simplified
 # Chinese is fully supported and is the default here because it is what the user
@@ -4357,6 +4402,14 @@ SCRIPT_GEN_PROMPT_FILE = Path(
 SCRIPT_GEN_PROMPT_MAX_CHARS = int(
     os.environ.get("MINIMAX_SCRIPT_PROMPT_MAX_CHARS", "4000")
 )
+# Optional operator file for 一般版. When absent or empty, the built-in general
+# template (_SCRIPT_GEN_GENERAL_TEMPLATE) is used instead.
+SCRIPT_GEN_PROMPT_FILE_GENERAL = Path(
+    os.environ.get(
+        "MINIMAX_SCRIPT_PROMPT_FILE_GENERAL",
+        str(SCRIPT_GEN_PROMPT_FILE.with_name("script_prompt_general.txt")),
+    )
+)
 
 SCRIPT_GEN_PROMPT_TEMPLATE = """\
 # ============================================================================
@@ -4382,7 +4435,7 @@ SCRIPT_GEN_PROMPT_TEMPLATE = """\
 """
 
 
-def load_custom_script_instructions() -> tuple[str, str]:
+def load_custom_script_instructions(path: Optional[Path] = None) -> tuple[str, str]:
     """Read the operator's custom instruction file.
 
     Returns (text, status) where status is a short human-readable note. The file
@@ -4391,7 +4444,7 @@ def load_custom_script_instructions() -> tuple[str, str]:
     Lines starting with `#` are treated as comments and dropped, which lets the
     shipped template document itself without those notes reaching the model.
     """
-    path = SCRIPT_GEN_PROMPT_FILE
+    path = path if path is not None else SCRIPT_GEN_PROMPT_FILE
     try:
         # utf-8-sig also tolerates the BOM that Windows editors add silently.
         raw = path.read_text(encoding="utf-8-sig")
@@ -4569,6 +4622,58 @@ random.
 Be concrete and visibly observable. Never write a vague verb like "{vague}";
 write "{concrete}". Never write media tags such as <Picture 1> or <Video 1>.
 """
+
+# Built-in general-content guidance, used when the 📄 switch is on 一般版 (and no
+# script_prompt_general.txt overrides it). The adult custom file is never
+# modified - switching simply stops feeding it to the model.
+_SCRIPT_GEN_GENERAL_TEMPLATE = """【一般內容模式（非成人）】
+【身份與輸出】
+你是 MiniMax H3 影片提示詞作者。只輸出腳本本身：不要說明、不要客套話、不要 markdown。
+時間軸標題一律照抄 Bot 給的原文，不要改成「場景N」、不要自己改秒數（時間已保證連續）。
+短片（15 秒以內）＝一段流暢散文，照下面規則寫，不套時間軸。
+腳本正文一律用簡體中文書寫（面板切成 English 時改用英文）；對白用中文或日文。
+想法中的每個元素（人物、動作、場景細節）都要逐字落實，不可以遺漏。
+
+【內容範圍（一般向，非成人）】
+- 題材由用戶想法決定：日常生活、旅遊、美食、運動、工藝、劇情小品、紀錄、廣告、產品展示等，任何一般向題材都可以。
+- 人物衣著整齊、行為得體；不出現裸露、性內容、暴力血腥或令人不安的畫面。
+- 想法如含成人內容，改寫成一般向版本；不寫色情暗示。
+- 不要假設主角性別——按想法寫「她」或「他」。
+
+【GLOBAL SETUP 必須包含（缺一不可）】
+1 人物：外貌要具體（樣貌、髮型、衣著）；有參考圖時保持與參考圖完全一致。
+2 場景與光線必須明寫（不寫＝模型會退回去參考圖場景）：自然日光或明亮白光，寫明時間與天氣。
+3 鏡頭：以近景與中景為主、主體清晰；可以有一個交代環境的鏡頭。
+4 音訊：明寫全程無音樂——The scene is completely silent except natural sounds and voices — NO music, no melody, no singing, no humming。
+5 對白：見下節。
+
+【對白（最關鍵，寫錯＝主角變旁白）】
+- 唯一合法格式：She says: "對白內容"（男角用 He says:）——H3 會自動生成唇形與語氣。
+- 禁止「她說：『…』」「對白：…」這類寫法，會被當成旁白讀出。
+- 對白短句、自然；每幕最多 1 至 2 句；「……」不可以當對白內容——該幕沒有對白就不要加 She says 行。
+- 句尾不要用「～」，改用「……」。
+
+【聲音句】
+每幕最後照寫一句短聲音句：環境音、腳步、器物聲、呼吸或說話聲；不要音樂、旋律、歌聲、歌詞。
+
+【動作與運鏡】
+- 動作具體、可觀察、按時間順序；不寫未來式。
+- 運鏡寫成自然散文（the camera slowly pushes in），不用「Camera direction:」這類標籤。
+- 每幕至少一個鏡頭是固定機位；開場動作（開門、入屋）放第一幕，不要寫進 GLOBAL。
+
+【參考圖】
+- Ref2VA：keeping the exact appearance of the reference ＋ 做新動作（參考圖用來鎖樣貌，不是重播）。
+- I2V：不重複描述圖中已見外觀，只寫動作、鏡頭、聲音。
+- 純文字模式：不要提「參考圖」三個字，直接具體描述人物外貌。
+
+【長片接續】
+- 每幕動作自然接續上一幕尾幀姿勢（Continue directly from the previous segment），不重新演一次開頭。
+- GLOBAL 不寫姿勢／動作，只寫人物、場景、光線。
+
+【2026-09 實測鐵律】
+1 每幕結尾鏡頭必須回到主體面部（清晰近景或中景），下一段接尾幀才不會變臉。
+2 場景每幕明寫，防止模型退回去參考圖場景。
+3 全片光線、衣著、髮型保持一致。"""
 
 _SCRIPT_GEN_MODE_NOTES = {
     INPUT_MODE_IMAGE: (
@@ -4965,9 +5070,11 @@ def build_script_messages(
     input_mode: str,
     lang: str = SCRIPT_LANG_DEFAULT,
     continuity: str = "",
+    template: str = "",
 ) -> list[dict[str, str]]:
     """Compose the system/user pair that asks for a complete H3 script."""
     lang = normalize_script_lang(lang)
+    template = normalize_script_template(template or get_script_template())
     long_form = seconds > MAX_SEGMENT_SECONDS
     language = _SCRIPT_GEN_LANGUAGE_BLOCK[lang]
     examples = _SCRIPT_GEN_EXAMPLES[lang]
@@ -4982,21 +5089,33 @@ def build_script_messages(
     if note:
         system = system + "\nMODE NOTE: " + note + "\n"
 
-    # Operator overrides are appended AFTER .format() on purpose: the custom text
-    # is arbitrary user input, and running it through str.format() would crash on
-    # any stray brace. It also has to come last so it can refine style, while the
-    # STRUCTURE and heading rules above stay authoritative.
-    custom, _status = load_custom_script_instructions()
-    if custom:
-        system = (
-            system
-            + "\nCUSTOM INSTRUCTIONS (from the operator; follow these for style "
+    # Template guidance is appended AFTER .format() on purpose: the text is
+    # arbitrary operator input, and running it through str.format() would crash
+    # on any stray brace. It also has to come last so it can refine style, while
+    # the STRUCTURE and heading rules above stay authoritative.
+    if template == SCRIPT_TEMPLATE_GENERAL:
+        # 一般版: the adult custom file is deliberately NOT read. An optional
+        # script_prompt_general.txt can override the built-in general template.
+        custom, _status = load_custom_script_instructions(
+            SCRIPT_GEN_PROMPT_FILE_GENERAL
+        )
+        if not custom:
+            custom = _SCRIPT_GEN_GENERAL_TEMPLATE
+        header = (
+            "\nGENERAL MODE (operator guidance; general-audience content only - "
+            "follow these rules, keep everything non-explicit, and ignore any "
+            "conflicting style guidance above):\n"
+        )
+    else:
+        custom, _status = load_custom_script_instructions()
+        header = (
+            "\nCUSTOM INSTRUCTIONS (from the operator; follow these for style "
             "and content - they take priority over the general style guidance "
             "above, but never override the STRUCTURE section or the exact "
             "timeline headings):\n"
-            + custom
-            + "\n"
         )
+    if custom:
+        system = system + header + custom + "\n"
 
     # Continuity block (set when the new reference images are the tail frames of
     # the previous clip). Appended last so the "same person, same place" contract
@@ -5506,6 +5625,7 @@ class TelegramTurboBot:
             "   也可直接打 /make 再依提示輸入\n"
             "/lang zh|en 切換腳本語言（預設簡體中文）\n"
             "/scriptllm 切換腳本 LLM（本機 / Command Code）\n"
+            "/scripttemplate 切換腳本模板（成人版 / 一般版）\n"
             "/prompt_file 查看／編輯自訂指令檔（存檔即生效，免重啟）\n"
             "/prompt_help 提示詞寫作精華\n"
             "/progress 查看即時生成進度\n"
@@ -6919,6 +7039,8 @@ class TelegramMenuBot(TelegramTurboBot):
         self.continuity_source_script = self.load_saved_continuity_source()
         self.script_llm = self.load_saved_script_llm()
         set_script_llm_provider(self.script_llm)
+        self.script_template = self.load_saved_script_template()
+        set_script_template(self.script_template)
         self.shutdown_after_generation = self.load_saved_shutdown_after_generation()
         self._shutdown_pending = False
         self.awaiting_prompt = False
@@ -7122,6 +7244,19 @@ class TelegramMenuBot(TelegramTurboBot):
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
         return SCRIPT_LLM_DEFAULT
+
+    @staticmethod
+    def load_saved_script_template() -> str:
+        """Which guidance template the writer uses: adult or general."""
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            value = saved.get("script_template")
+            if isinstance(value, str):
+                return normalize_script_template(value)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return SCRIPT_TEMPLATE_DEFAULT
 
     @staticmethod
     def load_saved_shutdown_after_generation() -> bool:
@@ -7371,6 +7506,9 @@ class TelegramMenuBot(TelegramTurboBot):
                     ),
                     "script_llm": normalize_script_llm(
                         getattr(self, "script_llm", SCRIPT_LLM_DEFAULT)
+                    ),
+                    "script_template": normalize_script_template(
+                        getattr(self, "script_template", SCRIPT_TEMPLATE_DEFAULT)
                     ),
                     "shutdown_after_generation": bool(
                         getattr(self, "shutdown_after_generation", False)
@@ -8347,6 +8485,12 @@ class TelegramMenuBot(TelegramTurboBot):
         Toggle with the 🧠 button in the system menu
         (or MINIMAX_LLM_RESTART_AFTER_JOB=0 for the default).
         """
+        if get_script_llm_provider() == SCRIPT_LLM_COMMANDCODE:
+            # Scripts come from the cloud engine now, so the Bot has no reason to
+            # wake the local LLM back up after a job. Start it manually (🧠 啟動
+            # LLM / /llm_start) when Hermes or the DSH models need it.
+            bot_log("restart_llm_after_job: skipped (script engine = Command Code)")
+            return
         enabled = bool(getattr(self, "restart_llm_after_generation", True))
         try:
             llama_up = llama_is_online()
@@ -8555,6 +8699,15 @@ class TelegramMenuBot(TelegramTurboBot):
                         ],
                         "callback_data": "script_llm:toggle",
                     },
+                    {
+                        "text": "📄 模板："
+                        + SCRIPT_TEMPLATE_LABEL[
+                            normalize_script_template(
+                                getattr(self, "script_template", SCRIPT_TEMPLATE_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_template:toggle",
+                    },
                     {"text": "📝 自訂指令", "callback_data": "script_file"},
                 ],
                 [{"text": "🗑 清除上傳素材", "callback_data": "clear_image"}],
@@ -8645,6 +8798,15 @@ class TelegramMenuBot(TelegramTurboBot):
                             )
                         ],
                         "callback_data": "script_llm:toggle",
+                    },
+                    {
+                        "text": "📄 模板："
+                        + SCRIPT_TEMPLATE_LABEL[
+                            normalize_script_template(
+                                getattr(self, "script_template", SCRIPT_TEMPLATE_DEFAULT)
+                            )
+                        ],
+                        "callback_data": "script_template:toggle",
                     },
                     {"text": "📝 自訂指令", "callback_data": "script_file"},
                 ],
@@ -10455,6 +10617,7 @@ class TelegramMenuBot(TelegramTurboBot):
             "  • 2分鐘 賽博龐克機車追逐\n\n"
             f"沒寫秒數就用目前的 {self.duration_label(self.total_seconds)}。\n"
             f"腳本 LLM：{script_llm_display_name()}（輸入 /scriptllm 可切換）\n"
+            f"腳本模板：{script_template_display_name()}（輸入 /scripttemplate 可切換）\n"
             f"腳本語言：{SCRIPT_LANG_LABEL[normalize_script_lang(getattr(self, 'script_lang', SCRIPT_LANG_DEFAULT))]}"
             "（輸入 /lang 可切換）\n"
             "生成約需 20–60 秒，完成後可一鍵採用或重新生成。"
@@ -10506,6 +10669,24 @@ class TelegramMenuBot(TelegramTurboBot):
                 "生成腳本前 Bot 會自動確保它已啟動。"
             )
         notice = f"🧠 腳本 LLM 已切換為：{script_llm_display_name()}{extra}"
+        if message_id is not None:
+            self.show_menu(chat_id, message_id, notice)
+        else:
+            self.show_menu(chat_id, notice=notice)
+
+    def switch_script_template(self, chat_id: str, value: str, message_id: Optional[int] = None) -> None:
+        """Switch the script-guidance template (成人版 / 一般版) and persist it."""
+        self.script_template = normalize_script_template(value)
+        set_script_template(self.script_template)
+        self.save_settings()
+        if self.script_template == SCRIPT_TEMPLATE_GENERAL:
+            extra = (
+                "\n一般版：使用內建非成人模板，唔會讀 script_prompt.txt。"
+                "\n（想自訂一般版規則：建立 script_prompt_general.txt，內容會取代內建模板。）"
+            )
+        else:
+            extra = "\n成人版：繼續使用你的自訂指令檔 script_prompt.txt（原檔未改動）。"
+        notice = f"📄 腳本模板已切換為：{script_template_display_name()}{extra}"
         if message_id is not None:
             self.show_menu(chat_id, message_id, notice)
         else:
@@ -11840,6 +12021,21 @@ class TelegramMenuBot(TelegramTurboBot):
                     target = normalize_script_lang(action)
                 self.set_script_lang(chat_id, target, message_id)
                 return
+            if data.startswith("script_template:"):
+                action = data.removeprefix("script_template:")
+                current = normalize_script_template(
+                    getattr(self, "script_template", SCRIPT_TEMPLATE_DEFAULT)
+                )
+                if action in {"", "toggle"}:
+                    target = (
+                        SCRIPT_TEMPLATE_GENERAL
+                        if current == SCRIPT_TEMPLATE_ADULT
+                        else SCRIPT_TEMPLATE_ADULT
+                    )
+                else:
+                    target = normalize_script_template(action)
+                self.switch_script_template(chat_id, target, message_id)
+                return
             if data.startswith("script_llm:"):
                 action = data.removeprefix("script_llm:")
                 current = normalize_script_llm(
@@ -12289,6 +12485,18 @@ class TelegramMenuBot(TelegramTurboBot):
                 self.handle_script_idea(chat_id, remainder[1].strip())
             else:
                 self.request_script_idea(chat_id)
+            return
+        if command in {"/scripttemplate", "/template"}:
+            if len(parts) > 1:
+                self.switch_script_template(chat_id, parts[1])
+            else:
+                self.send_safe(
+                    chat_id,
+                    f"📄 目前腳本模板：{script_template_display_name()}\n\n"
+                    "/scripttemplate adult — 成人版（用你的 script_prompt.txt）\n"
+                    "/scripttemplate general — 一般版（內建非成人模板）\n\n"
+                    "也可以在面板按「📄 模板」切換。",
+                )
             return
         if command in {"/scriptllm", "/script_llm"}:
             if len(parts) > 1:
