@@ -9,6 +9,7 @@ variables and are never written to this workspace.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import asyncio
@@ -4338,6 +4339,12 @@ COMMANDCODE_BASE_URL = os.environ.get(
 COMMANDCODE_MODEL = os.environ.get(
     "MINIMAX_COMMANDCODE_MODEL", "deepseek/deepseek-v4.1-flash"
 )
+# Vision model used when a continuation prompt attaches the previous clip's
+# last frames: the plain flash model silently ignores image parts (verified),
+# this one actually reads them.
+COMMANDCODE_VISION_MODEL = os.environ.get(
+    "MINIMAX_COMMANDCODE_VISION_MODEL", "deepseek/deepseek-v4-flash-vision-exp"
+)
 # Cloudflare sits in front of the API and blocks unknown browser signatures
 # (error 1010), so requests must carry a normal browser User-Agent.
 COMMANDCODE_USER_AGENT = os.environ.get(
@@ -5071,6 +5078,7 @@ def _llama_chat_once(
     max_tokens: int,
     temperature: float,
     timeout: float,
+    has_images: bool = False,
 ) -> tuple[str, str, int]:
     """One chat completion. Returns (content, finish_reason, completion_tokens)."""
     if get_script_llm_provider() == SCRIPT_LLM_COMMANDCODE:
@@ -5080,7 +5088,7 @@ def _llama_chat_once(
                 f"Command Code API key 未設定（環境變數 {COMMANDCODE_API_KEY_ENV}）。"
             )
         payload = {
-            "model": COMMANDCODE_MODEL,
+            "model": COMMANDCODE_VISION_MODEL if has_images else COMMANDCODE_MODEL,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -5144,6 +5152,7 @@ def llama_chat(
     max_tokens: int = SCRIPT_GEN_MAX_TOKENS,
     temperature: float = SCRIPT_GEN_TEMPERATURE,
     timeout: float = SCRIPT_GEN_TIMEOUT,
+    has_images: bool = False,
 ) -> str:
     """Send a chat completion to the local llama.cpp server and return the text.
 
@@ -5166,7 +5175,7 @@ def llama_chat(
     last_tokens = 0
     for budget in budgets:
         content, finish, tokens = _llama_chat_once(
-            messages, budget, temperature, timeout
+            messages, budget, temperature, timeout, has_images=has_images
         )
         if content:
             if finish == "length":
@@ -5192,6 +5201,37 @@ def llama_chat(
     )
 
 
+def _image_content_parts(paths: list[Path], limit: int = 2) -> list[dict[str, Any]]:
+    """Encode local images as OpenAI-style content parts (data URLs).
+
+    Only used for continuation prompts (the previous clip's last frames), so a
+    hard limit of two keeps tokens and payload size predictable. Unreadable or
+    absurdly large files are skipped rather than failing the generation.
+    """
+    parts: list[dict[str, Any]] = []
+    for path in list(paths or [])[:limit]:
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            continue
+        if not data or len(data) > 4_000_000:
+            continue
+        suffix = Path(path).suffix.lower()
+        mime = "image/png" if suffix == ".png" else "image/jpeg"
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": (
+                        f"data:{mime};base64,"
+                        + base64.b64encode(data).decode("ascii")
+                    )
+                },
+            }
+        )
+    return parts
+
+
 def build_script_messages(
     idea: str,
     seconds: float,
@@ -5199,6 +5239,7 @@ def build_script_messages(
     lang: str = SCRIPT_LANG_DEFAULT,
     continuity: str = "",
     template: str = "",
+    images: Optional[list[Path]] = None,
 ) -> list[dict[str, str]]:
     """Compose the system/user pair that asks for a complete H3 script."""
     lang = normalize_script_lang(lang)
@@ -5264,6 +5305,23 @@ def build_script_messages(
             f"Idea: {idea}\n"
             "Write the prompt paragraph now."
         )
+    image_parts = _image_content_parts(list(images or []))
+    if image_parts:
+        # Ground the continuation in what the previous clip actually ended on.
+        user = (
+            "【上一段最後兩格】以下圖片是上一段影片的最後畫面（相隔約 0.5 秒）。"
+            "先仔細看清楚：人物的姿勢、衣着／裸露狀態、鏡頭角度、構圖、光線與場景，"
+            "然後寫出由這一刻直接接下去的內容；不要把畫面中已經完成的動作再演一次。\n\n"
+            + user
+        )
+    if image_parts:
+        return [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": user}, *image_parts],
+            },
+        ]
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -5313,6 +5371,7 @@ def refine_h3_script(
     attempts: int = SCRIPT_GEN_ATTEMPTS,
     lang: str = SCRIPT_LANG_DEFAULT,
     continuity: str = "",
+    images: Optional[list[Path]] = None,
 ) -> tuple[str, list[str]]:
     """Revise an existing script from a natural-language instruction.
 
@@ -5333,14 +5392,25 @@ def refine_h3_script(
         if long_form
         else ""
     )
-    messages: list[dict[str, str]] = [
+    image_parts = _image_content_parts(list(images or []))
+    refine_user = _SCRIPT_GEN_REFINE_USER.format(
+        draft=draft,
+        instruction=instruction,
+        headings_note=headings_note,
+    )
+    if image_parts:
+        refine_user = (
+            "【上一段最後兩格】以下圖片是上一段影片的最後畫面：修訂後的新一段必須"
+            "由這一刻直接接下去。\n\n" + refine_user
+        )
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         {
             "role": "user",
-            "content": _SCRIPT_GEN_REFINE_USER.format(
-                draft=draft,
-                instruction=instruction,
-                headings_note=headings_note,
+            "content": (
+                [{"type": "text", "text": refine_user}, *image_parts]
+                if image_parts
+                else refine_user
             ),
         },
     ]
@@ -5350,7 +5420,9 @@ def refine_h3_script(
     for attempt in range(1, max(1, attempts) + 1):
         if on_progress is not None:
             on_progress(attempt, max(1, attempts), last_error)
-        reply = llama_chat(messages, timeout=SCRIPT_GEN_TIMEOUT)
+        reply = llama_chat(
+            messages, timeout=SCRIPT_GEN_TIMEOUT, has_images=bool(image_parts)
+        )
         script = _strip_script_wrappers(reply)
         messages.append({"role": "assistant", "content": script})
         ok, message = _script_accepts(script, seconds)
@@ -5384,6 +5456,7 @@ def generate_h3_script(
     attempts: int = SCRIPT_GEN_ATTEMPTS,
     lang: str = SCRIPT_LANG_DEFAULT,
     continuity: str = "",
+    images: Optional[list[Path]] = None,
 ) -> tuple[str, list[str]]:
     """Generate a script and self-repair it until the Bot's validator accepts.
 
@@ -5392,7 +5465,8 @@ def generate_h3_script(
     parser error so the failure is diagnosable from Telegram alone.
     """
     lang = normalize_script_lang(lang)
-    messages = build_script_messages(idea, seconds, input_mode, lang, continuity)
+    has_images = bool(_image_content_parts(list(images or [])))
+    messages = build_script_messages(idea, seconds, input_mode, lang, continuity, images=images)
     skeleton = format_skeleton(script_timeline_skeleton(float(seconds), lang))
     log: list[str] = []
     last_error = ""
@@ -5400,7 +5474,11 @@ def generate_h3_script(
     for attempt in range(1, max(1, attempts) + 1):
         if on_progress is not None:
             on_progress(attempt, max(1, attempts), last_error)
-        reply = llama_chat(messages, timeout=SCRIPT_GEN_TIMEOUT)
+        reply = llama_chat(
+            messages,
+            timeout=SCRIPT_GEN_TIMEOUT,
+            has_images=has_images,
+        )
         script = _strip_script_wrappers(reply)
         messages.append({"role": "assistant", "content": script})
 
@@ -11092,6 +11170,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 on_progress=progress,
                 lang=self._script_lang(),
                 continuity=self.script_continuity,
+                images=self._continuation_images(),
             )
         except (BotError, OSError) as exc:
             self.script_busy = False
@@ -11294,6 +11373,7 @@ class TelegramMenuBot(TelegramTurboBot):
                 on_progress=progress,
                 lang=self._script_lang(),
                 continuity=self.script_continuity,
+                images=self._continuation_images(),
             )
         except (BotError, OSError) as exc:
             self.script_busy = False
@@ -12133,6 +12213,22 @@ class TelegramMenuBot(TelegramTurboBot):
         self.request_script_idea(chat_id, note=note)
 
     # --- 🔗 auto-chain (short clips chained by tail-frame handoff) ----------
+    def _continuation_images(self) -> list[Path]:
+        """Tail frames to SHOW the LLM when a continuity run is active.
+
+        After a handoff the reference images ARE the previous clip's last
+        frames, so they are exactly what the writer must look at. Returns []
+        when no continuity is running (a fresh idea must not be told these are
+        the previous clip's ending).
+        """
+        if not (getattr(self, "script_continuity", "") or "").strip():
+            return []
+        return [
+            path
+            for path in getattr(self, "reference_image_paths", [])
+            if path is not None and Path(path).is_file()
+        ][:2]
+
     def show_gpu_status(self, chat_id: str) -> None:
         """Report per-GPU memory/display state and the card ComfyUI will use."""
         try:
@@ -12433,6 +12529,7 @@ class TelegramMenuBot(TelegramTurboBot):
                             on_progress=None,
                             lang=self._script_lang(),
                             continuity=self.script_continuity,
+                            images=self._continuation_images(),
                         )
                     except (BotError, OSError) as exc:
                         self.send_safe(
