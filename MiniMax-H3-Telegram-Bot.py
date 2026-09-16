@@ -3561,41 +3561,150 @@ TAIL_FRAME_DIR = Path(
 )
 
 
-def extract_tail_frames(
-    video_path: Path, count: int = 2, spacing: float = 0.5
-) -> tuple[str, list[Path]]:
-    """Save the last `count` frames of a video as JPEGs.
+TAIL_SCAN_SECONDS = float(os.environ.get("MINIMAX_TAIL_SCAN_SECONDS", "3.0"))
+TAIL_SCAN_FPS = float(os.environ.get("MINIMAX_TAIL_SCAN_FPS", "4.0"))
+# OpenCV 5 dropped the Haar cascade API entirely, so face scoring runs on the
+# YuNet DNN detector instead (232 KB model, ships with landmarks that also give
+# a frontal-ness measure). The model sits next to the runtime; download once:
+#   https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+FACE_MODEL_PATH = Path(
+    os.environ.get(
+        "MINIMAX_FACE_MODEL",
+        str(TAIL_FRAME_DIR.parent / "face" / "face_detection_yunet_2023mar.onnx"),
+    )
+)
+_FACE_DETECTOR: Any = None
+_FACE_DETECTOR_TRIED = False
+_FACE_CASCADE: Any = None
+_PROFILE_CASCADE: Any = None
+_FACE_CASCADE_TRIED = False
 
-    Frames are sampled `spacing` seconds apart ending on the video's final
-    frame (the very last two frames are usually identical, which makes the
-    second one useless as a reference image). Identical outputs are dropped.
 
-    Returns (token, frames), frames ordered oldest-to-newest. The token is
-    embedded in the Telegram callback data so the button handler can find the
-    frames on disk later without keeping per-message state in memory.
+def _face_detector() -> Any:
+    """YuNet detector when its model file is present, else None."""
+    global _FACE_DETECTOR, _FACE_DETECTOR_TRIED
+    if not _FACE_DETECTOR_TRIED:
+        _FACE_DETECTOR_TRIED = True
+        try:
+            import cv2
+
+            if FACE_MODEL_PATH.is_file() and hasattr(cv2, "FaceDetectorYN"):
+                _FACE_DETECTOR = cv2.FaceDetectorYN.create(
+                    str(FACE_MODEL_PATH), "", (320, 320), 0.6, 0.3, 5000
+                )
+        except Exception:  # noqa: BLE001 - a missing model must never fail a job
+            _FACE_DETECTOR = None
+    return _FACE_DETECTOR
+
+
+def _face_cascades() -> list[Any]:
+    """Legacy OpenCV (<=4) frontal + profile cascades, [] when unavailable."""
+    global _FACE_CASCADE, _PROFILE_CASCADE, _FACE_CASCADE_TRIED
+    if not _FACE_CASCADE_TRIED:
+        _FACE_CASCADE_TRIED = True
+        try:
+            import cv2
+
+            _FACE_CASCADE = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+            _PROFILE_CASCADE = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_profileface.xml"
+            )
+        except Exception:  # noqa: BLE001 - a missing cv2 must never fail a job
+            _FACE_CASCADE = None
+            _PROFILE_CASCADE = None
+    return [c for c in (_FACE_CASCADE, _PROFILE_CASCADE) if c is not None]
+
+
+def score_tail_frame(path: Path) -> tuple[float, bool]:
+    """(score, has_face) for picking reference-quality tail frames.
+
+    Score = sharpness (variance of the Laplacian) weighted by the detected
+    face's share of the frame and by how frontal it is, so a big, crisp,
+    front-facing face beats a small/blurred/turned-away one - the reference
+    image is what the next clip's identity is read from.
     """
-    if not video_path.is_file():
-        return "", []
     try:
-        duration, _, _ = probe_video_info(video_path)
-    except Exception:
-        return "", []
-    if duration <= 0:
-        return "", []
+        import cv2
+        import numpy as np
 
-    token = uuid.uuid4().hex[:10]
+        image = cv2.imread(str(path))
+        if image is None:
+            return 0.0, False
+        height, width = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        area_share = 0.0
+        frontal = 1.0
+        detector = _face_detector()
+        if detector is not None:
+            detector.setInputSize((width, height))
+            _count, faces = detector.detect(image)
+            if faces is not None and len(faces):
+                best = max(faces, key=lambda row: row[2] * row[3])
+                area_share = float(best[2] * best[3]) / float(width * height)
+                eye_distance = float(
+                    np.hypot(float(best[6] - best[4]), float(best[7] - best[5]))
+                )
+                ratio = eye_distance / max(1.0, float(best[2]))
+                # A straight-on face sits around 0.45; weight it up to 2x and
+                # never punish below 1x (a profile frame can still be picked
+                # when it is the only face available).
+                frontal = 1.0 + max(0.0, min(1.0, (ratio - 0.22) / 0.23))
+        else:
+            for cascade in _face_cascades():
+                if cascade.empty():
+                    continue
+                faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(40, 40))
+                if len(faces):
+                    area_share = max(
+                        area_share,
+                        max(w * h for (_x, _y, w, h) in faces)
+                        / float(width * height),
+                    )
+        return sharpness * (1.0 + 20.0 * area_share) * frontal, area_share > 0.0
+    except Exception:  # noqa: BLE001 - scoring is best-effort
+        return 0.0, False
+
+
+def _tail_scan_frames(video_path: Path, scan_dir: Path) -> list[Path]:
+    """Sample the video's last TAIL_SCAN_SECONDS in one ffmpeg pass."""
     try:
-        TAIL_FRAME_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return "", []
-    frames: list[Path] = []
-    seen_hashes: set[str] = set()
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            FFMPEG_PATH,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-sseof",
+            f"-{TAIL_SCAN_SECONDS:.2f}",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"fps={TAIL_SCAN_FPS:g}",
+            "-q:v",
+            "2",
+            str(scan_dir / "cand_%03d.jpg"),
+        ]
+        subprocess.run(command, capture_output=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return sorted(scan_dir.glob("cand_*.jpg"))
+
+
+def _last_frames_plain(
+    video_path: Path, scan_dir: Path, count: int, spacing: float
+) -> list[Path]:
+    """Historical fallback: `count` frames ending on the video's final frame."""
+    out: list[Path] = []
     for index in range(count, 0, -1):
         # `-sseof` seeks from the end of the file; seeking to `duration` with
         # `-ss` lands past the last video frame (the audio track is usually a
         # bit longer than the video one) and yields nothing at all.
         offset = -(0.1 + (index - 1) * spacing)
-        destination = TAIL_FRAME_DIR / f"tail_{token}_{count - index + 1}.jpg"
+        destination = scan_dir / f"plain_{count - index + 1}.jpg"
         command = [
             FFMPEG_PATH,
             "-hide_banner",
@@ -3616,15 +3725,84 @@ def extract_tail_frames(
             subprocess.run(command, capture_output=True, timeout=60)
         except (OSError, subprocess.TimeoutExpired):
             continue
-        if not destination.is_file() or destination.stat().st_size == 0:
-            continue
-        digest = hashlib.md5(destination.read_bytes()).hexdigest()
-        if digest in seen_hashes:
-            destination.unlink(missing_ok=True)
-            continue
-        seen_hashes.add(digest)
-        frames.append(destination)
-    return token, frames
+        if destination.is_file() and destination.stat().st_size > 0:
+            out.append(destination)
+    return out
+
+
+def extract_tail_frames(
+    video_path: Path, count: int = 2, spacing: float = 0.5
+) -> tuple[str, list[Path]]:
+    """Save the best `count` frames from the video's ending as JPEGs.
+
+    The last TAIL_SCAN_SECONDS are sampled in one ffmpeg pass and scored
+    (see score_tail_frame): a crisp, front-facing face wins over whatever
+    frame happens to land last, which is often motion-blurred or looking away
+    - and a face the model cannot read is a face the next clip will drift
+    from. Falls back to the plain last-frames behaviour when scoring finds
+    nothing usable. Identical outputs are dropped.
+
+    Returns (token, frames), frames ordered oldest-to-newest. The token is
+    embedded in the Telegram callback data so the button handler can find the
+    frames on disk later without keeping per-message state in memory.
+    """
+    if not video_path.is_file():
+        return "", []
+    try:
+        duration, _, _ = probe_video_info(video_path)
+    except Exception:
+        return "", []
+    if duration <= 0:
+        return "", []
+
+    token = uuid.uuid4().hex[:10]
+    try:
+        TAIL_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return "", []
+    scan_dir = TAIL_FRAME_DIR / f"scan_{token}"
+    try:
+        candidates = _tail_scan_frames(video_path, scan_dir)
+        scored: list[tuple[float, int, Path, bool]] = []
+        for index, path in enumerate(candidates):
+            score, has_face = score_tail_frame(path)
+            scored.append((score, index, path, has_face))
+        with_face = [row for row in scored if row[3]]
+        pool = with_face or scored
+        pool.sort(key=lambda row: row[0], reverse=True)
+        # Keep the picks spread apart so both reference images are not the
+        # same instant; `spacing` is honoured at half strength.
+        min_gap = max(1, int(TAIL_SCAN_FPS * spacing / 2))
+        chosen: list[tuple[int, Path]] = []
+        for _score, index, path, _face in pool:
+            if len(chosen) >= count:
+                break
+            if all(
+                abs(index - other_index) >= min_gap
+                for other_index, _other_path in chosen
+            ):
+                chosen.append((index, path))
+        chosen.sort(key=lambda row: row[0])
+        sources = [path for _index, path in chosen]
+        if not sources:
+            sources = _last_frames_plain(video_path, scan_dir, count, spacing)
+        frames: list[Path] = []
+        seen_hashes: set[str] = set()
+        for source in sources:
+            destination = TAIL_FRAME_DIR / f"tail_{token}_{len(frames) + 1}.jpg"
+            try:
+                shutil.copyfile(source, destination)
+            except OSError:
+                continue
+            digest = hashlib.md5(destination.read_bytes()).hexdigest()
+            if digest in seen_hashes:
+                destination.unlink(missing_ok=True)
+                continue
+            seen_hashes.add(digest)
+            frames.append(destination)
+        return token, frames
+    finally:
+        shutil.rmtree(scan_dir, ignore_errors=True)
 
 
 def tail_reference_frames(token: str) -> list[Path]:
